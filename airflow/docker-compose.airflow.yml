@@ -16,7 +16,9 @@ services:
     restart: always
 
   airflow-webserver:
-    image: apache/airflow:2.9.3
+    build:
+      context: .
+      dockerfile: Dockerfile
     depends_on:
       postgres:
         condition: service_healthy
@@ -42,7 +44,9 @@ services:
     command: webserver
 
   airflow-scheduler:
-    image: apache/airflow:2.9.3
+    build:
+      context: .
+      dockerfile: Dockerfile
     depends_on:
       postgres:
         condition: service_healthy
@@ -66,7 +70,9 @@ services:
     command: scheduler
 
   airflow-triggerer:
-    image: apache/airflow:2.9.3
+    build:
+      context: .
+      dockerfile: Dockerfile
     depends_on:
       postgres:
         condition: service_healthy

@@ -118,26 +118,53 @@ def df_from_parquets(patterns):
 
 # ---------------- load labels (dynamic) ----------------
 
-def load_all_labels():
-    pattern = os.path.join(SILVER_LABELS_DIR, "ingest_date=*/labels_union.parquet")
-    print("[info] loading labels from pattern:", pattern)
-    labels = df_from_parquets([pattern])
-    if labels.empty:
-        raise SystemExit("No labels found (check silver/labels_union).")
+# ---------------- load labels (dynamic + feedback) ----------------
 
-    print("[info] raw labels rows:", len(labels))
+def load_all_labels():
+    # 1) Main labels
+    pattern_main = os.path.join(SILVER_LABELS_DIR, "ingest_date=*/labels_union.parquet")
+    print("[info] loading labels from pattern:", pattern_main)
+    labels = df_from_parquets([pattern_main])
+    
+    # 2) Active Learning feedback
+    FEEDBACK_DIR = os.path.join(REPO_ROOT, "ml", "data", "feedback")
+    pattern_fb = os.path.join(FEEDBACK_DIR, "feedback_labels_*.parquet")
+    print("[info] loading feedback from pattern:", pattern_fb)
+    fb = df_from_parquets([pattern_fb])
+    
+    if not fb.empty:
+        print(f"[info] found {len(fb)} active learning feedback rows")
+        labels = pd.concat([labels, fb], ignore_index=True)
+
+    if labels.empty:
+        # Fallback for initial run if no data exists yet
+        print("[warn] No labels found. Returning empty DataFrame.")
+        return pd.DataFrame(columns=["domain", "registered_domain", "label", "source", "ingest_date"])
+
+    print("[info] total labels rows:", len(labels))
 
     # Normalise
     labels["registered_domain"] = labels["domain"].map(reg_domain)
     labels = labels[labels["registered_domain"].astype(bool)].copy()
 
     # Label: benign=0 if source==benign_seed else 1 (same convention as week5)
-    labels["label"] = np.where(labels["source"] == "benign_seed", 0, 1)
+    # Note: feedback rows usually have label=1 explicitly set
+    if "label" not in labels.columns:
+        labels["label"] = np.where(labels["source"] == "benign_seed", 0, 1)
+    else:
+        # fill missing for original rows
+        mask_missing = labels["label"].isna()
+        labels.loc[mask_missing, "label"] = np.where(
+            labels.loc[mask_missing, "source"] == "benign_seed", 0, 1
+        )
 
-    # only benign + phishing (ignore other weird sources if any)
+    # only benign + phishing
     labels = labels[labels["label"].isin([0, 1])].copy()
+    labels["label"] = labels["label"].astype(int)
 
     # ensure ingest_date is string for grouping / temporal split
+    if "ingest_date" not in labels.columns:
+         labels["ingest_date"] = NOW_UTC.strftime("%Y-%m-%d")
     labels["ingest_date"] = labels["ingest_date"].astype(str)
 
     print(
@@ -154,12 +181,15 @@ def load_all_labels():
 labels = load_all_labels()
 
 # pick latest ingest_date per registered_domain (for temporal split later)
-last_seen = (
-    labels.groupby("registered_domain")["ingest_date"]
-    .max()
-    .reset_index()
-    .rename(columns={"ingest_date": "last_ingest_date"})
-)
+if not labels.empty:
+    last_seen = (
+        labels.groupby("registered_domain")["ingest_date"]
+        .max()
+        .reset_index()
+        .rename(columns={"ingest_date": "last_ingest_date"})
+    )
+else:
+    last_seen = pd.DataFrame(columns=["registered_domain", "last_ingest_date"])
 
 # ---------------- load DNS (all days) ----------------
 
