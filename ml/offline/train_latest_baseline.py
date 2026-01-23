@@ -148,15 +148,9 @@ def load_all_labels():
     labels = labels[labels["registered_domain"].astype(bool)].copy()
 
     # Label: benign=0 if source==benign_seed else 1 (same convention as week5)
-    # Note: feedback rows usually have label=1 explicitly set
-    if "label" not in labels.columns:
-        labels["label"] = np.where(labels["source"] == "benign_seed", 0, 1)
-    else:
-        # fill missing for original rows
-        mask_missing = labels["label"].isna()
-        labels.loc[mask_missing, "label"] = np.where(
-            labels.loc[mask_missing, "source"] == "benign_seed", 0, 1
-        )
+    # The label column may exist but contain string values (e.g., "malware_download")
+    # We need to convert to binary: benign=0, phishing/malware=1
+    labels["label"] = np.where(labels["source"] == "benign_seed", 0, 1)
 
     # only benign + phishing
     labels = labels[labels["label"].isin([0, 1])].copy()
