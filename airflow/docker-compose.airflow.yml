@@ -39,6 +39,7 @@ services:
       - ../lookups:/opt/airflow/lookups
       - ../ct:/opt/airflow/ct
       - ../ml:/opt/airflow/ml
+      - ../gold:/opt/airflow/gold
     ports:
       - "8080:8080"
     command: webserver
@@ -67,6 +68,7 @@ services:
       - ../lookups:/opt/airflow/lookups
       - ../ct:/opt/airflow/ct
       - ../ml:/opt/airflow/ml
+      - ../gold:/opt/airflow/gold
     command: scheduler
 
   airflow-triggerer:
@@ -88,6 +90,7 @@ services:
       - ./plugins:/opt/airflow/plugins
       - ../ct:/opt/airflow/ct
       - ../ml:/opt/airflow/ml
+      - ../gold:/opt/airflow/gold
     command: triggerer
 
 volumes:

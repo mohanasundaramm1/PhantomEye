@@ -1,5 +1,7 @@
 # Airflow logs and state
 airflow/logs/
+airflow/benign/
+airflow/pre_migration_exports/
 airflow/airflow-webserver.pid
 airflow/airflow-worker.pid
 airflow/airflow.db
@@ -10,6 +12,8 @@ silver/
 lookups/
 ct/data/
 ct/chk/
+gold/
+chk/
 dlq/
 
 # Environments and caches
@@ -21,7 +25,5 @@ __pycache__/
 
 # ML artifacts
 ml/tmp/
-ml/models/*.joblib
-ml/models/*.bin
-ml/models/*.txt
+ml/models/
 ml/reports/

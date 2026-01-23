@@ -5,7 +5,7 @@ import glob
 
 from datetime import datetime
 
-DATA_DIR = os.path.join("ct", "data", "scored")
+DATA_DIR = os.path.join("gold", "threat_scores")
 
 st.set_page_config(
     page_title="CT Threat Intelligence Dashboard",

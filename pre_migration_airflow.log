@@ -1,6 +1,3 @@
-[[34m2025-11-14T02:06:18.979+0000[0m] {[34mscheduler_job_runner.py:[0m1657} INFO[0m - Reset the following 6 orphaned TaskInstances:
-	<TaskInstance: urlhaus_ingest.urlhaus_fetch_normalize_bronze scheduled__2025-11-13T00:00:00+00:00 [queued]>
-	<TaskInstance: openphish_ingest.openphish_fetch_normalize_bronze scheduled__2025-11-13T00:00:00+00:00 [queued]>
 	<TaskInstance: whois_rdap_ingest.whois_rdap_fetch scheduled__2025-11-13T00:00:00+00:00 [queued]>
 	<TaskInstance: dns_ip_geo_ingest.dns_ip_geo_fetch scheduled__2025-11-13T00:00:00+00:00 [queued]>
 	<TaskInstance: openphish_silver.openphish_bronze_to_silver scheduled__2025-11-13T00:00:00+00:00 [queued]>
@@ -198,3 +195,6 @@
 [[34m2025-11-14T02:52:12.760+0000[0m] {[34mdag.py:[0m3947} INFO[0m - Setting next_dagrun for pipeline_orchestrator to 2025-11-14 00:00:00+00:00, run_after=2025-11-15 00:00:00+00:00[0m
 [[34m2025-11-14T02:53:17.472+0000[0m] {[34mdag.py:[0m3947} INFO[0m - Setting next_dagrun for pipeline_orchestrator to 2025-11-14 00:00:00+00:00, run_after=2025-11-15 00:00:00+00:00[0m
 [[34m2025-11-14T02:53:49.617+0000[0m] {[34mdag.py:[0m3947} INFO[0m - Setting next_dagrun for pipeline_orchestrator to 2025-11-14 00:00:00+00:00, run_after=2025-11-15 00:00:00+00:00[0m
+[[34m2025-11-14T02:54:22.518+0000[0m] {[34mdag.py:[0m3947} INFO[0m - Setting next_dagrun for pipeline_orchestrator to 2025-11-14 00:00:00+00:00, run_after=2025-11-15 00:00:00+00:00[0m
+[[34m2025-11-14T02:54:54.047+0000[0m] {[34mdag.py:[0m3947} INFO[0m - Setting next_dagrun for pipeline_orchestrator to 2025-11-14 00:00:00+00:00, run_after=2025-11-15 00:00:00+00:00[0m
+[[34m2025-11-14T02:55:26.923+0000[0m] {[34mdag.py:[0m3947} INFO[0m - Setting next_dagrun for pipeline_orchestrator to 2025-11-14 00:00:00+00:00, run_after=2025-11-15 00:00:00+00:00[0m

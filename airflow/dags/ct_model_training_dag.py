@@ -28,6 +28,6 @@ with DAG(
         bash_command=f"""
         cd {REPO_ROOT} && \
         export PYTHONPATH=$PYTHONPATH:{REPO_ROOT} && \
-        python ml/offline/train_latest_baseline.py
+        python ml/core/train_model.py
         """
     )

@@ -9,8 +9,8 @@ This platform is designed to bridge the gap between reactive security lists and 
 ### Key Features
 *   **Automated Ingestion**: Live stream processing of OpenPhish, URLHaus, and MISP OSINT feeds.
 *   **Infrastructure Recon**: Automated enrichment of domains via recursive DNS and RDAP protocols.
-*   **Medallion Architecture**: Data-lake structure (Bronze → Silver → Gold) implemented via Parquet and Airflow.
-*   **Predictive Risk Scoring**: Machine learning models (LightGBM & Logistic Regression) trained on historical phishing patterns to score new domains.
+*   **Formal Medallion Architecture**: Production-grade data lakehouse structure (Bronze → Silver → Gold) implemented via Parquet and Airflow.
+*   **Self-Driving ML Core**: Modular LightGBM & Logistic Regression pipeline with active learning support for continuous model improvement.
 *   **Operational Dashboard**: Real-time Streamlit visualization for security analysts to investigate high-risk sightings.
 
 ---
@@ -31,13 +31,13 @@ graph TD
         B[Bronze: Raw Ingest]
         S[Silver: Normalization & Union]
         E[Enrichment: DNS/WHOIS/GeoIP]
-        ML[Gold: ML Risk Scoring]
+        G[Gold: Predictive Intelligence]
     end
 
     subgraph Storage [Data Lakehouse]
-        P1[(Parquet: Raw)]
-        P2[(Parquet: Normalized)]
-        P3[(Parquet: Scored)]
+        P1[(Bronze: Raw Parquet)]
+        P2[(Silver: Enriched Parquet)]
+        P3[(Gold: Scored Parquet)]
     end
 
     Sources --> B
@@ -45,8 +45,8 @@ graph TD
     P1 --> S
     S --> P2
     P2 --> E
-    E --> ML
-    ML --> P3
+    E --> G
+    G --> P3
     P3 --> Dash[Streamlit Dashboard]
 ```
 
