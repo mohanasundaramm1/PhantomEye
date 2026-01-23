@@ -28,3 +28,6 @@ joblib
 scikit-learn
 xgboost
 pyarrow
+fastapi
+uvicorn
+python-multipart
