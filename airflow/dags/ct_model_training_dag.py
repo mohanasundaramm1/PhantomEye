@@ -4,8 +4,7 @@ from airflow import DAG
 from airflow.operators.bash import BashOperator
 
 # Adjust this path if your repo lives somewhere else in the Airflow environment
-REPO_ROOT = "/Users/mohanasundarammurugasen/dev/threat-intel"
-VENV_ACTIVATE = f"source {REPO_ROOT}/.venv/bin/activate"
+REPO_ROOT = "/opt/airflow"
 
 default_args = {
     "owner": "ct-pipeline",
@@ -27,10 +26,8 @@ with DAG(
     train_latest_baseline = BashOperator(
         task_id="train_latest_baseline",
         bash_command=f"""
-        bash -lc '
         cd {REPO_ROOT} && \
-        {VENV_ACTIVATE} && \
+        export PYTHONPATH=$PYTHONPATH:{REPO_ROOT} && \
         python ml/offline/train_latest_baseline.py
-        '
         """
     )

@@ -9,7 +9,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      test: [ "CMD-SHELL", "pg_isready -U airflow" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -27,7 +27,7 @@ services:
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__DEFAULT_TIMEZONE: "UTC"
       AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
-      _PIP_ADDITIONAL_REQUIREMENTS: "psycopg2-binary pandas pyarrow requests dnspython tldextract great_expectations==0.18.12"
+      _PIP_ADDITIONAL_REQUIREMENTS: "psycopg2-binary pandas pyarrow requests dnspython tldextract great_expectations==0.18.12 scikit-learn scipy lightgbm joblib"
     volumes:
       - ./dags:/opt/airflow/dags
       - ./logs:/opt/airflow/logs
@@ -35,6 +35,8 @@ services:
       - ../bronze:/opt/airflow/bronze
       - ../silver:/opt/airflow/silver
       - ../lookups:/opt/airflow/lookups
+      - ../ct:/opt/airflow/ct
+      - ../ml:/opt/airflow/ml
     ports:
       - "8080:8080"
     command: webserver
@@ -49,9 +51,9 @@ services:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
       AIRFLOW__CORE__DEFAULT_TIMEZONE: "UTC"
-      AIRFLOW__SCHEDULER__ZOMBIE_TASK_THRESHOLD: "10800"   # 3 hours
+      AIRFLOW__SCHEDULER__ZOMBIE_TASK_THRESHOLD: "10800" # 3 hours
       AIRFLOW__SCHEDULER__TASK_HEARTBEAT_SEC: "30"
-      _PIP_ADDITIONAL_REQUIREMENTS: "psycopg2-binary pandas pyarrow requests dnspython tldextract great_expectations==0.18.12"
+      _PIP_ADDITIONAL_REQUIREMENTS: "psycopg2-binary pandas pyarrow requests dnspython tldextract great_expectations==0.18.12 scikit-learn scipy lightgbm joblib"
     volumes:
       - ./dags:/opt/airflow/dags
       - ./logs:/opt/airflow/logs
@@ -59,6 +61,8 @@ services:
       - ../bronze:/opt/airflow/bronze
       - ../silver:/opt/airflow/silver
       - ../lookups:/opt/airflow/lookups
+      - ../ct:/opt/airflow/ct
+      - ../ml:/opt/airflow/ml
     command: scheduler
 
   airflow-triggerer:
@@ -71,11 +75,13 @@ services:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
       AIRFLOW__CORE__DEFAULT_TIMEZONE: "UTC"
-      _PIP_ADDITIONAL_REQUIREMENTS: "psycopg2-binary pandas pyarrow requests dnspython tldextract great_expectations==0.18.12"
+      _PIP_ADDITIONAL_REQUIREMENTS: "psycopg2-binary pandas pyarrow requests dnspython tldextract great_expectations==0.18.12 scikit-learn scipy lightgbm joblib"
     volumes:
       - ./dags:/opt/airflow/dags
       - ./logs:/opt/airflow/logs
       - ./plugins:/opt/airflow/plugins
+      - ../ct:/opt/airflow/ct
+      - ../ml:/opt/airflow/ml
     command: triggerer
 
 volumes:

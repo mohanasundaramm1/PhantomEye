@@ -3,8 +3,7 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.bash import BashOperator
 
-REPO_ROOT = "/Users/mohanasundarammurugasen/dev/threat-intel"
-VENV_ACTIVATE = f"source {REPO_ROOT}/.venv/bin/activate"
+REPO_ROOT = "/opt/airflow"
 
 default_args = {
     "owner": "ct-pipeline",
@@ -28,12 +27,10 @@ with DAG(
     enrich_ct = BashOperator(
         task_id="enrich_ct",
         bash_command=f"""
-        bash -lc '
         cd {REPO_ROOT} && \
-        {VENV_ACTIVATE} && \
+        export PYTHONPATH=$PYTHONPATH:{REPO_ROOT} && \
         MAX_DOMAINS=2000 CAP_ROWS=50000 MAX_BRONZE_FILES=100 \
         python ct/enrich/enrich_ct.py
-        '
         """
     )
 
@@ -41,11 +38,9 @@ with DAG(
     score_ct = BashOperator(
         task_id="score_ct_with_latest",
         bash_command=f"""
-        bash -lc '
         cd {REPO_ROOT} && \
-        {VENV_ACTIVATE} && \
+        export PYTHONPATH=$PYTHONPATH:{REPO_ROOT} && \
         python ct/score/score_ct_with_latest.py
-        '
         """
     )
 
