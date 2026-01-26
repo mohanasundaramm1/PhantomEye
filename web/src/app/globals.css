@@ -109,3 +109,26 @@ body {
 .animate-pulse-red {
   animation: pulse-red 2s infinite;
 }
+
+/* Custom Tactical Scrollbar */
+.scrollbar-custom::-webkit-scrollbar {
+  width: 4px;
+}
+
+.scrollbar-custom::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.scrollbar-custom::-webkit-scrollbar-thumb {
+  background: rgba(255, 0, 0, 0.2);
+  border-radius: 2px;
+}
+
+.scrollbar-custom::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 0, 0, 0.5);
+}
+
+.scrollbar-custom {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 0, 0, 0.2) rgba(255, 255, 255, 0.02);
+}

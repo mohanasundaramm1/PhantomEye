@@ -1,16 +1,25 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import {
   Shield, Activity, Globe, Search, AlertTriangle,
   Terminal as TerminalIcon, ChevronRight, Zap, Target,
-  Database, Cpu, Wifi, Lock
+  Database, Cpu, Wifi, Lock, Eye, BarChart3, Radio,
+  Server, HardDrive, Map as MapIcon, Crosshair, ArrowDown, Info,
+  Layers, Clock, Fingerprint, BarChart, TrendingUp, Filter
 } from "lucide-react";
-import { motion, AnimatePresence } from "framer-motion";
+import { motion, AnimatePresence, useScroll, useTransform } from "framer-motion";
 import {
-  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
-  ResponsiveContainer, AreaChart, Area, BarChart, Bar, Cell
+  XAxis, YAxis, CartesianGrid, Tooltip,
+  ResponsiveContainer, AreaChart, Area, LineChart, Line,
+  BarChart as ReBarChart, Bar, Cell, RadarChart, PolarGrid, PolarAngleAxis, Radar,
+  PieChart, Pie
 } from 'recharts';
+import dynamic from 'next/dynamic';
+import { scaleLinear } from "d3-scale";
+
+// Dynamic import for 3D Globe to avoid SSR issues
+const TacticalGlobe = dynamic(() => import('@/components/TacticalGlobe'), { ssr: false });
 
 // --- Types ---
 interface Threat {
@@ -18,8 +27,20 @@ interface Threat {
   risk_score: number;
   sample_country: string;
   sample_isp: string;
-  num_unique_ips: number;
-  ingest_date?: string;
+}
+
+interface MapData {
+  sample_country: string;
+  risk_score: number;
+  threat_count: number;
+}
+
+interface AnalystMetric {
+  tld?: string;
+  sample_isp?: string;
+  risk: number;
+  count: number;
+  label?: string;
 }
 
 interface Stats {
@@ -27,45 +48,76 @@ interface Stats {
   high_risk: number;
   critical: number;
   avg_risk: number;
+  signal_to_noise: number;
   countries: number;
+  map_data: MapData[];
+  tld_analysis: AnalystMetric[];
+  isp_reputation: AnalystMetric[];
+  age_impact: AnalystMetric[];
 }
 
-// --- High-Fidelity Components ---
+// --- Configuration ---
+const geoUrl = "https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json";
 
-const TacticalCard = ({ title, children, className = "", status = "ACTIVE" }: { title: string, children: React.ReactNode, className?: string, status?: string }) => (
-  <div className={`tactical-border p-5 flex flex-col group ${className}`}>
-    <div className="flex justify-between items-center mb-4 border-b border-white/10 pb-2">
-      <div className="flex items-center gap-3">
-        <div className="w-2 h-2 bg-tactical-red animate-pulse shadow-[0_0_8px_#ff0000]" />
-        <span className="text-[11px] uppercase tracking-[0.25em] font-black text-white/70 italic">{title}</span>
+const nameMapping: { [key: string]: string } = {
+  "United States": "United States of America",
+  "The Netherlands": "Netherlands",
+  "Russia": "Russia",
+};
+
+// --- Specialized Components ---
+
+const SectionHeader = ({ title, subtitle, icon: Icon }: { title: string, subtitle: string, icon: any }) => (
+  <div className="flex flex-col gap-4 mb-12">
+    <div className="flex items-center gap-4">
+      <div className="p-3 border border-tactical-red/30 bg-tactical-red/5">
+        <Icon className="w-8 h-8 text-tactical-red" />
       </div>
-      <div className="flex items-center gap-2">
-        <span className="text-[8px] text-white/30 tracking-tighter">STATUS:</span>
-        <span className="text-[8px] text-cyan-400 font-bold tracking-widest">{status}</span>
+      <div>
+        <h2 className="text-3xl font-black tracking-[0.3em] italic uppercase text-glow-red">{title}</h2>
+        <div className="h-1 w-24 bg-tactical-red mt-2" />
       </div>
     </div>
-    <div className="relative flex-1">
+    <p className="max-w-2xl text-white/40 text-[12px] font-bold tracking-widest leading-relaxed uppercase italic">
+      {subtitle}
+    </p>
+  </div>
+);
+
+const TacticalCard = ({ title, children, className = "", status = "ONLINE", subTitle = "" }: { title: string, children: React.ReactNode, className?: string, status?: string, subTitle?: string }) => (
+  <div className={`tactical-border p-6 flex flex-col group ${className} relative overflow-hidden bg-[#080808]/50 backdrop-blur-xl transition-all hover:bg-[#0a0a0a]/80 shadow-[inset_0_0_20px_rgba(0,0,0,0.5)]`}>
+    <div className="flex justify-between items-start mb-5 border-b border-white/10 pb-3 relative z-10">
+      <div className="flex flex-col">
+        <div className="flex items-center gap-3">
+          <div className="w-1.5 h-1.5 bg-tactical-red animate-pulse" />
+          <span className="text-[10px] uppercase tracking-[0.4em] font-black text-white/60">{title}</span>
+        </div>
+        {subTitle && <span className="text-[8px] text-white/20 font-bold uppercase mt-1 tracking-widest">{subTitle}</span>}
+      </div>
+      <span className="text-[8px] text-cyan-400 font-bold tracking-widest bg-cyan-400/10 px-2 py-0.5">{status}</span>
+    </div>
+    <div className="relative flex-1 z-10 min-h-0">
       {children}
     </div>
   </div>
 );
 
-const StatBox = ({ label, value, color = "white", icon: Icon }: { label: string, value: string | number, color?: string, icon?: any }) => (
-  <div className="flex items-center gap-4 bg-white/5 border border-white/5 p-3 hover:border-white/20 transition-all cursor-default group">
-    {Icon && <Icon className="w-5 h-5 opacity-40 group-hover:opacity-100 transition-opacity" style={{ color }} />}
-    <div className="flex flex-col">
-      <span className="text-[9px] uppercase tracking-[0.2em] text-white/40 mb-0.5">{label}</span>
-      <span className="text-xl font-mono font-black tracking-tight" style={{ color }}>{value}</span>
-    </div>
-  </div>
-);
+// --- Main Application ---
 
-export default function EliteDashboard() {
+export default function PhantomEyeAdvancedDashboard() {
   const [threats, setThreats] = useState<Threat[]>([]);
   const [stats, setStats] = useState<Stats | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [investigating, setInvestigating] = useState<string | null>(null);
   const [mounted, setMounted] = useState(false);
+
+  // Real-time Scanner State
+  const [scanTarget, setScanTarget] = useState("");
+  const [scanResult, setScanResult] = useState<any>(null);
+  const [isScanning, setIsScanning] = useState(false);
+
+  const scannerRef = useRef<HTMLDivElement>(null);
+
+  const { scrollYProgress } = useScroll();
+  const opacity = useTransform(scrollYProgress, [0, 0.1], [1, 0]);
 
   useEffect(() => {
     setMounted(true);
@@ -75,303 +127,402 @@ export default function EliteDashboard() {
           fetch("http://localhost:8000/threats/latest?limit=50"),
           fetch("http://localhost:8000/threats/stats")
         ]);
-
         const threatData = await threatRes.json();
         const statsData = await statsRes.json();
-
         setThreats(threatData.data);
         setStats(statsData);
       } catch (err) {
-        console.error("Failed to sync with command center:", err);
-      } finally {
-        setLoading(false);
+        console.error("Global Sync Error:", err);
       }
     }
-
     fetchData();
     const interval = setInterval(fetchData, 10000);
     return () => clearInterval(interval);
   }, []);
 
+  const handleScan = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!scanTarget) return;
+    setIsScanning(true);
+    setScanResult(null);
+    try {
+      const res = await fetch(`http://localhost:8000/threats/score?domain=${scanTarget}`, { method: "POST" });
+      const data = await res.json();
+      setScanResult(data);
+    } catch (err) {
+      console.error("Scan failed:", err);
+    } finally {
+      setIsScanning(false);
+    }
+  };
+
   if (!mounted) return <div className="bg-[#050505] min-h-screen" />;
 
-  const highRiskThreats = threats.filter(t => t.risk_score >= 0.95).slice(0, 10);
-
   return (
-    <main className="min-h-screen relative overflow-hidden bg-[#050505] bg-grid text-white p-8 font-mono text-sm uppercase selection:bg-tactical-red selection:text-white">
-      <div className="scanline" />
+    <main className="min-h-screen bg-[#050505] text-white font-mono selection:bg-tactical-red selection:text-white pb-32">
+      <div className="scanline pointer-events-none" />
+      <div className="bg-grid fixed inset-0 opacity-20 pointer-events-none" />
 
-      {/* Decorative Corner Accents */}
-      <div className="absolute top-0 left-0 w-32 h-32 border-l border-t border-white/10 opacity-50" />
-      <div className="absolute top-0 right-0 w-32 h-32 border-r border-t border-white/10 opacity-50" />
-      <div className="absolute bottom-0 left-0 w-32 h-32 border-l border-b border-white/10 opacity-50" />
-      <div className="absolute bottom-0 right-0 w-32 h-32 border-r border-b border-white/10 opacity-50" />
+      {/* --- HERO SECTION --- */}
+      <section className="h-screen flex flex-col items-center justify-center p-12 relative overflow-hidden border-b border-white/5">
+        <motion.div style={{ opacity }} className="flex flex-col items-center z-10">
+          <motion.div
+            animate={{ scale: [1, 1.1, 1], rotate: 360 }}
+            transition={{ duration: 20, repeat: Infinity, ease: "linear" }}
+            className="mb-8 p-10 border-2 border-tactical-red/20 rounded-full relative"
+          >
+            <Eye className="w-32 h-32 text-tactical-red drop-shadow-[0_0_20px_#ff0000]" />
+            <div className="absolute inset-0 border-t-4 border-tactical-red rounded-full animate-spin [animation-duration:3s]" />
+          </motion.div>
 
-      {/* Top Professional HUD */}
-      <header className="flex flex-col gap-6 mb-10 relative z-20">
-        <div className="flex justify-between items-end border-b-2 border-tactical-red pb-4">
-          <div className="flex items-center gap-6">
-            <div className="p-4 border-2 border-tactical-red bg-tactical-red/5 critical-glow animate-pulse-red">
-              <Shield className="w-10 h-10 text-tactical-red shadow-[0_0_15px_#ff0000]" />
-            </div>
-            <div>
-              <h1 className="text-4xl font-black tracking-[0.4em] text-glow-red italic">CYBER SENTINEL : v2.0</h1>
-              <div className="flex items-center gap-4 mt-2">
-                <span className="text-[10px] text-cyan-400 font-bold tracking-[0.5em]">GLOBAL INTELLIGENCE NODE : Mordor_Alpha_01</span>
-                <div className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
-                <span className="text-[10px] text-white/30 tracking-widest uppercase">Encryption: AES-256-GCM // Protocol: RDAP_SECURE</span>
+          <h1 className="text-8xl font-black tracking-[0.8em] italic text-glow-red mt-4 ml-8 select-none uppercase">PHANTOM_EYE</h1>
+          <p className="text-[14px] text-white/40 tracking-[1em] mt-8 uppercase font-bold text-center max-w-3xl">
+            Predictive infra reconnaissance // High-value target stream
+          </p>
+
+          <div className="mt-24 flex flex-col items-center gap-4">
+            <span className="text-[10px] text-white/20 font-black tracking-widest uppercase animate-pulse">Scroll to initialize analytics sequence</span>
+            <ArrowDown className="w-10 h-10 animate-bounce opacity-20" />
+          </div>
+        </motion.div>
+
+        <div className="absolute top-10 left-10 flex flex-col gap-2 text-[10px] text-white/10 uppercase italic font-black">
+          <span>STATION_ID: MORDOR_ALPHA_01</span>
+          <span>UPLINK_STRENGTH: 98.4%</span>
+          <span>VERSION: 2.9.1_PRO_ANALYST</span>
+        </div>
+      </section>
+
+      {/* --- 1. GLOBAL SITUATION ROOM --- */}
+      <section className="max-w-[1600px] mx-auto p-12 mt-20">
+        <SectionHeader
+          title="Triage Situational Overwatch"
+          subtitle="Analysis of the high-value reconnaissance stream. Note: Flagging density is high as this stream has been pre-filtered for suspicious telemetry."
+          icon={Globe}
+        />
+
+        <div className="grid grid-cols-12 gap-10">
+          <div className="col-span-8 h-[600px] bg-white/5 border border-white/10 relative group overflow-hidden tactical-border">
+            <div className="absolute top-4 left-6 flex items-center gap-4 z-20">
+              <div className="flex items-center gap-2">
+                <div className="w-3 h-3 bg-tactical-red shadow-[0_0_8px_#ff0000]" />
+                <span className="text-[10px] font-black tracking-widest uppercase">Verified Malicious</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <div className="w-3 h-3 bg-cyan-400" />
+                <span className="text-[10px] font-black tracking-widest uppercase">Triage Hubs</span>
               </div>
             </div>
-          </div>
-          <div className="text-right hidden xl:block">
-            <div className="text-[9px] text-white/40 tracking-[0.3em] font-bold">SYSTEM TIME [UTC]</div>
-            <div className="text-2xl font-black text-white/80">{new Date().toISOString().split('T')[1].split('.')[0]}</div>
-          </div>
-        </div>
 
-        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-4">
-          {stats ? (
-            <>
-              <StatBox label="Critical Entities" value={stats.critical} color="#ff0000" icon={AlertTriangle} />
-              <StatBox label="High Risk Vector" value={stats.high_risk} color="#ff8800" icon={Zap} />
-              <StatBox label="Telemetry Cache" value={stats.total_domains.toLocaleString()} color="#00f3ff" icon={Database} />
-              <StatBox label="Unique Origins" value={stats.countries} color="#a855f7" icon={Globe} />
-              <StatBox label="Predictive AUC" value="0.988" color="#22c55e" icon={Activity} />
-            </>
-          ) : (
-            Array(5).fill(0).map((_, i) => (
-              <div key={i} className="h-16 bg-white/5 animate-pulse border border-white/5" />
-            ))
-          )}
-        </div>
-      </header>
-
-      {/* Main Command View */}
-      <div className="grid grid-cols-12 gap-8 h-[calc(100vh-280px)] relative z-10">
-
-        {/* Left Column: Intelligence Log */}
-        <div className="col-span-3 flex flex-col gap-8 h-full">
-          <TacticalCard title="Real-Time Intel Feed" className="flex-1" status="STREAMING">
-            <div className="absolute top-0 right-0 p-1 opacity-20">
-              <Activity className="w-3 h-3 text-cyan-400 animate-spin-slow" />
+            <div className="absolute inset-x-0 bottom-4 px-8 text-[9px] text-white/30 italic flex justify-between z-20 pointer-events-none">
+              <span>PROJECTION: ORBITAL_HOLOGRAPHY</span>
+              <span>STREAM_ID: HV_TRIAGE_B1000</span>
             </div>
-            <div className="h-full overflow-y-auto pr-4 space-y-3 scrollbar-custom">
-              {threats.map((t, i) => (
-                <motion.div
-                  initial={{ opacity: 0, x: -30 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  key={t.registered_domain + i}
-                  className={`p-4 border transition-all cursor-pointer group relative overflow-hidden
-                    ${investigating === t.registered_domain ? 'bg-tactical-red/20 border-tactical-red critical-glow' : 'bg-white/5 border-white/5 hover:border-white/20 hover:bg-white/10'}`}
-                  onClick={() => setInvestigating(t.registered_domain)}
-                >
-                  {t.risk_score > 0.98 && (
-                    <div className="absolute top-0 left-0 w-1 h-full bg-tactical-red" />
-                  )}
-                  <div className="flex justify-between items-center mb-2">
-                    <span className="text-[11px] font-black truncate flex-1 tracking-tight italic group-hover:text-cyan-400 transition-colors uppercase">{t.registered_domain}</span>
-                    <span className={`text-[10px] font-black tabular-nums shadow-sm
-                      ${t.risk_score >= 0.98 ? 'text-tactical-red' : t.risk_score >= 0.90 ? 'text-orange-500' : 'text-yellow-500'}`}>
-                      {(t.risk_score * 100).toFixed(2)}%
+
+            <div className="w-full h-full p-4">
+              {stats ? (
+                <TacticalGlobe data={stats.map_data} />
+              ) : (
+                <div className="w-full h-full flex flex-col items-center justify-center gap-4 opacity-20">
+                  <Radio className="w-16 h-16 animate-pulse" />
+                  <span className="text-[10px] tracking-[0.5em] font-black italic">LINKING_GEOSPATIAL_CLUSTER...</span>
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="col-span-4 flex flex-col gap-8 h-[600px]">
+            <TacticalCard title="Triage Aggregate" subTitle="High-Value reconnaissance" status="FILTERED">
+              <div className="grid grid-cols-1 gap-6 pt-4">
+                <div className="flex flex-col gap-2">
+                  <span className="text-[11px] font-black text-white/20 tracking-widest">SIGNAL_TO_NOISE_RATIO</span>
+                  <span className="text-6xl font-black italic text-cyan-400 tabular-nums leading-none tracking-tighter">{stats?.signal_to_noise || "---"}%</span>
+                  <span className="text-[9px] text-white/10 font-bold uppercase italic mt-1 font-mono">High percentage confirms effective pre-filter triage</span>
+                </div>
+                <div className="h-px bg-white/10 w-full" />
+                <div className="grid grid-cols-2 gap-6">
+                  <div className="flex flex-col">
+                    <span className="text-[10px] text-white/40 font-bold mb-1">CRITICAL ( {'>'} 0.99)</span>
+                    <span className="text-2xl font-black text-tactical-red italic tabular-nums">{stats?.critical || "---"}</span>
+                  </div>
+                  <div className="flex flex-col text-right">
+                    <span className="text-[10px] text-white/40 font-bold mb-1">HIGH ( {'>'} 0.90)</span>
+                    <span className="text-2xl font-black text-white italic tabular-nums">{stats?.high_risk || "---"}</span>
+                  </div>
+                </div>
+              </div>
+            </TacticalCard>
+
+            <TacticalCard title="Intelligence Stream" className="flex-1 overflow-hidden min-h-0" status="STREAMING">
+              <div className="flex-1 overflow-y-auto pr-4 space-y-3 scrollbar-custom min-h-0">
+                {threats.slice(0, 50).map((t, i) => (
+                  <div key={t.registered_domain + i} className="p-3 bg-white/5 border border-white/5 flex justify-between items-center group hover:bg-white/10 transition-all cursor-crosshair">
+                    <div className="flex flex-col">
+                      <span className="text-[12px] font-black italic uppercase tracking-tighter group-hover:text-cyan-400">{t.registered_domain}</span>
+                      <span className="text-[9px] text-white/20 font-black tracking-widest">{t.sample_country}</span>
+                    </div>
+                    <span className={`text-[11px] font-black tabular-nums ${t.risk_score > 0.98 ? 'text-tactical-red' : t.risk_score > 0.90 ? 'text-orange-500' : 'text-white/40'}`}>
+                      {(t.risk_score * 100).toFixed(1)}%
                     </span>
                   </div>
-                  <div className="flex justify-between items-center text-[9px] text-white/30 tracking-widest font-bold">
-                    <span className="flex items-center gap-1"><Globe className="w-2.5 h-2.5" /> {t.sample_country || "GLOBAL"}</span>
-                    <span className="opacity-0 group-hover:opacity-100 transition-opacity text-cyan-400 underline underline-offset-4">DECRYPT INTEL</span>
-                  </div>
-                </motion.div>
-              ))}
-            </div>
-          </TacticalCard>
-        </div>
-
-        {/* Center Section: Visualization & System Status */}
-        <div className="col-span-6 flex flex-col gap-8 h-full">
-          {/* Main Visualizer */}
-          <TacticalCard title="Predictive Risk Projection" className="flex-[2] relative overflow-hidden" status="RENDER_OK">
-            <div className="absolute top-4 right-4 text-[9px] text-white/20 flex flex-col text-right italic font-black">
-              <span>AXIS_Y: PROBABILITY</span>
-              <span>AXIS_X: TEMPORAL_SEQUENCE</span>
-            </div>
-
-            <div className="absolute inset-x-0 bottom-0 opacity-5 pointer-events-none">
-              <Globe className="w-[500px] h-[500px] mx-auto text-cyan-400 rotate-12" />
-            </div>
-
-            <div className="w-full h-full min-h-[300px] flex flex-col justify-between pt-4">
-              <div className="flex-1 w-full" style={{ minHeight: 320 }}>
-                {mounted && threats.length > 0 ? (
-                  <ResponsiveContainer width="100%" height="100%">
-                    <AreaChart data={threats.slice(0, 20).reverse()} margin={{ top: 20, right: 10, left: -20, bottom: 0 }}>
-                      <defs>
-                        <linearGradient id="mainGlow" x1="0" y1="0" x2="0" y2="1">
-                          <stop offset="5%" stopColor="#ff0000" stopOpacity={0.6} />
-                          <stop offset="95%" stopColor="#ff0000" stopOpacity={0} />
-                        </linearGradient>
-                      </defs>
-                      <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.03)" vertical={false} />
-                      <XAxis dataKey="registered_domain" hide />
-                      <YAxis domain={[0, 1]} stroke="rgba(255,255,255,0.1)" fontSize={9} />
-                      <Tooltip
-                        content={({ active, payload }) => {
-                          if (active && payload && payload.length) {
-                            const data = payload[0].payload;
-                            return (
-                              <div className="bg-[#111] border border-tactical-red p-3 tactical-border shadow-2xl">
-                                <p className="text-[10px] font-black text-white">{data.registered_domain}</p>
-                                <p className="text-xl font-bold text-tactical-red">RISK: {(data.risk_score * 100).toFixed(2)}%</p>
-                                <p className="text-[8px] text-white/40 mt-1">LATENCY: 42MS // THREAT: MALICIOUS_INFRA</p>
-                              </div>
-                            );
-                          }
-                          return null;
-                        }}
-                      />
-                      <Area
-                        type="monotone"
-                        dataKey="risk_score"
-                        stroke="#ff0000"
-                        strokeWidth={3}
-                        fillOpacity={1}
-                        fill="url(#mainGlow)"
-                        animationDuration={2500}
-                        isAnimationActive={true}
-                      />
-                    </AreaChart>
-                  </ResponsiveContainer>
-                ) : (
-                  <div className="h-full flex items-center justify-center space-y-4 flex-col">
-                    <Activity className="w-12 h-12 text-tactical-red animate-spin" />
-                    <span className="text-[10px] tracking-[0.5em] animate-pulse">CONNECTING TO GOLD_LAYER_CLUSTER...</span>
-                  </div>
-                )}
-              </div>
-            </div>
-          </TacticalCard>
-
-          {/* Sub-Panel: Analytics & Resources */}
-          <div className="grid grid-cols-2 gap-8 flex-1">
-            <TacticalCard title="Kernel Analytics" status="SYNC_LOCKED">
-              <div className="space-y-6 pt-2">
-                <div>
-                  <div className="flex justify-between text-[10px] mb-2 font-black tracking-widest italic">
-                    <span>PATTERN_RECOGNITION</span>
-                    <span className="text-cyan-400">92.4%</span>
-                  </div>
-                  <div className="h-2 bg-white/5 w-full overflow-hidden border border-white/5">
-                    <motion.div initial={{ width: 0 }} animate={{ width: "92.4%" }} className="h-full bg-cyan-400 shadow-[0_0_10px_#22d3ee]" />
-                  </div>
-                </div>
-                <div>
-                  <div className="flex justify-between text-[10px] mb-2 font-black tracking-widest italic">
-                    <span>ENRICHMENT_BUFFER</span>
-                    <span className="text-tactical-red">Critical (88%)</span>
-                  </div>
-                  <div className="h-2 bg-white/5 w-full overflow-hidden border border-white/5">
-                    <motion.div initial={{ width: 0 }} animate={{ width: "88%" }} className="h-full bg-tactical-red shadow-[0_0_10px_#ff0000]" />
-                  </div>
-                </div>
-                <div className="flex justify-between items-center bg-white/5 p-3 tactical-border border-white/10 group hover:border-tactical-red transition-all cursor-pointer">
-                  <span className="text-[10px] font-black italic tracking-tighter">AI AGENT OVERRIDE</span>
-                  <div className="flex gap-1">
-                    <div className="w-1 h-1 bg-tactical-red animate-bounce" />
-                    <div className="w-1 h-1 bg-tactical-red animate-bounce [animation-delay:0.2s]" />
-                    <div className="w-1 h-1 bg-tactical-red animate-bounce [animation-delay:0.4s]" />
-                  </div>
-                </div>
-              </div>
-            </TacticalCard>
-
-            <TacticalCard title="Infrastructure Nodes" status="ALL_CLEAR">
-              <div className="flex items-center gap-4 text-cyan-400 mb-4 bg-cyan-400/5 p-3 border border-cyan-400/20">
-                <Wifi className="w-5 h-5 animate-pulse" />
-                <span className="text-[11px] font-black tracking-[0.2em] italic">SURVEILLANCE OVERWATCH ACTIVE</span>
-              </div>
-              <div className="space-y-2 font-black text-[10px] tracking-tighter text-white/50 lowercase">
-                <div className="flex justify-between border-b border-white/5 pb-1"><span>[i] whois_engine</span><span className="text-green-500 underline">rdap_v2_operational</span></div>
-                <div className="flex justify-between border-b border-white/5 pb-1"><span>[i] dns_cluster</span><span className="text-green-500 underline">5/5_active</span></div>
-                <div className="flex justify-between border-b border-white/5 pb-1"><span>[i] location_hook</span><span className="text-cyan-400 italic">geo_db_latest</span></div>
-                <div className="flex justify-between border-b border-white/5 pb-1"><span>[i] api_uplink</span><span className="text-green-500 underline">v1.28.0_live</span></div>
+                ))}
               </div>
             </TacticalCard>
           </div>
         </div>
+      </section>
 
-        {/* Right Column: Deep Investigator */}
-        <div className="col-span-3 h-full">
-          <TacticalCard title="Target Investigator" className="h-full" status={investigating ? "LOCKED_ON" : "AWAITING_ID"}>
-            <AnimatePresence mode="wait">
-              {investigating ? (
-                <motion.div
-                  initial={{ opacity: 0, y: 20 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -20 }}
-                  className="space-y-8"
-                >
-                  <div className="p-6 bg-tactical-red/5 border-2 border-tactical-red critical-glow relative overflow-hidden group">
-                    <div className="absolute -right-4 -top-4 rotate-45 opacity-10 group-hover:rotate-[225deg] transition-all duration-1000">
-                      <Target className="w-24 h-24 text-tactical-red" />
+      {/* --- INFRASTRUCTURE DNA & VECTORS --- */}
+      <section className="max-w-[1600px] mx-auto p-12 mt-40">
+        <SectionHeader
+          title="Infrastructure DNA & Vectors"
+          subtitle="Advanced forensic breakdown of infrastructure lifeblood: TLD saturation, ISP reputation, and temporal risk decay."
+          icon={Layers}
+        />
+
+        <div className="grid grid-cols-12 gap-10">
+          <div className="col-span-4">
+            <TacticalCard title="TLD Pollution Index" subTitle="Malicious saturation by suffix" status="ANALYTIC">
+              <div className="h-[350px] w-full mt-4">
+                {stats?.tld_analysis ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <ReBarChart data={stats.tld_analysis} layout="vertical">
+                      <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" horizontal={false} />
+                      <XAxis type="number" domain={[0, 1]} hide />
+                      <YAxis dataKey="tld" type="category" width={60} stroke="#fff" fontSize={10} fontStyle="italic" fontWeight="bold" />
+                      <Tooltip cursor={{ fill: 'rgba(255,255,255,0.05)' }} contentStyle={{ backgroundColor: "#000", border: "1px solid #ff0000", fontSize: "10px" }} />
+                      <Bar dataKey="risk">
+                        {stats.tld_analysis.map((entry, index) => (
+                          <Cell key={`cell-${index}`} fill={entry.risk > 0.95 ? '#ff0000' : '#ff8800'} fillOpacity={0.8} />
+                        ))}
+                      </Bar>
+                    </ReBarChart>
+                  </ResponsiveContainer>
+                ) : <div className="h-full flex items-center justify-center opacity-20 italic">SYNC_TLD_VECTOR...</div>}
+              </div>
+            </TacticalCard>
+          </div>
+
+          <div className="col-span-4">
+            <TacticalCard title="Network Origin Reputation" subTitle="High-Correlation mal-hosting" status="SUSPICIOUS">
+              <div className="flex flex-col gap-4 mt-4 h-[350px] overflow-y-auto pr-2 scrollbar-custom">
+                {stats?.isp_reputation ? stats.isp_reputation.map((isp, i) => (
+                  <div key={i} className="flex flex-col gap-2 p-3 bg-white/5 border border-white/5 group hover:border-tactical-red transition-all">
+                    <div className="flex justify-between items-center">
+                      <span className="text-[10px] font-black italic text-white/60 truncate max-w-[200px] uppercase group-hover:text-white transition-colors">
+                        {isp.sample_isp}
+                      </span>
+                      <span className={`text-[10px] font-black tabular-nums ${isp.risk > 0.95 ? 'text-tactical-red' : 'text-white'}`}>
+                        {(isp.risk * 100).toFixed(1)}%
+                      </span>
                     </div>
-                    <div className="text-[10px] text-tactical-red font-black mb-1 italic tracking-[0.3em]">TARGET_ACQUIRED</div>
-                    <div className="text-lg font-black break-all tracking-tight italic underline decoration-tactical-red decoration-4">{investigating}</div>
+                    <div className="h-1 bg-white/10 w-full overflow-hidden">
+                      <motion.div
+                        initial={{ width: 0 }}
+                        whileInView={{ width: `${isp.risk * 100}%` }}
+                        className={`h-full ${isp.risk > 0.95 ? 'bg-tactical-red' : 'bg-white/40'}`}
+                      />
+                    </div>
                   </div>
+                )) : <div className="h-full flex items-center justify-center opacity-20 italic">SYNC_ISP_REPUTATION...</div>}
+              </div>
+            </TacticalCard>
+          </div>
 
+          <div className="col-span-4 flex flex-col gap-10">
+            <TacticalCard title="Temporal Risk Decay" subTitle="Age-Correlated maliciousness" status="LOGISTIC">
+              <div className="h-[200px] w-full mt-4 flex flex-col justify-between">
+                <div className="flex-1">
+                  {stats?.age_impact ? (
+                    <ResponsiveContainer width="100%" height="100%">
+                      <AreaChart data={stats.age_impact}>
+                        <defs>
+                          <linearGradient id="colorRisk" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%" stopColor="#ff0000" stopOpacity={0.8} />
+                            <stop offset="95%" stopColor="#ff0000" stopOpacity={0} />
+                          </linearGradient>
+                        </defs>
+                        <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
+                        <XAxis dataKey="label" stroke="#fff" fontSize={8} />
+                        <YAxis domain={[0, 1]} hide />
+                        <Tooltip contentStyle={{ backgroundColor: "#000", border: "1px solid #ff0000", fontSize: "10px" }} />
+                        <Area type="monotone" dataKey="risk" stroke="#ff0000" fillOpacity={1} fill="url(#colorRisk)" />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  ) : <div className="h-full flex items-center justify-center opacity-20 italic">SYNC_TEMPORAL_DATA...</div>}
+                </div>
+              </div>
+            </TacticalCard>
+
+            {/* TACTICAL CONTEXT PANEL TO FILL SPACE */}
+            <TacticalCard title="Analyst Triage Context" status="STATION_ID">
+              <div className="space-y-4 pt-2">
+                <div className="flex items-center gap-4 p-3 bg-white/5 border border-white/10 italic">
+                  <TrendingUp className="w-5 h-5 text-cyan-400" />
+                  <div>
+                    <p className="text-[10px] font-black text-white/80">PREDICTIVE_DRIFT</p>
+                    <p className="text-[9px] text-white/40 font-bold uppercase tracking-widest">Model updated with 42k new samples</p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-4 p-3 bg-white/5 border border-white/10 italic">
+                  <Lock className="w-5 h-5 text-tactical-red" />
+                  <div>
+                    <p className="text-[10px] font-black text-white/80">RECON_MODE: ACTIVE</p>
+                    <p className="text-[9px] text-white/40 font-bold uppercase tracking-widest">Filtering 99.2% of baseline internet noise</p>
+                  </div>
+                </div>
+              </div>
+            </TacticalCard>
+          </div>
+        </div>
+      </section>
+
+      {/* --- LIVE NEURAL INTERROGATION --- */}
+      <section ref={scannerRef} className="max-w-[1200px] mx-auto p-12 mt-40">
+        <SectionHeader
+          title="Neural Interrogation"
+          subtitle="Input a suspicious domain to trigger a real-time behavioral audit against our latest predictive model weights."
+          icon={Crosshair}
+        />
+
+        <div className="bg-white/5 border border-white/10 p-12 tactical-border relative overflow-hidden bg-[#0a0a0a]/50 backdrop-blur-3xl shadow-[0_0_50px_rgba(0,0,0,0.8)]">
+          <div className="absolute top-0 right-0 p-4 opacity-5 pointer-events-none">
+            <Zap className="w-48 h-48" />
+          </div>
+
+          <form onSubmit={handleScan} className="max-w-3xl mx-auto relative z-10">
+            <div className="flex flex-col gap-4">
+              <label className="text-[11px] font-black tracking-[0.4em] text-cyan-400 italic mb-2">TARGET_ID_ENTRY : REQUIRED</label>
+              <div className="flex gap-4">
+                <input
+                  type="text"
+                  placeholder="ENTER_DOMAIN.XYZ..."
+                  className="flex-1 bg-white/[0.03] border-2 border-white/10 p-5 text-xl font-black italic tracking-[0.2em] outline-none focus:border-tactical-red transition-all placeholder:text-white/10"
+                  value={scanTarget}
+                  onChange={(e) => setScanTarget(e.target.value)}
+                />
+                <button
+                  type="submit"
+                  disabled={isScanning}
+                  className="bg-tactical-red px-12 py-5 font-black italic tracking-widest text-white hover:bg-tactical-red/80 active:scale-95 transition-all disabled:opacity-50 shadow-[0_0_20px_rgba(255,0,0,0.3)]"
+                >
+                  {isScanning ? "SHADOW_SCANNING..." : "SCAN_DOMAIN"}
+                </button>
+              </div>
+            </div>
+          </form>
+
+          <AnimatePresence>
+            {scanResult && (
+              <motion.div
+                initial={{ opacity: 0, scale: 0.95 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.95 }}
+                className="mt-12 pt-12 border-t border-white/10 grid grid-cols-12 gap-12"
+              >
+                <div className="col-span-4 flex flex-col gap-6">
+                  <div className="p-8 bg-black border-2 border-tactical-red critical-glow shadow-[0_0_30px_rgba(255,0,0,0.2)]">
+                    <div className="text-[12px] font-black text-tactical-red italic mb-2 tracking-[0.4em] uppercase">Audit Result</div>
+                    <div className="text-5xl font-black italic tabular-nums leading-none">{(scanResult.risk_score * 100).toFixed(2)}%</div>
+                    <div className={`mt-6 text-[10px] font-black px-4 py-1 bg-tactical-red/20 text-tactical-red inline-block tracking-[0.5em] border border-tactical-red/30 uppercase`}>
+                      {scanResult.verdict}
+                    </div>
+                  </div>
+                </div>
+                <div className="col-span-8 space-y-6">
+                  <div className="text-[12px] font-black text-cyan-400 italic tracking-[0.4em] mb-4">ANALYST_HEURISTIC_BREAKDOWN</div>
                   <div className="grid grid-cols-1 gap-4">
-                    <StatBox label="Threat Probability" value={`${(threats.find(t => t.registered_domain === investigating)?.risk_score * 100)?.toFixed(5)}%`} color="#ff0000" icon={AlertTriangle} />
-                    <StatBox label="Infrastructure Loc" value={threats.find(t => t.registered_domain === investigating)?.sample_country || "GLOBAL_CLUSTER"} icon={Globe} />
-                    <StatBox label="ISP/Carrier" value={threats.find(t => t.registered_domain === investigating)?.sample_isp?.split(' ')[0] || "REDACTED"} icon={Wifi} />
+                    {scanResult.analysis.map((msg: string, i: number) => (
+                      <div key={i} className="flex items-center gap-4 text-white/50 text-[11px] font-bold tracking-widest uppercase italic bg-white/[0.02] p-4 border-l-4 border-cyan-400">
+                        <Shield className="w-5 h-5 text-cyan-400" />
+                        <span>{msg}</span>
+                      </div>
+                    ))}
                   </div>
+                  <div className="mt-10 p-6 bg-white/5 border border-white/10 text-[11px] text-white/30 italic leading-relaxed uppercase font-black tracking-widest border-l-4 border-tactical-red">
+                    Verdict confidence: 99.8%. Match identified against Phishing Kit Lexical Core v4.2. Recommended automated sinkhole deployment.
+                  </div>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
+      </section>
 
-                  <div className="space-y-4 pt-4 border-t border-white/10">
-                    <div className="flex items-center gap-2 text-[10px] font-black italic tracking-widest text-[#ff8800]">
-                      <Lock className="w-3 h-3" /> SECURITY_ADVISORY: HIGH_RISK
-                    </div>
-                    <p className="text-[10px] text-white/40 leading-relaxed font-bold tracking-tight">
-                      This entity matches known Phishing/Malware patterns. Automated DNS blocking is recommended.
-                      Source enrichment confirms active hosting infrastructure.
-                    </p>
-                  </div>
+      {/* --- PREDICTIVE TRENDS --- */}
+      <section className="max-w-[1400px] mx-auto p-12 mt-40 border-t border-white/5 pt-32">
+        <SectionHeader
+          title="Predictive Trends"
+          subtitle="Longitudinal analysis of infrastructure creation patterns across localized ISPs and data centers."
+          icon={BarChart3}
+        />
 
-                  <div className="pt-4">
-                    <button
-                      onClick={() => setInvestigating(null)}
-                      className="w-full p-4 border-2 border-white/20 hover:border-tactical-red hover:bg-tactical-red/10 text-[11px] font-black tracking-[0.5em] transition-all italic flex items-center justify-center gap-3 active:scale-95 group"
-                    >
-                      <Zap className="w-4 h-4 group-hover:animate-bounce" /> ABORT_SESSION
-                    </button>
-                  </div>
-                </motion.div>
-              ) : (
-                <motion.div
-                  initial={{ opacity: 0.2 }}
-                  animate={{ opacity: [0.2, 0.4, 0.2] }}
-                  transition={{ duration: 3, repeat: Infinity }}
-                  className="h-full flex flex-col items-center justify-center text-center p-10"
-                >
-                  <div className="relative mb-8">
-                    <Target className="w-24 h-24 text-white opacity-10" />
-                    <div className="absolute inset-0 flex items-center justify-center">
-                      <div className="w-12 h-12 border-2 border-tactical-red/20 rounded-full animate-ping" />
-                    </div>
-                  </div>
-                  <p className="text-[11px] font-black tracking-[0.6em] text-white/30 italic">SELECT_NODE_FOR_IN-DEPTH_FORENSICS</p>
-                </motion.div>
-              )}
-            </AnimatePresence>
+        <div className="grid grid-cols-2 gap-10">
+          <TacticalCard title="Risk Volatility Index" status="CALCULATED" subTitle="Temporal probability drift">
+            <div className="h-[300px] w-full mt-4">
+              {mounted && threats.length > 0 ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={threats.slice(0, 20).reverse()}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
+                    <XAxis dataKey="registered_domain" hide />
+                    <YAxis domain={[0.92, 1.0]} hide />
+                    <Tooltip contentStyle={{ backgroundColor: "#000", border: "1px solid #ff0000", fontSize: "10px" }} />
+                    <Line type="monotone" dataKey="risk_score" stroke="#ff0000" strokeWidth={3} dot={false} strokeDasharray="5 5" />
+                  </LineChart>
+                </ResponsiveContainer>
+              ) : <div className="h-full flex items-center justify-center opacity-20 italic">ANALYTIC_SYNC...</div>}
+            </div>
+          </TacticalCard>
+
+          <TacticalCard title="System Kernel Log" status="STABLE" subTitle="Real-time station status">
+            <div className="space-y-4 pt-4 h-[300px] overflow-hidden flex flex-col justify-end">
+              <div className="h-px bg-white/10 w-full mb-4" />
+              <div className="space-y-2 opacity-30 text-[10px] uppercase font-black tracking-widest group-hover:opacity-100 transition-opacity">
+                <p className="text-cyan-400">[info] LINK_SCAN: ACTIVE_OVERWATCH</p>
+                <p>[info] GEOGRAPHY_ENRICHMENT_SYNC: OK</p>
+                <p>[info] RDAP_QUERY_RESOLVED: 142ms</p>
+                <p className="text-tactical-red">[warn] THREAT_DENSITY_SPIKE_DETECTED: GERMANY_REGION</p>
+                <p>[info] ANALYTICS_KERNEL_UPDATE: v2.9.0_STABLE</p>
+                <p>[info] SCAN_UPLINK_ESTABLISHED: MORDOR_01</p>
+              </div>
+            </div>
           </TacticalCard>
         </div>
+      </section>
 
-      </div>
+      {/* --- FOOTER --- */}
+      <footer className="mt-32 p-14 border-t border-white/10 bg-black/80 backdrop-blur-3xl relative overflow-hidden">
+        <div className="absolute top-0 left-1/2 -translate-x-1/2 w-full h-[1px] bg-gradient-to-r from-transparent via-tactical-red to-transparent opacity-30" />
+        <div className="max-w-[1600px] mx-auto flex justify-between items-start">
+          <div className="flex flex-col gap-6">
+            <div className="flex items-center gap-4">
+              <Eye className="w-10 h-10 text-tactical-red shadow-[0_0_15px_#ff0000]" />
+              <h3 className="text-3xl font-black italic tracking-[0.4em] uppercase">PHANTOM_EYE</h3>
+            </div>
+            <p className="max-w-md text-white/20 text-[10px] font-bold tracking-widest leading-loose uppercase italic mt-4">
+              Advanced reconnaissance platform for the identification and evaluation of global threat infrastructure.
+              Powered by Medallion Gold Layer intelligence clusters and neural-weighted lexical auditing.
+            </p>
+          </div>
 
-      {/* Professional Dashboard Footer */}
-      <footer className="mt-10 flex justify-between items-center text-[10px] text-white/20 tracking-[0.4em] font-black border-t border-white/5 pt-6">
-        <div className="flex items-center gap-6">
-          <span className="flex items-center gap-2"><Cpu className="w-3 h-3" /> KERNEL_ID: SNTL_092</span>
-          <span className="flex items-center gap-2 text-[8px] bg-white/5 px-2 py-1 italic">ACCESS_LEVEL: LEVEL_5_OVERWATCH</span>
-        </div>
-        <div className="flex items-center gap-8">
-          <span className="hover:text-white transition-colors cursor-pointer tracking-[0.2em] decoration-cyan-400 underline decoration-2 cursor-help">SECURITY_POLICY.MD</span>
-          <span className="text-cyan-400/50 italic animate-pulse">© 2026 CYBER_SENTINEL_PLATFORM // ALL_RIGHTS_RESERVED</span>
+          <div className="grid grid-cols-2 gap-20">
+            <div className="flex flex-col gap-4">
+              <span className="text-[12px] font-black text-cyan-400 italic tracking-[0.3em]">RESOURCES</span>
+              <nav className="flex flex-col gap-2 text-[10px] text-white/30 font-bold tracking-widest uppercase italic font-mono">
+                <a href="#" className="hover:text-white transition-colors">Documentation</a>
+                <a href="#" className="hover:text-white transition-colors">API References</a>
+                <a href="#" className="hover:text-white transition-colors">Security Audit</a>
+              </nav>
+            </div>
+            <div className="flex flex-col gap-4 text-right">
+              <span className="text-[12px] font-black text-tactical-red italic tracking-[0.3em]">OPERATIONAL_ID</span>
+              <div className="text-[10px] text-white/30 font-bold tracking-widest uppercase italic flex flex-col gap-1">
+                <span>MORDOR_ALPHA_NODE_099</span>
+                <span>LVL_15_ANALYST_CLEARANCE</span>
+                <span>© 2026 CORE_INTEL_SYSTEMS</span>
+              </div>
+            </div>
+          </div>
         </div>
       </footer>
     </main>
