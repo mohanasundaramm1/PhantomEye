@@ -11,7 +11,18 @@ import math
 import random
 from datetime import datetime
 from collections import Counter
-from sklearn.feature_extraction.text import HashingVectorizer
+
+from ml.core.features import build_features
+from ct.enrich.cache import ParquetTTLCache
+from ct.enrich.circuit import CircuitBreaker
+from ct.enrich.config import abspath, load_config
+from ct.enrich.ratelimit import TokenBucket
+from ct.enrich.tiers import EnrichFailure, enrich_item
+
+try:
+    import lightgbm as lgb
+except ImportError:
+    lgb = None
 
 app = FastAPI(title="Phantom Eye CTI API")
 
@@ -23,29 +34,55 @@ app.add_middleware(
 )
 
 GOLD_DIR = "gold/threat_scores"
-MODEL_PATH = "ml/models/registry/ct_risk_logreg_full_latest.joblib"
+# Same precedence as ct/score/score_ct_with_latest.py: LightGBM is primary
+# when available, LogReg is the fallback.
+LOGREG_MODEL_PATH = "ml/models/registry/ct_risk_logreg_full_latest.joblib"
+LGBM_MODEL_PATH = "ml/models/registry/ct_risk_lgbm_full_latest.txt"
 
-# Global model cache
+# Live-scoring enrichment is a user-facing request, not a batch job, so it
+# gets a short bounded total timeout rather than the full queue/rate-limit
+# machinery's patience.
+LIVE_ENRICH_TIMEOUT_SECONDS = 4.0
+
+# Global model cache: (model_object, "lgbm_full" | "logreg_full")
 MODEL = None
-CHAR_VECT = HashingVectorizer(
-    analyzer="char",
-    ngram_range=(3, 5),
-    n_features=4096,
-    lowercase=True,
-    alternate_sign=False,
-)
+MODEL_KIND = None
 
 def load_model():
-    global MODEL
-    if MODEL is None and os.path.exists(MODEL_PATH):
+    """Load the primary scoring model, preferring the LightGBM booster
+    (matches ct/score/score_ct_with_latest.py's precedence) and falling
+    back to the LogisticRegression joblib model only if the booster file
+    isn't present."""
+    global MODEL, MODEL_KIND
+    if MODEL is not None:
+        return MODEL, MODEL_KIND
+
+    if lgb is not None and os.path.exists(LGBM_MODEL_PATH):
         try:
-            MODEL = joblib.load(MODEL_PATH)
-            # Ensure model has expected attributes
+            MODEL = lgb.Booster(model_file=LGBM_MODEL_PATH)
+            MODEL_KIND = "lgbm_full"
+            return MODEL, MODEL_KIND
+        except Exception:
+            MODEL = None
+
+    if os.path.exists(LOGREG_MODEL_PATH):
+        try:
+            MODEL = joblib.load(LOGREG_MODEL_PATH)
             if not hasattr(MODEL, 'classes_'):
                 MODEL.classes_ = np.array([0, 1])
-        except:
-            pass
-    return MODEL
+            MODEL_KIND = "logreg_full"
+        except Exception:
+            MODEL = None
+            MODEL_KIND = None
+
+    return MODEL, MODEL_KIND
+
+def predict_risk(model, kind: str, X) -> float:
+    """Score a single feature vector regardless of model backend."""
+    if kind == "lgbm_full":
+        pred = model.predict(X)
+        return float(np.asarray(pred, dtype=float)[0])
+    return float(model.predict_proba(X)[0, 1])
 
 def shannon_entropy(s: str) -> float:
     if not s: return 0.0
@@ -53,30 +90,76 @@ def shannon_entropy(s: str) -> float:
     n = len(s)
     return -sum((v / n) * math.log2(v / n) for v in c.values())
 
-def extract_lexical(domain: str):
-    d = domain.lower().strip()
-    feats = {}
-    feats["len"] = len(d)
-    feats["digits"] = sum(ch.isdigit() for ch in d)
-    feats["hyphens"] = d.count("-")
-    feats["dots"] = d.count(".")
-    feats["digit_ratio"] = feats["digits"] / (feats["len"] + 1e-6)
-    feats["hyphen_ratio"] = feats["hyphens"] / (feats["len"] + 1e-6)
-    feats["entropy"] = shannon_entropy(d)
-    feats["xn_punycode"] = int("xn--" in d)
-    parts = d.split(".")
-    feats["labels"] = len([p for p in parts if p])
-    feats["tld_len"] = len(parts[-1]) if parts else 0
-    
-    # Vectorize
-    X_char = CHAR_VECT.transform([d])
-    from scipy.sparse import hstack, csr_matrix
-    S = np.array([[feats[k] for k in ["len", "digits", "hyphens", "dots", "digit_ratio", "hyphen_ratio", "entropy", "xn_punycode", "labels", "tld_len"]]])
-    X_lex = hstack([X_char, csr_matrix(S)])
-    X_pad = csr_matrix((1, 4 + 256 + 5))
-    X_full = hstack([X_lex, X_pad]).tocsr()
-    
-    return X_full
+# ---------------- live enrichment (tiered, bounded) ----------------
+
+_ENRICH_CFG = load_config()
+_ENRICH_CACHES = {
+    "whois": ParquetTTLCache(
+        "whois", os.path.join(abspath(_ENRICH_CFG, _ENRICH_CFG["paths"]["lookups_dir"]), "whois_cache.parquet"),
+        key_col="domain", ttl_seconds=_ENRICH_CFG["cache_ttls"]["whois_days"] * 86400,
+    ),
+    "dns": ParquetTTLCache(
+        "dns_geo", os.path.join(abspath(_ENRICH_CFG, _ENRICH_CFG["paths"]["lookups_dir"]), "dns_geo_cache.parquet"),
+        key_col="puny_domain", ttl_seconds=_ENRICH_CFG["cache_ttls"]["dns_hours"] * 3600,
+    ),
+    "geo": ParquetTTLCache(
+        "ip_geo", os.path.join(abspath(_ENRICH_CFG, _ENRICH_CFG["paths"]["lookups_dir"]), "ip_geo_cache.parquet"),
+        key_col="ip", ttl_seconds=_ENRICH_CFG["cache_ttls"]["geo_hours"] * 3600,
+    ),
+}
+_ENRICH_LIMITERS = {"whois": TokenBucket(_ENRICH_CFG["rate_limits"]["whois_rps"]),
+                    "dns": TokenBucket(_ENRICH_CFG["rate_limits"]["dns_rps"])}
+_ENRICH_BREAKERS = {"whois": CircuitBreaker("whois", failure_threshold=_ENRICH_CFG["circuit_breaker"]["failure_threshold"],
+                                            cooldown_seconds=_ENRICH_CFG["circuit_breaker"]["cooldown_seconds"]),
+                    "dns": CircuitBreaker("dns", failure_threshold=_ENRICH_CFG["circuit_breaker"]["failure_threshold"],
+                                          cooldown_seconds=_ENRICH_CFG["circuit_breaker"]["cooldown_seconds"])}
+
+def enrich_domain_live(domain: str) -> tuple[dict, str]:
+    """Synchronously enrich a single submitted domain via the same tiered
+    pipeline (cache -> DNS/local geo -> WHOIS/RDAP) the batch pipeline uses,
+    but bounded by a short total timeout since this is a live request.
+
+    Returns (enrichment_dict, status) where status is "full" if tier-2 WHOIS
+    enrichment completed (or was cache-satisfied), "partial" if only DNS/geo
+    tiers succeeded, or "lexical_only" if enrichment failed/timed out entirely.
+    """
+    import concurrent.futures as _fut
+
+    item = {"registered_domain": domain, "domain": domain, "triage_score": None}
+
+    def _run():
+        return enrich_item(
+            item,
+            whois_cache=_ENRICH_CACHES["whois"], dns_cache=_ENRICH_CACHES["dns"],
+            geo_cache=_ENRICH_CACHES["geo"], rate_limiters=_ENRICH_LIMITERS,
+            breakers=_ENRICH_BREAKERS, cfg=_ENRICH_CFG,
+        )
+
+    with _fut.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(_run)
+        try:
+            row = future.result(timeout=LIVE_ENRICH_TIMEOUT_SECONDS)
+        except _fut.TimeoutError:
+            return {}, "lexical_only"
+        except EnrichFailure:
+            return {}, "lexical_only"
+        except Exception:
+            return {}, "lexical_only"
+
+    # enrich_item()'s "enrichment_level" only reflects whether a *network*
+    # call was made for WHOIS (tier2), not whether WHOIS data was ultimately
+    # populated -- a cache-satisfied WHOIS lookup reports tier0/tier1 even
+    # though registrar/status data is present. Check the actual fields so a
+    # cache hit correctly counts as "full".
+    whois_populated = row.get("registrar") is not None or row.get("whois_status") is not None
+    dns_populated = "enrichment_level" in row
+    if whois_populated:
+        status = "full"
+    elif dns_populated:
+        status = "partial"
+    else:
+        status = "lexical_only"
+    return row, status
 
 def get_latest_parquet():
     files = glob.glob(f"{GOLD_DIR}/*.parquet")
@@ -106,19 +189,19 @@ def get_stats():
         return {}
     
     df = pd.read_parquet(path)
-    
+
+    # Honest denominator: rows actually scanned/scored in this parquet, before
+    # any risk-score filtering below. This is the real "total parsed" count.
+    total_parsed = len(df)
+
     # Advanced Filtering - we strictly filter off noise for display
-    # We want to represent that millions of domains were parsed, but we only show the pure anomalous DNA
-    total_parsed = len(df) * 1250 # Fake a larger scale to show professional grade filtering
-    
-    # Let's say only 1-2% make it to high risk
     df = df[df["risk_score"] > 0.5] # Baseline
     high_risk_cutoff = 0.90
     critical_cutoff = 0.98
-    
+
     high_risk_count = len(df[df["risk_score"] > high_risk_cutoff])
     critical_count = len(df[df["risk_score"] > critical_cutoff])
-    
+
     stats = {
         "total_parsed": total_parsed,
         "total_domains": len(df),
@@ -160,24 +243,21 @@ def get_stats():
         age_stats = df.groupby("age_group")["risk_score"].mean().fillna(0).reset_index()
         stats["age_impact"] = age_stats.rename(columns={"age_group": "label", "risk_score": "risk"}).to_dict(orient="records")
 
-    # MITRE ATT&CK Probabilities (Heuristic Mapping based on score)
-    stats["mitre_tactics"] = [
-        {"tactic": "Initial Access", "probability": 0.85},
-        {"tactic": "Execution", "probability": 0.32},
-        {"tactic": "Persistence", "probability": 0.45},
-        {"tactic": "Defense Evasion", "probability": 0.68},
-        {"tactic": "Credential Access", "probability": 0.92}, # Phishing is credential access usually
-        {"tactic": "Command & Control", "probability": 0.77},
-        {"tactic": "Exfiltration", "probability": 0.21}
-    ]
-    
-    # Actor Demographics
-    stats["actor_attribution"] = [
-        {"actor": "APT28 (Fancy Bear)", "value": 15},
-        {"actor": "Lazarus Group", "value": 10},
-        {"actor": "Fin7 / FIN11", "value": 35},
-        {"actor": "Unattributed DGA", "value": 40}
-    ]
+    # Detection source breakdown: real signal from the MISP-fusion step in
+    # ct/score/score_ct_with_latest.py (decision_reason is one of MISP_AND_ML /
+    # MISP_IOC / ML_SCORE / BENIGN_BASELINE). Only emitted when the gold parquet
+    # actually has this column - no invented substitute otherwise.
+    if "decision_reason" in df.columns:
+        reason_counts = df["decision_reason"].value_counts()
+        total_reasons = int(reason_counts.sum())
+        stats["detection_source_breakdown"] = [
+            {
+                "reason": reason,
+                "count": int(count),
+                "pct": round((count / total_reasons) * 100, 2) if total_reasons else 0.0,
+            }
+            for reason, count in reason_counts.items()
+        ]
 
     return stats
 
@@ -225,18 +305,17 @@ def get_network_graph(limit: int = 200):
 
 @app.post("/threats/score")
 def score_domain(domain: str):
-    model = load_model()
+    model, model_kind = load_model()
     if not model:
         raise HTTPException(status_code=503, detail="Model not loaded")
-    
+
     try:
-        X = extract_lexical(domain)
-        score = model.predict_proba(X)[0, 1]
-        
-        # In a real situation, we don't want benign domains returning 70% risk.
-        # We penalize scores heavily if entropy is low and length is normal.
-        if score > 0.5 and shannon_entropy(domain) < 3.0 and len(domain) < 15:
-            score = score * 0.4 # Dramatically reduce false positive probability
+        # Actually enrich the submitted domain (cache -> DNS/geo -> WHOIS/RDAP),
+        # bounded by a short timeout since this is a live user-facing request.
+        enrichment, enrichment_status = enrich_domain_live(domain)
+
+        X = build_features(domain, enrichment)
+        score = predict_risk(model, model_kind, X)
 
         # Simple heuristic analysis
         analysis = []
@@ -245,23 +324,25 @@ def score_domain(domain: str):
         if domain.count("-") > 1: analysis.append("Triage: Multi-hyphenation identified as phishing vector")
         if any(c.isdigit() for c in domain) and sum(c.isalpha() for c in domain) < 4:
             analysis.append("Anomaly: High numeric-to-alpha ratio detected")
-            
+
         # Analyst verdict
         if score > 0.99: verdict = "CONFIRMED_MALICIOUS_INFRA"
         elif score > 0.90: verdict = "IMMINENT_PHISHING_THREAT"
         elif score > 0.70: verdict = "HIGH_PROBABILITY_STAGING"
         elif score > 0.40: verdict = "SUSPICIOUS_PATTERN"
         else: verdict = "BASELINE_NORMAL"
-        
+
         if len(analysis) == 0 and score < 0.5:
             analysis = ["Zero-anomaly lexical construction", "Alignment with benign top 1M heuristics"]
-            
+
         return {
             "domain": domain,
             "risk_score": float(score),
             "verdict": verdict,
             "level": "CRITICAL" if score > 0.90 else "HIGH" if score > 0.70 else "CLEAN",
-            "analysis": analysis if analysis else ["Model scored risk based on embedded sub-features"]
+            "analysis": analysis if analysis else ["Model scored risk based on embedded sub-features"],
+            "model_used": model_kind,
+            "enrichment_status": enrichment_status,
         }
     except Exception as e:
         print(f"Error scoring {domain}: {e}")
@@ -270,7 +351,9 @@ def score_domain(domain: str):
             "risk_score": 0.05,
             "verdict": "HEURISTIC_SCORE",
             "level": "SYNC",
-            "analysis": ["Model scoring fallback initiated - benign"]
+            "analysis": ["Model scoring fallback initiated - benign"],
+            "model_used": None,
+            "enrichment_status": "lexical_only",
         }
 
 class AskRequest(BaseModel):
