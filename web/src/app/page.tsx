@@ -20,6 +20,8 @@ import { scaleLinear } from "d3-scale";
 
 // Dynamic import for 3D Globe to avoid SSR issues
 const TacticalGlobe = dynamic(() => import('@/components/TacticalGlobe'), { ssr: false });
+const NetworkGraph = dynamic(() => import('@/components/NetworkGraph'), { ssr: false });
+const IntelChat = dynamic(() => import('@/components/IntelChat'), { ssr: false });
 
 // --- Types ---
 interface Threat {
@@ -44,6 +46,7 @@ interface AnalystMetric {
 }
 
 interface Stats {
+  total_parsed: number;
   total_domains: number;
   high_risk: number;
   critical: number;
@@ -54,6 +57,8 @@ interface Stats {
   tld_analysis: AnalystMetric[];
   isp_reputation: AnalystMetric[];
   age_impact: AnalystMetric[];
+  mitre_tactics: { tactic: string, probability: number }[];
+  actor_attribution: { actor: string, value: number }[];
 }
 
 // --- Configuration ---
@@ -107,6 +112,7 @@ const TacticalCard = ({ title, children, className = "", status = "ONLINE", subT
 export default function PhantomEyeAdvancedDashboard() {
   const [threats, setThreats] = useState<Threat[]>([]);
   const [stats, setStats] = useState<Stats | null>(null);
+  const [network, setNetwork] = useState<any>(null);
   const [mounted, setMounted] = useState(false);
 
   // Real-time Scanner State
@@ -123,14 +129,17 @@ export default function PhantomEyeAdvancedDashboard() {
     setMounted(true);
     async function fetchData() {
       try {
-        const [threatRes, statsRes] = await Promise.all([
+        const [threatRes, statsRes, networkRes] = await Promise.all([
           fetch("http://localhost:8000/threats/latest?limit=50"),
-          fetch("http://localhost:8000/threats/stats")
+          fetch("http://localhost:8000/threats/stats"),
+          fetch("http://localhost:8000/threats/network")
         ]);
         const threatData = await threatRes.json();
         const statsData = await statsRes.json();
+        const networkData = await networkRes.json();
         setThreats(threatData.data);
         setStats(statsData);
+        setNetwork(networkData);
       } catch (err) {
         console.error("Global Sync Error:", err);
       }
@@ -235,9 +244,9 @@ export default function PhantomEyeAdvancedDashboard() {
             <TacticalCard title="Triage Aggregate" subTitle="High-Value reconnaissance" status="FILTERED">
               <div className="grid grid-cols-1 gap-6 pt-4">
                 <div className="flex flex-col gap-2">
-                  <span className="text-[11px] font-black text-white/20 tracking-widest">SIGNAL_TO_NOISE_RATIO</span>
-                  <span className="text-6xl font-black italic text-cyan-400 tabular-nums leading-none tracking-tighter">{stats?.signal_to_noise || "---"}%</span>
-                  <span className="text-[9px] text-white/10 font-bold uppercase italic mt-1 font-mono">High percentage confirms effective pre-filter triage</span>
+                  <span className="text-[11px] font-black text-white/20 tracking-widest">NOISE_REJECTION_RATE</span>
+                  <span className="text-6xl font-black italic text-cyan-400 tabular-nums leading-none tracking-tighter">{(100 - (stats?.signal_to_noise || 0.001)).toFixed(3)}%</span>
+                  <span className="text-[9px] text-white/10 font-bold uppercase italic mt-1 font-mono">Filtered from {stats ? (stats.total_parsed / 1000000).toFixed(2) : "--"}M queries / hr</span>
                 </div>
                 <div className="h-px bg-white/10 w-full" />
                 <div className="grid grid-cols-2 gap-6">
@@ -354,7 +363,6 @@ export default function PhantomEyeAdvancedDashboard() {
               </div>
             </TacticalCard>
 
-            {/* TACTICAL CONTEXT PANEL TO FILL SPACE */}
             <TacticalCard title="Analyst Triage Context" status="STATION_ID">
               <div className="space-y-4 pt-2">
                 <div className="flex items-center gap-4 p-3 bg-white/5 border border-white/10 italic">
@@ -368,9 +376,78 @@ export default function PhantomEyeAdvancedDashboard() {
                   <Lock className="w-5 h-5 text-tactical-red" />
                   <div>
                     <p className="text-[10px] font-black text-white/80">RECON_MODE: ACTIVE</p>
-                    <p className="text-[9px] text-white/40 font-bold uppercase tracking-widest">Filtering 99.2% of baseline internet noise</p>
+                    <p className="text-[9px] text-white/40 font-bold uppercase tracking-widest">Aggressive heuristic filtering active</p>
                   </div>
                 </div>
+              </div>
+            </TacticalCard>
+          </div>
+        </div>
+      </section>
+
+      {/* --- INFRASTRUCTURE TOPOLOGY & ATTRIBUTION --- */}
+      <section className="max-w-[1600px] mx-auto p-12 mt-40 pt-32 border-t border-white/5">
+        <SectionHeader
+          title="Topology & Attribution"
+          subtitle="Advanced Node-Link mapping of highly-scored infrastructure vectors, cross-correlated with known Advanced Persistent Threat (APT) demographics and MITRE ATT&CK probabilistic modeling."
+          icon={Cpu}
+        />
+
+        <div className="grid grid-cols-12 gap-10">
+          <div className="col-span-8 h-[700px] bg-white/5 border border-white/10 relative overflow-hidden tactical-border">
+            <TacticalCard title="Malicious Infrastructure Topology" status="NODE-LINK MAPPING" className="h-full">
+              <div className="h-full w-full">
+                <NetworkGraph data={network} />
+              </div>
+            </TacticalCard>
+          </div>
+          
+          <div className="col-span-4 flex flex-col gap-10 h-[700px]">
+            <TacticalCard title="Heuristic MITRE Mapping" subTitle="Adversarial Tactic Probability" status="PROBABILITIES" className="flex-1">
+              <div className="w-full h-full relative -mt-4">
+                {stats?.mitre_tactics ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <RadarChart cx="50%" cy="50%" outerRadius="60%" data={stats.mitre_tactics}>
+                      <PolarGrid stroke="rgba(255,255,255,0.1)" />
+                      <PolarAngleAxis dataKey="tactic" tick={{ fill: 'rgba(255,255,255,0.5)', fontSize: 9, fontWeight: 'bold' }} />
+                      <Radar name="Probability" dataKey="probability" stroke="#00ffff" fill="#00ffff" fillOpacity={0.3} />
+                      <Tooltip contentStyle={{ backgroundColor: "#000", border: "1px solid #00ffff", fontSize: "10px" }} />
+                    </RadarChart>
+                  </ResponsiveContainer>
+                ) : <div className="h-full flex items-center justify-center opacity-20 italic">SYNC_MITRE_MATRIX...</div>}
+              </div>
+            </TacticalCard>
+            
+            <TacticalCard title="Behavioral Attribution" subTitle="Clustered Entity Demographics" status="ANALYSIS" className="flex-1">
+              <div className="w-full h-[200px] mt-2">
+                {stats?.actor_attribution ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <PieChart>
+                      <Pie
+                        data={stats.actor_attribution}
+                        cx="50%" cy="50%" innerRadius={40} outerRadius={70}
+                        paddingAngle={5} dataKey="value" stroke="none"
+                      >
+                        {stats.actor_attribution.map((entry, index) => (
+                          <Cell key={`cell-${index}`} fill={['#ff0000', '#ff8800', '#00ffff', '#333333'][index % 4]} />
+                        ))}
+                      </Pie>
+                      <Tooltip contentStyle={{ backgroundColor: "#000", border: "1px solid #333", fontSize: "10px" }} />
+                    </PieChart>
+                  </ResponsiveContainer>
+                ) : <div className="h-full flex items-center justify-center opacity-20 italic">SYNC_ACTOR_DEMOGRAPHICS...</div>}
+              </div>
+              
+              <div className="flex flex-col gap-2 mt-4 overflow-y-auto w-full h-[70px] scrollbar-custom">
+                 {stats?.actor_attribution?.map((actor, idx) => (
+                   <div key={idx} className="flex justify-between items-center text-[10px]">
+                     <div className="flex items-center gap-2">
+                       <div className="w-2 h-2 rounded-full" style={{ backgroundColor: ['#ff0000', '#ff8800', '#00ffff', '#333333'][idx % 4]}}></div>
+                       <span className="font-bold text-white/70 uppercase tracking-wider">{actor.actor}</span>
+                     </div>
+                     <span className="font-black italic tabular-nums">{actor.value}%</span>
+                   </div>
+                 ))}
               </div>
             </TacticalCard>
           </div>
@@ -525,6 +602,9 @@ export default function PhantomEyeAdvancedDashboard() {
           </div>
         </div>
       </footer>
+      
+      {/* Live AI Intel Chat Interface */}
+      <IntelChat />
     </main>
   );
 }
