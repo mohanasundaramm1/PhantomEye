@@ -33,7 +33,13 @@ from pyspark.sql.functions import (
     lit,
     to_date,
 )
-from pyspark.sql.types import StructType, StructField, StringType
+from pyspark.sql.types import (
+    StructType,
+    StructField,
+    StringType,
+    DoubleType,
+    ArrayType,
+)
 
 # ---------- paths ----------
 
@@ -93,6 +99,10 @@ schema = StructType(
         StructField("event_ts", StringType(), False),
         StructField("producer_ts", StringType(), False),
         StructField("source", StringType(), False),
+        # attached by the forwarder's local triage pass (nullable for
+        # backward compatibility with pre-triage events)
+        StructField("triage_score", DoubleType(), True),
+        StructField("triage_reasons", ArrayType(StringType()), True),
     ]
 )
 
@@ -145,6 +155,8 @@ good = (
         to_timestamp(col("json.event_ts")).alias("event_ts"),
         to_timestamp(col("json.producer_ts")).alias("producer_ts"),
         col("json.source").alias("source"),
+        col("json.triage_score").alias("triage_score"),
+        col("json.triage_reasons").alias("triage_reasons"),
         current_timestamp().alias("ingest_ts"),
     )
     .withColumn(

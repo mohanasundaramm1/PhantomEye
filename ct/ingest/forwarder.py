@@ -6,9 +6,18 @@
 #   KAFKA_BOOTSTRAP_SERVERS   (default "localhost:29092")
 #   KAFKA_TOPIC               (default "ct-events")
 #   CERTSTREAM_WS             (default "ws://127.0.0.1:4000")
-#   SAMPLE_EVERY_N            (default "1" -> no sampling)
+#   SAMPLE_EVERY_N            (default "1" -> no sampling; legacy modulo sampler)
 #   FLUSH_EVERY               (default "500" messages between flushes)
 #   FLUSH_TIMEOUT_SEC         (default "5.0" seconds)
+#   CT_TRIAGE_CONFIG          (override path to config/triage.json)
+#   CT_LOW_PRIORITY_DIR       (override low-priority spool directory)
+#   CT_METRICS_LOG_EVERY_SEC  (default "30" seconds between counter log lines)
+#
+# Intake flow per domain (see config/triage.json for knobs):
+#   1. deterministic sampling (triage.should_sample) -> drop or keep
+#   2. local triage score (triage.triage_score):
+#        score >= pass_threshold -> forward to Kafka with score+reasons
+#        score <  pass_threshold -> append to low-priority jsonl spool
 
 import os
 import json
@@ -21,6 +30,11 @@ from websocket import WebSocketApp
 from kafka import KafkaProducer
 from kafka.errors import KafkaTimeoutError, KafkaError
 
+try:
+    from ct.ingest import triage
+except ImportError:  # running as a plain script from ct/ingest/
+    import triage
+
 # ---------- config ----------
 
 BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:29092")
@@ -30,6 +44,16 @@ SAMPLE_EVERY_N = int(os.getenv("SAMPLE_EVERY_N", "1"))  # 1 = no sampling
 
 FLUSH_EVERY = int(os.getenv("FLUSH_EVERY", "500"))
 FLUSH_TIMEOUT_SEC = float(os.getenv("FLUSH_TIMEOUT_SEC", "5.0"))
+
+THIS_DIR = os.path.dirname(__file__)
+DATA_DIR = os.path.abspath(os.path.join(THIS_DIR, "..", "data"))
+LOW_PRIORITY_DIR = os.getenv("CT_LOW_PRIORITY_DIR", os.path.join(DATA_DIR, "low_priority"))
+os.makedirs(LOW_PRIORITY_DIR, exist_ok=True)
+
+METRICS_LOG_EVERY_SEC = float(os.getenv("CT_METRICS_LOG_EVERY_SEC", "30"))
+
+TRIAGE_CFG = triage.load_config()
+TRIAGE_PASS_THRESHOLD = float(TRIAGE_CFG["triage"]["pass_threshold"])
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,6 +84,41 @@ producer = KafkaProducer(
 
 # how many messages we’ve queued since last flush
 _sent_since_flush = 0
+
+# ---------- intake metrics ----------
+
+_counters = {
+    "ingested": 0,        # domains seen after cleaning/regex
+    "sampled_out": 0,     # dropped by deterministic sampling
+    "triage_passed": 0,   # score >= threshold, forwarded to Kafka
+    "triage_deferred": 0, # score <  threshold, spooled to low-priority
+}
+_last_metrics_log = time.monotonic()
+
+
+def _maybe_log_metrics():
+    global _last_metrics_log
+    now = time.monotonic()
+    if now - _last_metrics_log >= METRICS_LOG_EVERY_SEC:
+        log.info(
+            "intake counters: ingested=%d sampled_out=%d triage_passed=%d triage_deferred=%d",
+            _counters["ingested"],
+            _counters["sampled_out"],
+            _counters["triage_passed"],
+            _counters["triage_deferred"],
+        )
+        _last_metrics_log = now
+
+
+def _spool_low_priority(event: dict):
+    """Append a below-threshold event to the day's low-priority jsonl spool."""
+    ds = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    path = os.path.join(LOW_PRIORITY_DIR, f"ds={ds}.jsonl")
+    try:
+        with open(path, "a") as f:
+            f.write(json.dumps(event) + "\n")
+    except OSError as e:
+        log.error("failed to spool low-priority event: %r", e)
 
 domain_re = re.compile(r"^[A-Za-z0-9\-\._*]+$")
 
@@ -116,8 +175,28 @@ def on_message(_ws, msg: str):
             if not d or not domain_re.match(d):
                 continue
 
+            _counters["ingested"] += 1
+
+            # deterministic sampling (brand/suspicious-TLD hits bypass it)
+            if not triage.should_sample(d, TRIAGE_CFG):
+                _counters["sampled_out"] += 1
+                continue
+
+            # cheap local triage before anything hits downstream enrichment
+            score, reasons = triage.triage_score(d, TRIAGE_CFG)
+            event = evt(d, i)
+            event["triage_score"] = round(score, 4)
+            event["triage_reasons"] = reasons
+
+            if score < TRIAGE_PASS_THRESHOLD:
+                _counters["triage_deferred"] += 1
+                _spool_low_priority(event)
+                continue
+
+            _counters["triage_passed"] += 1
+
             # enqueue event to Kafka (async)
-            producer.send(TOPIC, key=d, value=evt(d, i))
+            producer.send(TOPIC, key=d, value=event)
             batch_sent += 1
             _sent_since_flush += 1
 
@@ -127,6 +206,7 @@ def on_message(_ws, msg: str):
 
         if batch_sent:
             log.debug("sent %d domains from one CT message", batch_sent)
+        _maybe_log_metrics()
 
     except KafkaError as e:
         # Real Kafka error (broker down, auth, etc.)
