@@ -22,7 +22,9 @@ with DAG(
     max_active_runs=1,
 ) as dag:
 
-    # 1) Enrich CT domains (incremental)
+    # 1) Enrich CT domains via the queue-decoupled worker:
+    #    enqueue new bronze rows into the durable file queue, then drain it
+    #    under rate limits / circuit breakers (knobs in config/enrichment.json).
     # Tune MAX_DOMAINS / CAP_ROWS / MAX_BRONZE_FILES here.
     enrich_ct = BashOperator(
         task_id="enrich_ct",
@@ -30,7 +32,7 @@ with DAG(
         cd {REPO_ROOT} && \
         export PYTHONPATH=$PYTHONPATH:{REPO_ROOT} && \
         MAX_DOMAINS=2000 CAP_ROWS=50000 MAX_BRONZE_FILES=100 \
-        python ct/enrich/enrich_ct.py
+        python -m ct.enrich.enrich_worker --enqueue-from-bronze --drain
         """
     )
 
