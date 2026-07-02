@@ -168,6 +168,37 @@ def dns_ip_geo_task(ds: str, ts: str, **context):
     labels["puny_domain"] = labels["reg_domain"].map(_to_punycode)
     domains = sorted(labels["puny_domain"].dropna().unique().tolist())
 
+    # -------- queue-decoupled path --------
+    # Enqueue domains into the durable enrichment queue and drain via the shared
+    # worker (rate limits, timeouts, circuit breaker, TTL'd caches). Knobs in
+    # config/enrichment.json. DNS/GeoIP is Tier 0/1; WHOIS is gated by triage_score.
+    from ct.enrich.config import load_config
+    from ct.enrich.enrich_worker import build_caches, enqueue_domains, run_worker
+
+    cfg = load_config()
+    cfg["paths"]["lookups_dir"] = LOOKUPS_BASE
+    # keep this DAG cheap: DNS/geo only, skip Tier 2 WHOIS for these items
+    items = [{"registered_domain": d, "domain": d, "triage_score": 0.0} for d in domains]
+    enqueue_domains(items, cfg)
+    run_worker(cfg)
+
+    # daily subset from refreshed caches: dns pairs joined with ip geo
+    caches = build_caches(cfg)
+    dns_df = caches["dns"]._df
+    geo_df = caches["geo"]._df
+    daily = dns_df[dns_df["puny_domain"].astype(str).isin(domains)].copy()
+    if not geo_df.empty and "ip" in daily.columns:
+        daily = daily.merge(
+            geo_df.drop(columns=["fetched_at"], errors="ignore"),
+            on="ip", how="left", suffixes=("", "_geo"),
+        )
+    _atomic_to_parquet(daily, f"{outdir}/dns_geo.parquet")
+    log.info("[dns_ip_geo] ds=%s domains=%d daily_rows=%d -> %s",
+             ds, len(domains), len(daily), outdir)
+    return
+
+
+def _legacy_dns_ip_geo_inline(ds, outdir, domains):  # pragma: no cover (superseded by worker)
     # load persistent cache (tolerate corruption)
     if os.path.exists(DNS_GEO_CACHE_PATH):
         try:
