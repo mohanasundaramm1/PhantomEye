@@ -413,11 +413,13 @@ def has_two_classes(arr):
 Xtr_lex = Xte_lex = Xtr_full = Xte_full = None
 y_train = y_test = None
 used_temporal = False
+temporal_cutoff = None
 
 if "last_ingest_date" in Xdf.columns and Xdf["last_ingest_date"].notna().any():
     # Use last couple of days as "test" if possible
     cutoff = sorted(Xdf["last_ingest_date"].dropna().unique())[-1]
     print("[info] temporal split cutoff last_ingest_date >=", cutoff)
+    temporal_cutoff = str(cutoff)
     test_mask = (Xdf["last_ingest_date"] >= cutoff).to_numpy(bool)
     n_test = int(test_mask.sum())
     n_total = len(test_mask)
@@ -445,6 +447,7 @@ if "last_ingest_date" in Xdf.columns and Xdf["last_ingest_date"].notna().any():
         )
     else:
         print("[warn] temporal split degenerate; falling back to random split")
+        temporal_cutoff = None  # attempted but not actually used -- don't report a cutoff that wasn't applied
 
 if not used_temporal:
     Xtr_lex, Xte_lex, y_train, y_test = train_test_split(
@@ -575,6 +578,15 @@ meta = {
     "n_rows": int(len(Xdf)),
     "n_pos": int((y == 1).sum()),
     "n_neg": int((y == 0).sum()),
+    # Split methodology, made explicit rather than silently ambiguous: a
+    # reported AUC from a random split is not evidence of forward-looking
+    # predictive performance the way a genuine temporal split is. Consumers
+    # of this file (e.g. ct/score/score_ct_with_latest.py, dashboards) should
+    # treat used_temporal=False metrics with reduced confidence.
+    "used_temporal_split": used_temporal,
+    "temporal_cutoff_date": temporal_cutoff,
+    "n_train": int(len(y_train)),
+    "n_test": int(len(y_test)),
     "metrics": {
         "logreg_lex": metrics_logreg_lex,
         "logreg_full": metrics_logreg_full,
