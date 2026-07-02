@@ -61,6 +61,9 @@ interface Stats {
 }
 
 // --- Configuration ---
+// Backend base URL — override with NEXT_PUBLIC_API_BASE (e.g. for non-localhost
+// or IPv4-only environments); defaults to localhost:8000 for local dev.
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
 const geoUrl = "https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json";
 
 // decision_reason values emitted by the MISP-fusion step in
@@ -144,16 +147,22 @@ export default function PhantomEyeAdvancedDashboard() {
     async function fetchData() {
       try {
         const [threatRes, statsRes, networkRes] = await Promise.all([
-          fetch("http://localhost:8000/threats/latest?limit=50"),
-          fetch("http://localhost:8000/threats/stats"),
-          fetch("http://localhost:8000/threats/network")
+          fetch(`${API_BASE}/threats/latest?limit=50`),
+          fetch(`${API_BASE}/threats/stats`),
+          fetch(`${API_BASE}/threats/network`)
         ]);
+        // Skip this cycle on any bad response — keep last-good data rather than
+        // poisoning state with an error body (e.g. {detail:"Not Found"}).
+        if (!threatRes.ok || !statsRes.ok || !networkRes.ok) {
+          console.error("Sync skipped — backend status:", threatRes.status, statsRes.status, networkRes.status);
+          return;
+        }
         const threatData = await threatRes.json();
         const statsData = await statsRes.json();
         const networkData = await networkRes.json();
-        setThreats(threatData.data);
-        setStats(statsData);
-        setNetwork(networkData);
+        if (Array.isArray(threatData?.data)) setThreats(threatData.data);
+        if (statsData && typeof statsData.total_parsed === "number") setStats(statsData);
+        if (networkData && Array.isArray(networkData.nodes)) setNetwork(networkData);
       } catch (err) {
         console.error("Global Sync Error:", err);
       }
@@ -169,7 +178,7 @@ export default function PhantomEyeAdvancedDashboard() {
     setIsScanning(true);
     setScanResult(null);
     try {
-      const res = await fetch(`http://localhost:8000/threats/score?domain=${scanTarget}`, { method: "POST" });
+      const res = await fetch(`${API_BASE}/threats/score?domain=${encodeURIComponent(scanTarget)}`, { method: "POST" });
       const data = await res.json();
       setScanResult(data);
     } catch (err) {
@@ -260,7 +269,7 @@ export default function PhantomEyeAdvancedDashboard() {
                 <div className="flex flex-col gap-2">
                   <span className="text-[11px] font-black text-white/20 tracking-widest">NOISE_REJECTION_RATE</span>
                   <span className="text-6xl font-black italic text-cyan-400 tabular-nums leading-none tracking-tighter">{(100 - (stats?.signal_to_noise || 0.001)).toFixed(3)}%</span>
-                  <span className="text-[9px] text-white/10 font-bold uppercase italic mt-1 font-mono">Filtered from {stats ? (stats.total_parsed / 1000000).toFixed(2) : "--"}M queries / hr</span>
+                  <span className="text-[9px] text-white/10 font-bold uppercase italic mt-1 font-mono">Filtered from {stats?.total_parsed != null ? stats.total_parsed.toLocaleString() : "--"} domains in latest scan batch</span>
                 </div>
                 <div className="h-px bg-white/10 w-full" />
                 <div className="grid grid-cols-2 gap-6">

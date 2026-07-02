@@ -40,7 +40,8 @@ export default function IntelChat() {
     try {
       const history = messages.slice(-5).map(m => ({ role: m.role, content: m.content }));
       
-      const response = await fetch('http://localhost:8000/threats/ask', {
+      const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000';
+      const response = await fetch(`${API_BASE}/threats/ask`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query: userMessage.content, history })
