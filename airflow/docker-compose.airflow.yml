@@ -17,9 +17,8 @@ services:
   # One-shot initializer: migrate the metadata DB and create the admin user,
   # then exit. webserver/scheduler/triggerer wait for this via
   # service_completed_successfully, so a clean `docker compose up` / `make up-all`
-  # works with no manual db-migrate / user-create steps. Overrides the entrypoint
-  # to skip the heavy _PIP_ADDITIONAL_REQUIREMENTS install (migrate + user create
-  # only need core Airflow, not the DAG dependencies). Default login: admin / admin.
+  # works with no manual db-migrate / user-create steps. Overrides the default
+  # entrypoint to run migrate + user create directly. Default login: admin / admin.
   airflow-init:
     build:
       context: .
@@ -59,7 +58,6 @@ services:
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__DEFAULT_TIMEZONE: "UTC"
       AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
-      _PIP_ADDITIONAL_REQUIREMENTS: "psycopg2-binary pandas pyarrow requests dnspython tldextract great_expectations==0.18.12 scikit-learn scipy lightgbm joblib"
     volumes:
       - ./dags:/opt/airflow/dags
       - ./logs:/opt/airflow/logs
@@ -90,7 +88,6 @@ services:
       AIRFLOW__CORE__DEFAULT_TIMEZONE: "UTC"
       AIRFLOW__SCHEDULER__ZOMBIE_TASK_THRESHOLD: "10800" # 3 hours
       AIRFLOW__SCHEDULER__TASK_HEARTBEAT_SEC: "30"
-      _PIP_ADDITIONAL_REQUIREMENTS: "psycopg2-binary pandas pyarrow requests dnspython tldextract great_expectations==0.18.12 scikit-learn scipy lightgbm joblib"
     volumes:
       - ./dags:/opt/airflow/dags
       - ./logs:/opt/airflow/logs
@@ -117,7 +114,6 @@ services:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
       AIRFLOW__CORE__DEFAULT_TIMEZONE: "UTC"
-      _PIP_ADDITIONAL_REQUIREMENTS: "psycopg2-binary pandas pyarrow requests dnspython tldextract great_expectations==0.18.12 scikit-learn scipy lightgbm joblib"
     volumes:
       - ./dags:/opt/airflow/dags
       - ./logs:/opt/airflow/logs
