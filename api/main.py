@@ -198,9 +198,11 @@ def get_latest_threats(limit: int = 50):
         return {"data": []}
     df = pd.read_parquet(path)
     df = df.sort_values("risk_score", ascending=False)
-    # Give priority to heavily scored 
-    df = df[df["risk_score"] > 0.85] 
-    return {"data": df.head(limit).to_dict(orient="records")}
+    # Give priority to heavily scored
+    df = df[df["risk_score"] > 0.85]
+    out = df.head(limit).replace([np.inf, -np.inf], None)
+    out = out.astype(object).where(pd.notnull(out), None)
+    return {"data": out.to_dict(orient="records")}
 
 @app.get("/threats/stats")
 def get_stats():
@@ -222,32 +224,41 @@ def get_stats():
     high_risk_count = len(df[df["risk_score"] > high_risk_cutoff])
     critical_count = len(df[df["risk_score"] > critical_cutoff])
 
+    avg_risk = df["risk_score"].mean()
     stats = {
         "total_parsed": total_parsed,
         "total_domains": len(df),
         "high_risk": high_risk_count,
         "critical": critical_count,
-        "avg_risk": float(df["risk_score"].mean()),
+        "avg_risk": float(avg_risk) if pd.notnull(avg_risk) else 0.0,
         "signal_to_noise": round((critical_count / max(1, total_parsed)) * 100, 4),
         "countries": df["sample_country"].nunique() if "sample_country" in df.columns else 0
     }
-    
+
+    def _clean_records(frame: pd.DataFrame) -> list:
+        # pandas NaN/Inf aren't valid JSON under Starlette's strict encoder
+        # (allow_nan=False) -- a single NaN anywhere in the frame 500s the
+        # whole response. Sanitize before to_dict() rather than hoping
+        # every aggregation happens to be NaN-free.
+        cleaned = frame.replace([np.inf, -np.inf], None)
+        return cleaned.astype(object).where(pd.notnull(cleaned), None).to_dict(orient="records")
+
     # Map Data: Risk per country (Hex-Bins)
     if "sample_country" in df.columns:
         map_df = df.groupby("sample_country").agg(
             risk_score=("risk_score", "mean"),
             threat_count=("risk_score", "count")
         ).reset_index()
-        stats["map_data"] = map_df.to_dict(orient="records")
-    
+        stats["map_data"] = _clean_records(map_df)
+
     # TLD Analysis
     df["tld"] = df.get("registered_domain", pd.Series([""]*len(df))).apply(lambda x: str(x).split('.')[-1] if '.' in str(x) else 'none')
     tld_stats = df.groupby("tld").agg(
         risk=("risk_score", "mean"),
         count=("risk_score", "count")
     ).sort_values("count", ascending=False).head(10).reset_index()
-    stats["tld_analysis"] = tld_stats.to_dict(orient="records")
-    
+    stats["tld_analysis"] = _clean_records(tld_stats)
+
     # ISP / ASN Maliciousness
     if "sample_isp" in df.columns:
         isp_stats = df.groupby("sample_isp").agg(
@@ -255,13 +266,15 @@ def get_stats():
             count=("risk_score", "count")
         ).sort_values("count", ascending=False)
         isp_stats = isp_stats[isp_stats["count"] > 5].sort_values("risk", ascending=False).head(10).reset_index()
-        stats["isp_reputation"] = isp_stats.to_dict(orient="records")
+        stats["isp_reputation"] = _clean_records(isp_stats)
     
     # Age Distribution
     if "age_days" in df.columns:
         df["age_group"] = pd.cut(df["age_days"], bins=[-1, 1, 7, 30, 365, 9999], labels=["New (<1d)", "Fresh (<1w)", "Recent (<1m)", "Established", "Legacy"])
-        age_stats = df.groupby("age_group")["risk_score"].mean().fillna(0).reset_index()
-        stats["age_impact"] = age_stats.rename(columns={"age_group": "label", "risk_score": "risk"}).to_dict(orient="records")
+        age_stats = df.groupby("age_group", observed=False)["risk_score"].mean().fillna(0).reset_index()
+        age_stats = age_stats.rename(columns={"age_group": "label", "risk_score": "risk"})
+        age_stats["label"] = age_stats["label"].astype(str)
+        stats["age_impact"] = _clean_records(age_stats)
 
     # Detection source breakdown: real signal from the MISP-fusion step in
     # ct/score/score_ct_with_latest.py (decision_reason is one of MISP_AND_ML /
