@@ -217,6 +217,46 @@ def check_scored_staleness(scored_dir: str, lookback: int):
     return True, lines
 
 
+def check_scored_event_ts(scored_dir: str, max_age_hours: float):
+    """Newest scored file should carry RECENT event_ts values -- not a stale
+    re-score of an old snapshot. This catches the 'fresh filename, stale
+    content' failure: a scored file with a current mtime whose rows all carry
+    a months-old event_ts, which means the enrich->score pointer never
+    advanced to fresh domains. Returns (ok, lines)."""
+    lines = []
+    files = sorted(glob.glob(os.path.join(scored_dir, "ct_scored_*.parquet")),
+                   key=os.path.getmtime)
+    if not files:
+        lines.append("[event_ts] no scored files.")
+        return False, lines
+    newest = files[-1]
+    try:
+        import pandas as pd
+        df = pd.read_parquet(newest, columns=["event_ts"])
+        ets = pd.to_datetime(df["event_ts"], utc=True, errors="coerce")
+        newest_event = ets.max()
+    except Exception as e:
+        lines.append(f"[event_ts] could not read event_ts from {os.path.basename(newest)}: {e}")
+        return True, lines  # missing/unreadable column: don't hard-fail here
+    import pandas as pd
+    if pd.isna(newest_event):
+        lines.append(f"[event_ts] {os.path.basename(newest)} has no parseable event_ts.")
+        return True, lines
+    age_h = (pd.Timestamp.now(tz="UTC") - newest_event).total_seconds() / 3600.0
+    lines.append(f"[event_ts] newest scored file: {os.path.basename(newest)}")
+    lines.append(f"[event_ts] max event_ts in it: {newest_event.isoformat()} ({age_h:.1f}h old)")
+    if age_h > max_age_hours:
+        lines.append(
+            f"[event_ts] WARNING: newest scored data's event_ts is {age_h:.1f}h old "
+            f"(> {max_age_hours:.1f}h threshold). The scorer is emitting fresh FILES "
+            f"but STALE CONTENT -- the enrich->score pointer is not advancing to "
+            f"fresh domains. This is the exact break the July 2026 audit found."
+        )
+        return False, lines
+    lines.append(f"[event_ts] OK ({age_h:.1f}h <= {max_age_hours:.1f}h)")
+    return True, lines
+
+
 # ---------- CLI ----------
 
 def main(argv=None):
@@ -248,6 +288,17 @@ def main(argv=None):
         type=int,
         default=int(os.getenv("CT_SCORED_LOOKBACK", SCORED_LOOKBACK_DEFAULT)),
         help=f"how many recent scored files to compare (default: {SCORED_LOOKBACK_DEFAULT})",
+    )
+    ap.add_argument(
+        "--scored-event-max-age-hours",
+        type=float,
+        default=float(os.getenv("CT_SCORED_EVENT_MAX_AGE_HOURS", 6.0)),
+        help="fail if the newest scored file's max event_ts is older than this many hours (default: 6)",
+    )
+    ap.add_argument(
+        "--skip-event-ts",
+        action="store_true",
+        help="skip the scored event_ts freshness check",
     )
     ap.add_argument(
         "--skip-raw",
@@ -290,6 +341,13 @@ def main(argv=None):
         scored_ok, scored_lines = check_scored_staleness(args.scored_dir, args.scored_lookback)
         print("\n".join(scored_lines))
         ok = ok and scored_ok
+    print()
+
+    if not args.skip_event_ts:
+        ran_any = True
+        ev_ok, ev_lines = check_scored_event_ts(args.scored_dir, args.scored_event_max_age_hours)
+        print("\n".join(ev_lines))
+        ok = ok and ev_ok
     print()
 
     print("=" * 72)

@@ -68,6 +68,8 @@ services:
       - ../ct:/opt/airflow/ct
       - ../ml:/opt/airflow/ml
       - ../gold:/opt/airflow/gold
+      - ../config:/opt/airflow/config
+      - ../scripts:/opt/airflow/scripts
     ports:
       - "8080:8080"
     command: webserver
@@ -98,6 +100,8 @@ services:
       - ../ct:/opt/airflow/ct
       - ../ml:/opt/airflow/ml
       - ../gold:/opt/airflow/gold
+      - ../config:/opt/airflow/config
+      - ../scripts:/opt/airflow/scripts
     command: scheduler
 
   airflow-triggerer:
@@ -121,6 +125,8 @@ services:
       - ../ct:/opt/airflow/ct
       - ../ml:/opt/airflow/ml
       - ../gold:/opt/airflow/gold
+      - ../config:/opt/airflow/config
+      - ../scripts:/opt/airflow/scripts
     command: triggerer
 
 volumes:
