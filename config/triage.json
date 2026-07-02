@@ -1,0 +1,42 @@
+{
+  "sampling": {
+    "sample_rate": 0.10,
+    "always_include_brand_match": true,
+    "always_include_suspicious_tld": true
+  },
+  "triage": {
+    "pass_threshold": 0.35,
+    "weights": {
+      "suspicious_tld": 0.30,
+      "high_entropy": 0.25,
+      "brand_match": 0.40,
+      "excessive_hyphens": 0.10,
+      "excessive_digits": 0.10,
+      "long_domain": 0.10,
+      "punycode": 0.20,
+      "free_subdomain_provider": 0.25
+    },
+    "entropy_threshold": 3.8,
+    "max_hyphens": 3,
+    "max_digit_ratio": 0.30,
+    "max_domain_length": 45,
+    "levenshtein_max_distance": 2
+  },
+  "suspicious_tlds": [
+    "tk", "top", "xyz", "icu", "cfd", "rest", "gq", "ml",
+    "buzz", "cn", "work", "click", "link", "live", "monster",
+    "quest", "sbs", "cyou", "bond", "lol", "zip", "mov"
+  ],
+  "brand_keywords": [
+    "paypal", "apple", "microsoft", "amazon", "google", "netflix",
+    "facebook", "instagram", "whatsapp", "coinbase", "binance",
+    "bank", "login", "signin", "secure", "verify", "account",
+    "wallet", "update", "support", "billing", "invoice", "password"
+  ],
+  "free_subdomain_providers": [
+    "duckdns.org", "repl.co", "web.app", "firebaseapp.com",
+    "pages.dev", "netlify.app", "vercel.app", "herokuapp.com",
+    "github.io", "glitch.me", "000webhostapp.com", "weebly.com",
+    "blogspot.com", "wordpress.com", "azurewebsites.net", "no-ip.org"
+  ]
+}
