@@ -9,16 +9,23 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "3d-force-graph": "^1.80.0",
+    "array-move": "^4.0.0",
     "clsx": "^2.1.1",
     "d3-geo": "^3.1.1",
+    "force-graph": "^1.51.2",
     "framer-motion": "^12.29.0",
     "lucide-react": "^0.562.0",
     "next": "16.1.4",
     "react": "19.2.3",
     "react-dom": "19.2.3",
+    "react-force-graph-2d": "^1.29.1",
+    "react-force-graph-3d": "^1.29.1",
     "react-globe.gl": "^2.37.0",
+    "react-markdown": "^10.1.0",
     "react-simple-maps": "^3.0.0",
     "recharts": "^3.7.0",
+    "remark-gfm": "^4.0.1",
     "tailwind-merge": "^3.4.0",
     "three": "^0.182.0"
   },

@@ -27,3 +27,6 @@ __pycache__/
 ml/tmp/
 ml/models/
 ml/reports/
+
+console.log
+.claude/worktrees/
