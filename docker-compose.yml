@@ -32,3 +32,33 @@ services:
       - "9000:9000"
     environment:
       KAFKA_BROKERCONNECT: kafka:9092
+
+  # Certificate-Transparency-log websocket source for the real-time CT lane.
+  # ct/ingest/forwarder.py (CERTSTREAM_WS, default "ws://127.0.0.1:4000") connects
+  # here and forwards domains into Kafka. Nothing else in this repo runs a
+  # CertStream server, so forwarder.py has nothing to talk to without this service.
+  #
+  # Image: d-Rickyy-b/certstream-server-go (MIT, actively maintained, 200+ stars,
+  # explicit drop-in replacement for the original CaliDog/certstream-server):
+  #   https://github.com/d-Rickyy-b/certstream-server-go
+  # Official Docker Hub image, pinned to the v1.9.0 release tag (not :latest):
+  #   https://hub.docker.com/r/0rickyy0/certstream-server-go
+  #
+  # No config file is mounted: with none mounted the image falls back to its
+  # baked-in config.sample.yaml, which listens on 0.0.0.0:8080 and pulls from
+  # the default set of CT logs, which is enough for local dev.
+  #
+  # We map host port 4000 -> container port 8080 so the container's *default*
+  # lite endpoint at "/" is reachable at ws://127.0.0.1:4000 with NO path
+  # suffix -- exactly forwarder.py's existing CERTSTREAM_WS default, so no
+  # code change is needed there. Deliberately NOT using the server's
+  # "/domains-only" endpoint: that endpoint flattens output to
+  # {"data": [...domains], "message_type": "dns_entries"}, which does not
+  # match forwarder.py's parsing of data.leaf_cert.all_domains. The lite
+  # endpoint ("/") keeps the leaf_cert.all_domains nesting (it only drops the
+  # heavy as_der/chain fields), so it's the compatible choice.
+  certstream:
+    image: 0rickyy0/certstream-server-go:v1.9.0
+    ports:
+      - "4000:8080"
+    restart: unless-stopped
