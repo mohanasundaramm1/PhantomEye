@@ -126,8 +126,17 @@ def needs_tier2(item: dict, threshold: float, missing_is_high: bool = True) -> b
 
 def enrich_item(item: dict, *, whois_cache, dns_cache, geo_cache,
                 rate_limiters: dict, breakers: dict, cfg: dict,
-                dns_fetch=default_dns_fetch, whois_fetch=default_whois_fetch) -> dict:
-    """Enrich one item tier-by-tier. Raises EnrichFailure/CircuitOpen for requeue."""
+                dns_fetch=default_dns_fetch, whois_fetch=default_whois_fetch,
+                whois_mode: str = "network") -> dict:
+    """Enrich one item tier-by-tier. Raises EnrichFailure/CircuitOpen for requeue.
+
+    whois_mode:
+      "network"    - Tier 2 does a rate-limited RDAP call on cache miss (cold path).
+      "cache_only" - Tier 2 uses the WHOIS cache only; on a miss it does NOT make
+                     the (slow, rate-limited) network call, leaves WHOIS fields
+                     empty, and sets row["whois_backfill_needed"]=True so the hot
+                     path can hand the domain to the background backfill worker.
+    """
     domain = item.get("registered_domain") or item.get("domain")
     row: dict = {
         "registered_domain": domain,
@@ -185,11 +194,16 @@ def enrich_item(item: dict, *, whois_cache, dns_cache, geo_cache,
 
     # ---- Tier 2: WHOIS/RDAP (expensive, priority-gated) ----
     tiers_cfg = cfg["tiers"]
+    row["whois_backfill_needed"] = False
     if needs_tier2(item, tiers_cfg["triage_threshold"],
                    tiers_cfg.get("missing_triage_is_high_priority", True)):
         whois_rows = whois_cache.get(domain)
         if whois_rows is not None:
             w = whois_rows.iloc[0].to_dict()
+        elif whois_mode == "cache_only":
+            # hot path: skip the rate-limited network call, flag for backfill
+            w = None
+            row["whois_backfill_needed"] = True
         else:
             breaker = breakers["whois"]
             if not breaker.allow():
@@ -204,12 +218,16 @@ def enrich_item(item: dict, *, whois_cache, dns_cache, geo_cache,
             breaker.record_success()
             whois_cache.upsert([w])
             level = 2
-        row.update({
-            "registrar": w.get("registrar"),
-            "whois_status": w.get("status"),
-            "whois_created": w.get("created"),
-            "whois_expires": w.get("expires"),
-        })
+        if w is not None:
+            row.update({
+                "registrar": w.get("registrar"),
+                "whois_status": w.get("status"),
+                "whois_created": w.get("created"),
+                "whois_expires": w.get("expires"),
+            })
+        else:
+            row.update({"registrar": None, "whois_status": None,
+                        "whois_created": None, "whois_expires": None})
     else:
         row.update({"registrar": None, "whois_status": None,
                     "whois_created": None, "whois_expires": None})

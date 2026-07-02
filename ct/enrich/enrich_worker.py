@@ -122,11 +122,41 @@ def enqueue_from_bronze(cfg: dict | None = None) -> int:
     return n
 
 
+# ---------------- enriched output ----------------
+
+def _write_enriched_output(enriched_rows: list[dict], cfg: dict,
+                           update_pointer: bool = True) -> str | None:
+    """Persist enriched rows to a timestamped parquet. When update_pointer is
+    True, atomically advance _latest_enriched.json so the scorer picks it up.
+    Backfill passes set it False so they warm caches without hijacking the
+    pointer away from the freshest hot-path output."""
+    if not enriched_rows:
+        return None
+    out_df = pd.DataFrame(enriched_rows)
+    enriched_dir = abspath(cfg, cfg["paths"]["enriched_dir"])
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out_path = os.path.join(enriched_dir, f"ct_enriched_{ts}.parquet")
+    atomic_to_parquet(out_df, out_path)
+    if update_pointer:
+        ptr = os.path.join(enriched_dir, "_latest_enriched.json")
+        tmp = ptr + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"path": out_path, "rows": len(out_df), "created_utc": ts}, f)
+        os.replace(tmp, ptr)
+    log.info("[worker] wrote %d enriched rows -> %s (pointer=%s)",
+             len(out_df), out_path, update_pointer)
+    return out_path
+
+
 # ---------------- drain loop ----------------
 
 def run_worker(cfg: dict | None = None, max_batches: int | None = None,
-               dns_fetch=None, whois_fetch=None) -> dict:
-    """Drain the pending queue. Returns summary stats. Fetchers injectable for tests."""
+               dns_fetch=None, whois_fetch=None, update_pointer: bool = True) -> dict:
+    """Drain the pending queue. Returns summary stats. Fetchers injectable for tests.
+
+    update_pointer=False (cold/backfill mode) warms caches and records enriched
+    output without moving _latest_enriched.json, so it never overwrites the
+    fresher hot-path pointer the scorer reads."""
     cfg = cfg or load_config()
     queue = build_queue(cfg)
     caches = build_caches(cfg)
@@ -178,23 +208,104 @@ def run_worker(cfg: dict | None = None, max_batches: int | None = None,
         c.flush()
         c.log_stats()
 
-    # write enriched output + latest pointer (same contract as old inline path)
-    if enriched_rows:
-        out_df = pd.DataFrame(enriched_rows)
-        enriched_dir = abspath(cfg, cfg["paths"]["enriched_dir"])
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        out_path = os.path.join(enriched_dir, f"ct_enriched_{ts}.parquet")
-        atomic_to_parquet(out_df, out_path)
-        ptr = os.path.join(enriched_dir, "_latest_enriched.json")
-        tmp = ptr + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({"path": out_path, "rows": len(out_df), "created_utc": ts}, f)
-        os.replace(tmp, ptr)
-        log.info("[worker] wrote %d enriched rows -> %s", len(out_df), out_path)
+    # write enriched output (+ pointer unless this is a backfill pass)
+    out_path = _write_enriched_output(enriched_rows, cfg, update_pointer=update_pointer)
+    if out_path:
         stats["output_path"] = out_path
 
     queue.log_metrics()
     log.info("[worker] done: %s", stats)
+    return stats
+
+
+# ---------------- hot path (fresh, bounded, non-blocking) ----------------
+
+def run_hot_cycle(cfg: dict | None = None, max_domains: int | None = None,
+                  dns_fetch=None, whois_fetch=None) -> dict:
+    """Fast path that closes the freshness loop: score the newest, highest-triage
+    CT domains with no blocking on rate-limited WHOIS.
+
+    Reads the newest bronze window (bookmark-incremental), keeps the top
+    `max_domains` by triage_score, enriches each WHOIS-cache-only (DNS is the
+    only network call, fast at dns_rps), writes the enriched output and advances
+    _latest_enriched.json so the scorer immediately sees fresh data. High-triage
+    domains that missed the WHOIS cache are handed to the durable queue for the
+    background (cold) worker to backfill at its safe rate. Lower-triage rows in
+    the window are deliberately dropped -- triage-hard: spend the budget only on
+    the candidates that matter."""
+    from ct.enrich import enrich_ct
+    from ct.enrich import tiers as _tiers
+
+    cfg = cfg or load_config()
+    hp = cfg.get("hot_path", {})
+    max_domains = max_domains or hp.get("max_domains", 600)
+    min_triage = hp.get("min_triage_score", 0.0)
+
+    df = enrich_ct.read_bronze()
+    if df.empty:
+        log.info("[hot] no new bronze rows")
+        return {"processed": 0, "backfill_enqueued": 0, "output_path": None}
+
+    if "triage_score" in df.columns:
+        df = df.copy()
+        # missing triage treated as high priority (backward compat with old bronze)
+        df["_ts"] = pd.to_numeric(df["triage_score"], errors="coerce").fillna(1.0)
+        df = df[df["_ts"] >= min_triage].sort_values("_ts", ascending=False)
+    window = df.head(max_domains)
+
+    caches = build_caches(cfg)
+    limiters = build_rate_limiters(cfg)
+    breakers = build_breakers(cfg)
+    dns_fetch = dns_fetch or _tiers.default_dns_fetch
+    whois_fetch = whois_fetch or _tiers.default_whois_fetch
+
+    enriched_rows: list[dict] = []
+    backfill: list[dict] = []
+    for _, r in window.iterrows():
+        dom = r.get("registered_domain") or r.get("domain")
+        item = {
+            "registered_domain": dom,
+            "domain": r.get("domain"),
+            "event_ts": str(r.get("event_ts")) if r.get("event_ts") is not None else None,
+            "source": r.get("source"),
+            "triage_score": (float(r["triage_score"])
+                             if "triage_score" in window.columns and pd.notna(r.get("triage_score"))
+                             else None),
+        }
+        try:
+            row = _tiers.enrich_item(
+                item, whois_cache=caches["whois"], dns_cache=caches["dns"],
+                geo_cache=caches["geo"], rate_limiters=limiters, breakers=breakers,
+                cfg=cfg, dns_fetch=dns_fetch, whois_fetch=whois_fetch,
+                whois_mode="cache_only",
+            )
+        except (CircuitOpen, EnrichFailure) as e:
+            # hot path never blocks/requeues -- score on lexical features alone
+            row = {
+                "registered_domain": dom, "domain_sample": item["domain"],
+                "triage_score": item["triage_score"], "event_ts": item["event_ts"],
+                "source": item["source"], "enrichment_level": "tier0",
+                "whois_backfill_needed": False, "enrich_note": f"hot_skip:{e}",
+            }
+        if row.pop("whois_backfill_needed", False):
+            backfill.append({"registered_domain": dom, "domain": item["domain"],
+                             "triage_score": item["triage_score"]})
+        enriched_rows.append(row)
+
+    for c in caches.values():
+        c.flush()
+        c.log_stats()
+
+    out_path = _write_enriched_output(enriched_rows, cfg, update_pointer=True)
+
+    # advance bookmark past the whole window (dropped low-triage rows included)
+    if "ingest_ts" in df.columns and not df["ingest_ts"].empty:
+        enrich_ct._write_bookmark({"last_ingest_ts": str(df["ingest_ts"].max())})
+
+    n_bf = enqueue_domains(backfill, cfg) if backfill else 0
+    stats = {"processed": len(enriched_rows), "backfill_enqueued": n_bf,
+             "output_path": out_path}
+    log.info("[hot] done: %s", stats)
     return stats
 
 
@@ -210,19 +321,28 @@ def main(argv=None):
     ap.add_argument("--enqueue-domains", nargs="*", default=None,
                     help="enqueue explicit registered domains")
     ap.add_argument("--drain", action="store_true", help="drain the pending queue")
+    ap.add_argument("--hot", action="store_true",
+                    help="run the fast fresh-scoring cycle (bounded, WHOIS cache-only)")
+    ap.add_argument("--no-pointer", action="store_true",
+                    help="drain without advancing _latest_enriched.json (backfill / cache-warming)")
     ap.add_argument("--max-batches", type=int, default=None)
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
     did = False
+    if args.hot:
+        run_hot_cycle(cfg)
+        did = True
     if args.enqueue_from_bronze:
         enqueue_from_bronze(cfg)
         did = True
     if args.enqueue_domains:
         enqueue_domains(args.enqueue_domains, cfg)
         did = True
-    if args.drain or not did:
-        run_worker(cfg, max_batches=args.max_batches)
+    if args.drain:
+        run_worker(cfg, max_batches=args.max_batches, update_pointer=not args.no_pointer)
+    elif not did:
+        run_worker(cfg, max_batches=args.max_batches, update_pointer=not args.no_pointer)
 
 
 if __name__ == "__main__":

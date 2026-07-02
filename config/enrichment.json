@@ -16,6 +16,10 @@
     "triage_threshold": 0.5,
     "missing_triage_is_high_priority": true
   },
+  "hot_path": {
+    "max_domains": 600,
+    "min_triage_score": 0.0
+  },
   "cache_ttls": {
     "whois_days": 7,
     "dns_hours": 24,

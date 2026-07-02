@@ -17,6 +17,7 @@ from ct.enrich.config import load_config
 from ct.enrich.queue import FileQueue
 from ct.enrich.ratelimit import TokenBucket
 from ct.enrich.tiers import EnrichFailure, enrich_item, needs_tier2
+from ct.enrich.enrich_worker import _write_enriched_output, run_worker
 
 
 # ---------------- helpers ----------------
@@ -333,3 +334,125 @@ def test_worker_end_to_end_writes_output_and_ledgers(tmp_path):
     # caches persisted with fetched_at
     whois = pd.read_parquet(str(tmp_path / "lookups" / "whois_cache.parquet"))
     assert "fetched_at" in whois.columns and (whois["domain"] == "hi.com").any()
+
+
+# ---------------- hot path: whois_mode="cache_only" ----------------
+
+def test_cache_only_whois_miss_skips_network_and_flags_backfill(tmp_path):
+    """Hot path must never block on rate-limited WHOIS: a cache miss should
+    skip the network call entirely and flag the item for background backfill,
+    not raise/requeue."""
+    cfg = make_cfg(tmp_path)
+    caches = make_caches(tmp_path)
+
+    def boom(*a, **k):
+        raise AssertionError("whois network call should not happen in cache_only mode")
+
+    row = enrich_item(
+        {"registered_domain": "fresh.com", "domain": "fresh.com", "triage_score": 0.95},
+        whois_cache=caches["whois"], dns_cache=caches["dns"], geo_cache=caches["geo"],
+        rate_limiters=fast_limiters(), breakers=breakers(), cfg=cfg,
+        dns_fetch=lambda d: ["1.2.3.4"], whois_fetch=boom,
+        whois_mode="cache_only",
+    )
+    assert row["whois_backfill_needed"] is True
+    assert row["registrar"] is None
+    assert row["enrichment_level"] == "tier1"  # DNS only, WHOIS skipped not attempted
+
+
+def test_cache_only_whois_hit_uses_cache_no_backfill(tmp_path):
+    cfg = make_cfg(tmp_path)
+    caches = make_caches(tmp_path)
+    caches["whois"].upsert([{"domain": "known.com", "registrar": "CacheReg",
+                             "status": "ok", "created": None, "expires": None}])
+
+    def boom(*a, **k):
+        raise AssertionError("whois network call should not happen on a cache hit")
+
+    row = enrich_item(
+        {"registered_domain": "known.com", "domain": "known.com", "triage_score": 0.95},
+        whois_cache=caches["whois"], dns_cache=caches["dns"], geo_cache=caches["geo"],
+        rate_limiters=fast_limiters(), breakers=breakers(), cfg=cfg,
+        dns_fetch=lambda d: ["1.2.3.4"], whois_fetch=boom,
+        whois_mode="cache_only",
+    )
+    assert row["whois_backfill_needed"] is False
+    assert row["registrar"] == "CacheReg"
+
+
+def test_cache_only_low_triage_never_flags_backfill(tmp_path):
+    """Low-triage items don't need tier2 at all, so a WHOIS cache miss on them
+    must not trigger a backfill enqueue -- only high-priority misses should."""
+    cfg = make_cfg(tmp_path)
+    caches = make_caches(tmp_path)
+
+    row = enrich_item(
+        {"registered_domain": "low.com", "domain": "low.com", "triage_score": 0.1},
+        whois_cache=caches["whois"], dns_cache=caches["dns"], geo_cache=caches["geo"],
+        rate_limiters=fast_limiters(), breakers=breakers(), cfg=cfg,
+        dns_fetch=lambda d: ["1.2.3.4"], whois_fetch=lambda *a, **k: {},
+        whois_mode="cache_only",
+    )
+    assert row["whois_backfill_needed"] is False
+
+
+# ---------------- pointer control: hot vs cold/backfill writes ----------------
+
+def test_write_enriched_output_update_pointer_true_advances_pointer(tmp_path):
+    cfg = make_cfg(tmp_path)
+    enriched_dir = tmp_path / "enriched"
+    cfg["paths"]["enriched_dir"] = str(enriched_dir)
+    rows = [{"registered_domain": "a.com", "risk_score": 0.9}]
+
+    out_path = _write_enriched_output(rows, cfg, update_pointer=True)
+    ptr_path = enriched_dir / "_latest_enriched.json"
+    assert ptr_path.exists()
+    ptr = json.loads(ptr_path.read_text())
+    assert ptr["path"] == out_path
+    assert ptr["rows"] == 1
+
+
+def test_write_enriched_output_update_pointer_false_leaves_pointer_alone(tmp_path):
+    """Cold/backfill passes must never hijack the pointer away from the
+    freshest hot-path output -- this is the exact bug that caused
+    _latest_enriched.json to get stuck on a months-old snapshot."""
+    cfg = make_cfg(tmp_path)
+    enriched_dir = tmp_path / "enriched"
+    cfg["paths"]["enriched_dir"] = str(enriched_dir)
+
+    # simulate a prior hot-path write that set the pointer
+    hot_path = _write_enriched_output(
+        [{"registered_domain": "fresh.com"}], cfg, update_pointer=True)
+    ptr_path = enriched_dir / "_latest_enriched.json"
+    original_ptr = json.loads(ptr_path.read_text())
+    assert original_ptr["path"] == hot_path
+
+    # a cold/backfill write happens afterward -- must not move the pointer
+    _write_enriched_output(
+        [{"registered_domain": "stale-backfill.com"}], cfg, update_pointer=False)
+    unchanged_ptr = json.loads(ptr_path.read_text())
+    assert unchanged_ptr["path"] == hot_path
+    assert unchanged_ptr == original_ptr
+
+
+def test_run_worker_no_pointer_mode_drains_without_moving_pointer(tmp_path):
+    cfg = make_cfg(tmp_path)
+    enriched_dir = tmp_path / "enriched"
+    cfg["paths"]["enriched_dir"] = str(enriched_dir)
+    from ct.enrich.enrich_worker import build_queue
+    queue = build_queue(cfg)
+    queue.enqueue([{"registered_domain": "cold1.com", "domain": "cold1.com", "triage_score": 0.9}])
+
+    # pre-seed a pointer as if a hot cycle already ran
+    ptr_path = enriched_dir / "_latest_enriched.json"
+    os.makedirs(enriched_dir, exist_ok=True)
+    ptr_path.write_text(json.dumps({"path": "/fake/hot/output.parquet", "rows": 5, "created_utc": "x"}))
+
+    run_worker(
+        cfg, dns_fetch=lambda d: ["1.2.3.4"],
+        whois_fetch=lambda d, timeout=10.0: {"domain": d, "registrar": "R"},
+        update_pointer=False,
+    )
+
+    ptr = json.loads(ptr_path.read_text())
+    assert ptr["path"] == "/fake/hot/output.parquet"  # untouched by the backfill drain
