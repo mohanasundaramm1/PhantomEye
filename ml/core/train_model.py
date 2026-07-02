@@ -494,13 +494,20 @@ def evaluate_model(name, clf, Xtr, ytr, Xte, yte):
         idx = np.searchsorted(fpr, 0.01, side="right") - 1
         idx = max(idx, 0)
         r_at_1pct = float(tpr[idx])
+        thr_at_1pct = float(thr[idx])
     else:
         r_at_1pct = float(tpr[-1])
+        thr_at_1pct = float(thr[-1])
     print(
         f"[{name}] ROC-AUC={roc:.4f}  PR-AUC={pr:.4f}  "
         f"Recall@FPR=1%={r_at_1pct:.3f}"
     )
-    return clf, {"roc_auc": roc, "pr_auc": pr, "recall_at_1pct": r_at_1pct}
+    return clf, {
+        "roc_auc": roc,
+        "pr_auc": pr,
+        "recall_at_1pct": r_at_1pct,
+        "threshold_at_1pct_fpr": thr_at_1pct,
+    }
 
 
 # 1) Logistic Regression baselines

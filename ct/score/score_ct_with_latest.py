@@ -225,8 +225,34 @@ def load_models():
     return logreg, booster, meta
 
 
-def choose_threshold(meta):
+def choose_threshold(meta, primary_name=None):
+    """
+    Pick the risk-classification cutoff dynamically from measured model
+    performance in the training metadata, falling back to a conservative
+    hardcoded default when it isn't available (e.g. older meta.json files
+    written before per-model thresholds were recorded, or a degenerate
+    ROC curve with no metrics at all).
+
+    Looks up meta["metrics"][primary_name]["threshold_at_1pct_fpr"] first
+    (the current, correctly-nested location matching how train_model.py's
+    evaluate_model() saves it). Falls back to legacy/top-level key names
+    for forward compatibility, then to 0.90 if nothing is found.
+    """
     if meta:
+        metrics = meta.get("metrics")
+        if isinstance(metrics, dict) and primary_name:
+            model_metrics = metrics.get(primary_name)
+            if isinstance(model_metrics, dict):
+                for k in ("threshold_at_1pct_fpr", "fpr_1pct_threshold"):
+                    v = model_metrics.get(k)
+                    if v is not None:
+                        try:
+                            return float(v)
+                        except Exception:
+                            pass
+        # legacy fallback: some older/alternate meta formats may have
+        # stored the threshold at the top level instead of nested under
+        # metrics[<model_name>].
         for k in ("threshold_at_1pct_fpr", "fpr_1pct_threshold"):
             v = meta.get(k)
             if v is not None:
@@ -343,7 +369,7 @@ def main():
         out["risk_score_lgbm"] = p_lgb
     out["risk_score"] = probs
 
-    thr = choose_threshold(meta)
+    thr = choose_threshold(meta, primary_name=primary_name)
     print(f"[info] using threshold={thr:.3f} for risk_label (model={primary_name})")
     out["risk_label"] = (out["risk_score"] >= thr).astype(int)
     out["model_used"] = primary_name
