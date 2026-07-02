@@ -95,37 +95,69 @@ def _host_from_url_or_domain(row_domain, row_url=None) -> str:
 
 # ---------- loaders ----------
 
-def load_ct_high_risk(gold_dir: str, risk_threshold: float) -> pd.DataFrame:
+def load_ct_high_risk(gold_dir: str, risk_threshold: float, verbose: bool = True) -> pd.DataFrame:
     """Every distinct high-risk domain CT has ever observed, with the
     EARLIEST event_ts across all (possibly duplicate/stale) gold files.
     Grouped by raw_host (the actual observed hostname, e.g.
     "t4w.5c2.myftpupload.com"), not just registered_domain -- see
-    compute_lead_time() for why both granularities matter."""
+    compute_lead_time() for why both granularities matter.
+
+    Files whose schema lacks "risk_score" (older gold files from before the
+    pipeline standardized on that column name -- e.g. some early files use
+    "week5_score"/"risk_bucket" instead) are SKIPPED, not silently included.
+    An earlier version of this loader padded the missing column with None and
+    let the risk_threshold comparison filter it out -- which silently dropped
+    every row in such a file with zero indication anything was lost. Skipping
+    explicitly (and reporting the count) makes that data-loss visible instead.
+    Older/differently-scaled scores are also not safely comparable to the
+    current model's risk_score under one threshold without recalibration,
+    which is out of scope here -- skipping is the honest choice, not a
+    workaround."""
     files = sorted(glob.glob(os.path.join(gold_dir, "*.parquet")))
+    cols = ["registered_domain", "domain_sample", "event_ts", "risk_score"]
     frames = []
+    n_skipped_schema = 0
+    n_skipped_unreadable = 0
     for f in files:
-        cols = ["registered_domain", "domain_sample", "event_ts", "risk_score"]
         try:
-            df = pd.read_parquet(f, columns=cols)
+            file_cols = pd.read_parquet(f).columns  # cheap: metadata-only would be nicer, but files are small
         except Exception:
-            try:
-                df = pd.read_parquet(f)
-                for c in cols:
-                    if c not in df.columns:
-                        df[c] = None
-                df = df[cols]
-            except Exception:
-                continue
-        frames.append(df)
+            n_skipped_unreadable += 1
+            continue
+        if "risk_score" not in file_cols:
+            n_skipped_schema += 1
+            continue
+        try:
+            df = pd.read_parquet(f, columns=[c for c in cols if c in file_cols])
+        except Exception:
+            n_skipped_unreadable += 1
+            continue
+        for c in cols:
+            if c not in df.columns:
+                df[c] = None
+        frames.append(df[cols])
+    if verbose and (n_skipped_schema or n_skipped_unreadable):
+        print(f"[warn] load_ct_high_risk: skipped {n_skipped_schema} file(s) missing 'risk_score' "
+              f"(incompatible/older schema) and {n_skipped_unreadable} unreadable file(s), "
+              f"out of {len(files)} total -- their rows are NOT represented below.")
     empty_cols = ["raw_host", "registered_domain", "ct_first_seen", "risk_score"]
     if not frames:
         return pd.DataFrame(columns=empty_cols)
 
     all_df = pd.concat(frames, ignore_index=True)
-    all_df["registered_domain"] = all_df["registered_domain"].fillna("").astype(str).str.lower().str.strip()
+    # Presence check only -- a row with no gold-provided registered_domain at
+    # all indicates a malformed/unusable row, so filter on it. The VALUE used
+    # for grouping/joining below is recomputed via reg_domain() so both sides
+    # of every join (here and in load_blocklist_first_seen) use the exact same
+    # PSL-aware normalization -- the gold column itself was written by the
+    # older, non-PSL-aware convention in ct/score/score_ct_with_latest.py,
+    # and joining on that inconsistently against a PSL-aware blocklist side
+    # would silently fail to match on any PSL-private platform.
+    all_df["_gold_registered_domain"] = all_df["registered_domain"].fillna("").astype(str).str.lower().str.strip()
     all_df["raw_host"] = all_df["domain_sample"].fillna("").astype(str).str.lower().str.strip()
-    all_df.loc[all_df["raw_host"] == "", "raw_host"] = all_df["registered_domain"]
-    all_df = all_df[all_df["registered_domain"] != ""]
+    all_df.loc[all_df["raw_host"] == "", "raw_host"] = all_df["_gold_registered_domain"]
+    all_df = all_df[all_df["_gold_registered_domain"] != ""]
+    all_df["registered_domain"] = all_df["raw_host"].map(reg_domain)
     all_df["event_ts"] = pd.to_datetime(all_df["event_ts"], utc=True, errors="coerce")
     all_df = all_df[all_df["risk_score"] >= risk_threshold]
 
@@ -243,7 +275,14 @@ def compute_lead_time(ct_df: pd.DataFrame, blocklist_df: pd.DataFrame) -> pd.Dat
 
 
 def summarize(ct_df: pd.DataFrame, joined_df: pd.DataFrame, risk_threshold: float) -> dict:
-    n_ct = int(ct_df["registered_domain"].nunique()) if not ct_df.empty else 0
+    # Denominator counted at raw_host granularity, matching the granularity
+    # matches are actually counted at (exact_hostname matches are per-raw_host).
+    # Counting at registered_domain granularity instead would let
+    # n_matched_total exceed n_ct -- and therefore coverage_pct exceed 100% --
+    # whenever multiple raw_hosts sharing one apex all get exact_hostname
+    # matches (a realistic scenario: one actor, one domain, several phishing
+    # subdomains, all independently observed by CT and a blocklist).
+    n_ct = int(ct_df["raw_host"].nunique()) if not ct_df.empty else 0
     n_matched = int(len(joined_df))
     n_exact = int((joined_df["match_tier"] == "exact_hostname").sum()) if n_matched else 0
     n_apex_only = n_matched - n_exact

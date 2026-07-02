@@ -71,6 +71,37 @@ def test_load_ct_high_risk_empty_dir_returns_empty_frame(tmp_path):
     assert set(["raw_host", "registered_domain", "ct_first_seen", "risk_score"]).issubset(out.columns)
 
 
+def test_load_ct_high_risk_skips_files_missing_risk_score_explicitly(tmp_path, capsys):
+    """Regression test for a real bug found by auditing this module's own
+    output: an older gold file used week5_score/risk_bucket instead of
+    risk_score. The original loader padded the missing column with None,
+    and `None >= threshold` silently filtered out every row in that file --
+    2892 real domains vanished with zero indication. Must now be an
+    explicit, visible skip instead."""
+    gold = tmp_path / "gold"
+    gold.mkdir()
+    # old-schema file: no risk_score at all
+    pd.DataFrame({
+        "registered_domain": ["old-schema-domain.com"],
+        "domain_sample": ["old-schema-domain.com"],
+        "event_ts": pd.to_datetime(["2025-11-30T00:00:00Z"]),
+        "week5_score": [0.99],
+        "risk_bucket": ["high"],
+    }).to_parquet(gold / "old_schema.parquet")
+    # current-schema file: has risk_score
+    pd.DataFrame({
+        "registered_domain": ["new-schema-domain.com"],
+        "domain_sample": ["new-schema-domain.com"],
+        "event_ts": pd.to_datetime(["2026-01-01T00:00:00Z"]),
+        "risk_score": [0.95],
+    }).to_parquet(gold / "new_schema.parquet")
+
+    out = load_ct_high_risk(str(gold), risk_threshold=0.90, verbose=True)
+    assert list(out["raw_host"]) == ["new-schema-domain.com"]  # old-schema row absent, not silently None-filtered
+    captured = capsys.readouterr()
+    assert "skipped 1 file" in captured.out  # the skip is reported, not silent
+
+
 def test_load_blocklist_first_seen_dedupes_across_sources_and_partitions(tmp_path):
     op_dir = tmp_path / "openphish" / "ingest_date=2026-01-01"
     op_dir.mkdir(parents=True)
@@ -168,7 +199,8 @@ def test_compute_lead_time_empty_inputs_returns_empty_frame():
 
 
 def test_summarize_reports_coverage_and_tiers():
-    ct_df = pd.DataFrame({"registered_domain": [f"d{i}.com" for i in range(10)]})
+    ct_df = pd.DataFrame({"registered_domain": [f"d{i}.com" for i in range(10)],
+                          "raw_host": [f"d{i}.com" for i in range(10)]})
     joined = pd.DataFrame({
         "registered_domain": ["d0.com", "d1.com", "d2.com"],
         "lead_time_hours": [10.0, -5.0, 20.0],
@@ -190,7 +222,7 @@ def test_summarize_reports_coverage_and_tiers():
 def test_summarize_apex_only_matches_are_flagged_low_confidence_even_if_present():
     """If every match is apex-tier (no exact-hostname matches at all), the
     confidence note must say so explicitly rather than implying a real signal."""
-    ct_df = pd.DataFrame({"registered_domain": ["a.com", "b.com"]})
+    ct_df = pd.DataFrame({"registered_domain": ["a.com", "b.com"], "raw_host": ["a.com", "b.com"]})
     joined = pd.DataFrame({
         "registered_domain": ["a.com", "b.com"],
         "lead_time_hours": [10.0, -5.0],
@@ -201,8 +233,69 @@ def test_summarize_apex_only_matches_are_flagged_low_confidence_even_if_present(
     assert "NO exact-hostname matches" in s["confidence_note"]
 
 
+def test_summarize_coverage_pct_never_exceeds_100_with_shared_apex(tmp_path):
+    """Regression test for a real bug found by auditing this module's own
+    output: counting n_ct at registered_domain granularity while
+    exact_hostname matches are counted at raw_host granularity let
+    coverage_pct exceed 100% whenever multiple raw_hosts sharing one apex
+    (e.g. several phishing subdomains of the same actor-owned domain) all
+    matched. Must stay mathematically bounded."""
+    gold = tmp_path / "gold"
+    gold.mkdir()
+    pd.DataFrame({
+        "registered_domain": ["evil.com", "evil.com"],
+        "domain_sample": ["phish1.evil.com", "phish2.evil.com"],
+        "event_ts": pd.to_datetime(["2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"]),
+        "risk_score": [0.95, 0.95],
+    }).to_parquet(gold / "run1.parquet")
+    ct_df = load_ct_high_risk(str(gold), risk_threshold=0.90, verbose=False)
+    assert len(ct_df) == 2  # two distinct raw_hosts under one apex
+
+    blocklist_df = pd.DataFrame({
+        "raw_host": ["phish1.evil.com", "phish2.evil.com"],
+        "registered_domain": ["evil.com", "evil.com"],
+        "blocklist_first_seen": pd.to_datetime(["2026-01-02T00:00:00Z", "2026-01-02T00:00:00Z"]),
+        "sources": ["openphish", "openphish"],
+    })
+    joined = compute_lead_time(ct_df, blocklist_df)
+    assert len(joined) == 2  # both raw_hosts matched at exact_hostname tier
+
+    s = summarize(ct_df, joined, risk_threshold=0.9)
+    assert s["n_ct_high_risk_domains"] == 2       # raw_host-based, not apex-based (would be 1)
+    assert s["n_matched_total"] == 2
+    assert s["coverage_pct"] == pytest.approx(100.0)  # not 200%
+    assert s["coverage_pct"] <= 100.0
+
+
+def test_load_ct_high_risk_recomputes_registered_domain_psl_aware(tmp_path):
+    """Regression test: the gold file's own registered_domain column is
+    written by an OLDER, non-PSL-aware convention elsewhere in the repo
+    (ct/score/score_ct_with_latest.py). If load_ct_high_risk trusted that
+    column instead of recomputing it, the apex-tier join in
+    compute_lead_time would silently fail to match anything on a
+    PSL-private platform, because the blocklist side uses the PSL-aware
+    convention. Both sides must agree."""
+    gold = tmp_path / "gold"
+    gold.mkdir()
+    pd.DataFrame({
+        # gold's OWN registered_domain column uses the old convention:
+        # "evil.herokuapp.com" was (wrongly) collapsed to "herokuapp.com"
+        # by the pipeline that originally wrote this file.
+        "registered_domain": ["herokuapp.com"],
+        "domain_sample": ["evil.herokuapp.com"],
+        "event_ts": pd.to_datetime(["2026-01-01T00:00:00Z"]),
+        "risk_score": [0.95],
+    }).to_parquet(gold / "run1.parquet")
+
+    out = load_ct_high_risk(str(gold), risk_threshold=0.90, verbose=False)
+    row = out[out["raw_host"] == "evil.herokuapp.com"].iloc[0]
+    # PSL-aware recomputation must win, not the gold file's stale value
+    assert row["registered_domain"] == "evil.herokuapp.com"
+    assert row["registered_domain"] != "herokuapp.com"
+
+
 def test_summarize_no_matches_is_explicit_not_silent():
-    ct_df = pd.DataFrame({"registered_domain": ["a.com"]})
+    ct_df = pd.DataFrame({"registered_domain": ["a.com"], "raw_host": ["a.com"]})
     empty_joined = pd.DataFrame(columns=["registered_domain", "lead_time_hours", "match_tier"])
     s = summarize(ct_df, empty_joined, risk_threshold=0.9)
     assert s["n_matched_total"] == 0
