@@ -627,7 +627,17 @@ if lgb is not None and "lgbm_full" in locals() and lgbm_full is not None:
 else:
     lgb_full_path = None
 
-# ---------------- update "latest" symlinks/copies ----------------
+# ---------------- update "latest" symlinks/copies (gated) ----------------
+#
+# _copy_latest() used to run unconditionally on every training run -- a bad
+# run (data issue, degenerate split, unlucky hyperparameters) could silently
+# replace a good production model (the one api/main.py and
+# ct/score/score_ct_with_latest.py actually read from) with a worse one, with
+# no check and no record. ml/core/promotion_gate.py decides whether this
+# run's model ("challenger") is allowed to replace the current production
+# model ("champion") before any copy happens.
+
+from ml.core.promotion_gate import append_promotion_log, decide_promotion, load_champion_meta
 
 def _copy_latest(src, latest_name):
     if src is None or not os.path.exists(src):
@@ -640,12 +650,28 @@ def _copy_latest(src, latest_name):
     except Exception as e:
         print(f"[warn] failed to update latest copy {latest_path}: {e}")
 
-# meta
-_copy_latest(meta_path, "ct_risk_meta_latest.json")
-# logreg
-_copy_latest(logreg_full_path, "ct_risk_logreg_full_latest.joblib")
-# lightgbm (if saved)
-if lgb_full_path is not None:
-    _copy_latest(lgb_full_path, "ct_risk_lgbm_full_latest.txt")
+champion_meta = load_champion_meta(MODEL_DIR)
+decision = decide_promotion(champion_meta, meta)
+for w in decision["warnings"]:
+    print("[warn] promotion:", w)
+
+# Make the timestamped meta.json self-documenting: it records its own
+# promotion outcome, not just its metrics.
+meta["promotion_decision"] = decision
+with open(meta_path, "w") as f:
+    json.dump(meta, f, indent=2)
+
+append_promotion_log(decision, os.path.join(MODEL_DIR, "promotion_log.jsonl"))
+
+if decision["promote"]:
+    print("[info] promotion GATE PASSED:", decision["reason"])
+    _copy_latest(meta_path, "ct_risk_meta_latest.json")
+    _copy_latest(logreg_full_path, "ct_risk_logreg_full_latest.joblib")
+    if lgb_full_path is not None:
+        _copy_latest(lgb_full_path, "ct_risk_lgbm_full_latest.txt")
+else:
+    print("[warn] promotion GATE REJECTED:", decision["reason"])
+    print(f"[warn] keeping existing production model; this run's artifacts are preserved "
+          f"at {meta_path} (and sibling model files) for inspection, just not promoted.")
 
 print("[info] training run complete.")
