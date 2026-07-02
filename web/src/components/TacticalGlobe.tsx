@@ -50,16 +50,17 @@ export default function TacticalGlobe({ data }: TacticalGlobeProps) {
 
     // Prepare Hex/Bar Data
     const hexData = useMemo(() => {
-        return data.map(d => {
+        return (data || []).map(d => {
             const coords = countryCentroids[d.sample_country] || countryCentroids["United States"]; // Fallback to US if unknown for now
+            const weight = Number.isFinite(d.risk_score) ? d.risk_score : 0;
             return {
                 lat: coords.lat,
                 lng: coords.lng,
-                weight: d.risk_score,
+                weight,
                 country: d.sample_country,
-                color: d.risk_score > 0.9 ? "#ff0000" : d.risk_score > 0.7 ? "#ff8800" : "#00bcd4"
+                color: weight > 0.9 ? "#ff0000" : weight > 0.7 ? "#ff8800" : "#00bcd4"
             };
-        }).filter(d => d.lat !== undefined);
+        }).filter(d => Number.isFinite(d.lat) && Number.isFinite(d.lng));
     }, [data]);
 
     // Generate Attack Arcs (Simulated for Visual Impact based on high risk nodes)
@@ -112,7 +113,7 @@ export default function TacticalGlobe({ data }: TacticalGlobeProps) {
                 // Points/Bars
                 hexBinPointsData={hexData}
                 hexBinPointWeight="weight"
-                hexAltitude={(d: any) => d.weight * 0.4} // Height based on risk
+                hexAltitude={(d: any) => (d.points?.length ? d.sumWeight / d.points.length : 0) * 0.4} // Height based on mean risk in bin (d is a hexbin, not a point)
                 hexBinResolution={4} // Chunky tech look
                 hexTopColor={(d: any) => d.points[0].color}
                 hexSideColor={() => "rgba(0, 50, 50, 0.6)"}
