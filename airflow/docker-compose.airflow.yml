@@ -1,4 +1,3 @@
-version: "3.8"
 services:
   postgres:
     image: postgres:15
@@ -15,6 +14,35 @@ services:
       retries: 5
     restart: always
 
+  # One-shot initializer: migrate the metadata DB and create the admin user,
+  # then exit. webserver/scheduler/triggerer wait for this via
+  # service_completed_successfully, so a clean `docker compose up` / `make up-all`
+  # works with no manual db-migrate / user-create steps. Overrides the entrypoint
+  # to skip the heavy _PIP_ADDITIONAL_REQUIREMENTS install (migrate + user create
+  # only need core Airflow, not the DAG dependencies). Default login: admin / admin.
+  airflow-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        airflow db migrate
+        airflow users create \
+          --username admin --password admin \
+          --firstname Cyber --lastname Sentinel --role Admin \
+          --email admin@phantomeye.local || true
+    restart: "no"
+
   airflow-webserver:
     build:
       context: .
@@ -22,6 +50,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
     restart: always
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
@@ -51,6 +81,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
     restart: always
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
@@ -78,6 +110,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
     restart: always
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
