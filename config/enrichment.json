@@ -1,0 +1,32 @@
+{
+  "queue": {
+    "dir": "ct/data/enrich_queue",
+    "batch_size": 200,
+    "max_attempts": 3
+  },
+  "rate_limits": {
+    "whois_rps": 1.0,
+    "dns_rps": 20.0
+  },
+  "timeouts": {
+    "whois_seconds": 10.0,
+    "dns_seconds": 5.0
+  },
+  "tiers": {
+    "triage_threshold": 0.5,
+    "missing_triage_is_high_priority": true
+  },
+  "cache_ttls": {
+    "whois_days": 7,
+    "dns_hours": 24,
+    "geo_hours": 24
+  },
+  "circuit_breaker": {
+    "failure_threshold": 5,
+    "cooldown_seconds": 300
+  },
+  "paths": {
+    "lookups_dir": "lookups",
+    "enriched_dir": "ct/data/enriched"
+  }
+}

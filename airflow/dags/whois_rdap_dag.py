@@ -260,6 +260,34 @@ def whois_rdap_task(ds: str | None = None, ts: str | None = None, **context):
     if not domains:
         raise AirflowSkipException(f"[whois_rdap] no valid domains for ds={ds}")
 
+    # -------- queue-decoupled path --------
+    # Enqueue domains into the durable enrichment queue and drain it via the
+    # shared worker (token-bucket rate limits, per-call timeouts, circuit
+    # breaker, TTL'd parquet caches). Knobs live in config/enrichment.json.
+    from ct.enrich.config import load_config
+    from ct.enrich.enrich_worker import build_caches, enqueue_domains, run_worker
+
+    cfg = load_config()
+    cfg["paths"]["lookups_dir"] = LOOKUPS_BASE
+    # labeled malicious domains: no triage_score -> treated as high priority (Tier 2)
+    enqueue_domains(domains, cfg)
+    run_worker(cfg)
+
+    # Daily subset for this ds, taken from the refreshed rolling cache
+    cache = build_caches(cfg)["whois"]._df
+    daily = cache[cache["domain"].astype(str).isin(domains)].copy()
+    outdir = f"{WHOIS_DAILY_DIR}/ingest_date={ds}"
+    outpath = f"{outdir}/whois.parquet"
+    _atomic_to_parquet(daily, outpath)
+
+    log.info(
+        "[whois_rdap] ds=%s daily_rows=%d cache_size=%d -> %s",
+        ds, len(daily), len(cache), outpath,
+    )
+    return
+
+
+def _legacy_whois_rdap_inline(ds, ts, domains):  # pragma: no cover (superseded by worker)
     # Load persistent cache, but be tolerant to corruption
     if os.path.exists(WHOIS_CACHE_PATH):
         try:
