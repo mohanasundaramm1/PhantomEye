@@ -31,3 +31,20 @@ with DAG(
         python ml/core/train_model.py
         """
     )
+
+    # Verifies the promotion gate itself actually ran and produced a recent
+    # decision -- NOT whether that decision was to promote or reject. A
+    # rejection (champion kept, challenger regressed) is the safety mechanism
+    # working correctly and must not fail this task; a missing/stale/malformed
+    # decision means the gate silently didn't execute, which is the real
+    # integrity risk (see ml/core/promotion_gate.py verify_latest_decision).
+    verify_promotion_gate_ran = BashOperator(
+        task_id="verify_promotion_gate_ran",
+        bash_command=f"""
+        cd {REPO_ROOT} && \
+        export PYTHONPATH=$PYTHONPATH:{REPO_ROOT} && \
+        python -m ml.core.promotion_gate --max-age-hours 6
+        """
+    )
+
+    train_latest_baseline >> verify_promotion_gate_ran
