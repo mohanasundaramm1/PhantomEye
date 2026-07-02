@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
 import glob
+import json
 import os
 import joblib
 import numpy as np
@@ -170,6 +171,25 @@ def get_latest_parquet():
 @app.get("/health")
 def health():
     return {"status": "operational", "timestamp": datetime.now().isoformat()}
+
+LEAD_TIME_SUMMARY_PATH = "gold/detection_timeline/latest_summary.json"
+
+@app.get("/metrics/lead-time")
+def lead_time_metrics():
+    """Surfaces the output of ct/score/measure_lead_time.py: how many hours
+    before a domain appears in a public blocklist (OpenPhish/URLHaus) this
+    pipeline's CT scoring already flagged it, measured directly against real
+    data -- not a marketing claim. Includes the confidence_note verbatim so
+    a small/zero sample size can't be misread as a proven result; re-run
+    ct/score/measure_lead_time.py to refresh."""
+    if not os.path.exists(LEAD_TIME_SUMMARY_PATH):
+        return {"available": False, "reason": "no measurement has been run yet; run ct/score/measure_lead_time.py"}
+    try:
+        with open(LEAD_TIME_SUMMARY_PATH) as f:
+            summary = json.load(f)
+    except Exception as e:
+        return {"available": False, "reason": f"could not read summary: {e}"}
+    return {"available": True, **summary}
 
 @app.get("/threats/latest")
 def get_latest_threats(limit: int = 50):
