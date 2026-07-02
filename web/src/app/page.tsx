@@ -12,7 +12,7 @@ import { motion, AnimatePresence, useScroll, useTransform } from "framer-motion"
 import {
   XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, AreaChart, Area, LineChart, Line,
-  BarChart as ReBarChart, Bar, Cell, RadarChart, PolarGrid, PolarAngleAxis, Radar,
+  BarChart as ReBarChart, Bar, Cell,
   PieChart, Pie
 } from 'recharts';
 import dynamic from 'next/dynamic';
@@ -57,12 +57,26 @@ interface Stats {
   tld_analysis: AnalystMetric[];
   isp_reputation: AnalystMetric[];
   age_impact: AnalystMetric[];
-  mitre_tactics: { tactic: string, probability: number }[];
-  actor_attribution: { actor: string, value: number }[];
+  detection_source_breakdown?: { reason: string, count: number, pct: number }[];
 }
 
 // --- Configuration ---
 const geoUrl = "https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json";
+
+// decision_reason values emitted by the MISP-fusion step in
+// ct/score/score_ct_with_latest.py — real detection provenance, not attribution.
+const SOURCE_LABELS: Record<string, string> = {
+  MISP_AND_ML: "MISP + ML",
+  MISP_IOC: "MISP IOC",
+  ML_SCORE: "ML score",
+  BENIGN_BASELINE: "Benign baseline",
+};
+const SOURCE_COLORS: Record<string, string> = {
+  MISP_AND_ML: "#ff0000",
+  MISP_IOC: "#ff8800",
+  ML_SCORE: "#00ffff",
+  BENIGN_BASELINE: "#333333",
+};
 
 const nameMapping: { [key: string]: string } = {
   "United States": "United States of America",
@@ -403,52 +417,39 @@ export default function PhantomEyeAdvancedDashboard() {
           </div>
           
           <div className="col-span-4 flex flex-col gap-10 h-[700px]">
-            <TacticalCard title="Heuristic MITRE Mapping" subTitle="Adversarial Tactic Probability" status="PROBABILITIES" className="flex-1">
-              <div className="w-full h-full relative -mt-4">
-                {stats?.mitre_tactics ? (
-                  <ResponsiveContainer width="100%" height="100%">
-                    <RadarChart cx="50%" cy="50%" outerRadius="60%" data={stats.mitre_tactics}>
-                      <PolarGrid stroke="rgba(255,255,255,0.1)" />
-                      <PolarAngleAxis dataKey="tactic" tick={{ fill: 'rgba(255,255,255,0.5)', fontSize: 9, fontWeight: 'bold' }} />
-                      <Radar name="Probability" dataKey="probability" stroke="#00ffff" fill="#00ffff" fillOpacity={0.3} />
-                      <Tooltip contentStyle={{ backgroundColor: "#000", border: "1px solid #00ffff", fontSize: "10px" }} />
-                    </RadarChart>
-                  </ResponsiveContainer>
-                ) : <div className="h-full flex items-center justify-center opacity-20 italic">SYNC_MITRE_MATRIX...</div>}
-              </div>
-            </TacticalCard>
-            
-            <TacticalCard title="Behavioral Attribution" subTitle="Clustered Entity Demographics" status="ANALYSIS" className="flex-1">
-              <div className="w-full h-[200px] mt-2">
-                {stats?.actor_attribution ? (
-                  <ResponsiveContainer width="100%" height="100%">
-                    <PieChart>
-                      <Pie
-                        data={stats.actor_attribution}
-                        cx="50%" cy="50%" innerRadius={40} outerRadius={70}
-                        paddingAngle={5} dataKey="value" stroke="none"
-                      >
-                        {stats.actor_attribution.map((entry, index) => (
-                          <Cell key={`cell-${index}`} fill={['#ff0000', '#ff8800', '#00ffff', '#333333'][index % 4]} />
-                        ))}
-                      </Pie>
-                      <Tooltip contentStyle={{ backgroundColor: "#000", border: "1px solid #333", fontSize: "10px" }} />
-                    </PieChart>
-                  </ResponsiveContainer>
-                ) : <div className="h-full flex items-center justify-center opacity-20 italic">SYNC_ACTOR_DEMOGRAPHICS...</div>}
-              </div>
-              
-              <div className="flex flex-col gap-2 mt-4 overflow-y-auto w-full h-[70px] scrollbar-custom">
-                 {stats?.actor_attribution?.map((actor, idx) => (
-                   <div key={idx} className="flex justify-between items-center text-[10px]">
-                     <div className="flex items-center gap-2">
-                       <div className="w-2 h-2 rounded-full" style={{ backgroundColor: ['#ff0000', '#ff8800', '#00ffff', '#333333'][idx % 4]}}></div>
-                       <span className="font-bold text-white/70 uppercase tracking-wider">{actor.actor}</span>
-                     </div>
-                     <span className="font-black italic tabular-nums">{actor.value}%</span>
-                   </div>
-                 ))}
-              </div>
+            <TacticalCard title="Detection Source" subTitle="How high-risk domains were flagged" status="MISP + ML FUSION" className="flex-1">
+              {stats?.detection_source_breakdown ? (
+                <>
+                  <div className="w-full h-[200px] mt-2">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <PieChart>
+                        <Pie
+                          data={stats.detection_source_breakdown}
+                          cx="50%" cy="50%" innerRadius={40} outerRadius={70}
+                          paddingAngle={5} dataKey="count" stroke="none"
+                        >
+                          {stats.detection_source_breakdown.map((entry, index) => (
+                            <Cell key={`cell-${index}`} fill={SOURCE_COLORS[entry.reason] ?? '#333333'} />
+                          ))}
+                        </Pie>
+                        <Tooltip contentStyle={{ backgroundColor: "#000", border: "1px solid #333", fontSize: "10px" }} />
+                      </PieChart>
+                    </ResponsiveContainer>
+                  </div>
+
+                  <div className="flex flex-col gap-2 mt-4 overflow-y-auto w-full h-[70px] scrollbar-custom">
+                    {stats.detection_source_breakdown.map((src, idx) => (
+                      <div key={idx} className="flex justify-between items-center text-[10px]">
+                        <div className="flex items-center gap-2">
+                          <div className="w-2 h-2 rounded-full" style={{ backgroundColor: SOURCE_COLORS[src.reason] ?? '#333333'}}></div>
+                          <span className="font-bold text-white/70 uppercase tracking-wider">{SOURCE_LABELS[src.reason] ?? src.reason}</span>
+                        </div>
+                        <span className="font-black italic tabular-nums">{src.pct}%</span>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              ) : <div className="h-full flex items-center justify-center opacity-20 italic">NO_DETECTION_SOURCE_DATA</div>}
             </TacticalCard>
           </div>
         </div>
@@ -516,8 +517,14 @@ export default function PhantomEyeAdvancedDashboard() {
                       </div>
                     ))}
                   </div>
-                  <div className="mt-10 p-6 bg-white/5 border border-white/10 text-[11px] text-white/30 italic leading-relaxed uppercase font-black tracking-widest border-l-4 border-tactical-red">
-                    Verdict confidence: 99.8%. Match identified against Phishing Kit Lexical Core v4.2. Recommended automated sinkhole deployment.
+                  <div className={`mt-10 p-6 bg-white/5 border border-white/10 text-[11px] italic leading-relaxed uppercase font-black tracking-widest border-l-4 ${scanResult.enrichment_status === 'lexical_only' ? 'border-yellow-500 text-yellow-500/70' : 'border-cyan-400 text-white/40'}`}>
+                    <div>Model: {scanResult.model_used ?? 'unavailable'}</div>
+                    <div>Enrichment: {scanResult.enrichment_status ?? 'unknown'}</div>
+                    {scanResult.enrichment_status === 'lexical_only'
+                      ? <div className="mt-2 not-italic normal-case tracking-normal">⚠ Live enrichment timed out — scored on domain text alone. Lower-confidence than a fully enriched result.</div>
+                      : scanResult.enrichment_status === 'partial'
+                      ? <div className="mt-2 not-italic normal-case tracking-normal">DNS/GeoIP resolved; WHOIS unavailable. Partial-confidence score.</div>
+                      : <div className="mt-2 not-italic normal-case tracking-normal">Fully enriched (DNS, GeoIP, WHOIS) — full model feature set.</div>}
                   </div>
                 </div>
               </motion.div>
