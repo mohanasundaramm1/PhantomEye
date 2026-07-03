@@ -89,7 +89,10 @@ services:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
       AIRFLOW__CORE__DEFAULT_TIMEZONE: "UTC"
       AIRFLOW__SCHEDULER__SCHEDULER_ZOMBIE_TASK_THRESHOLD: "10800" # 3 hours
-      AIRFLOW__SCHEDULER__TASK_HEARTBEAT_SEC: "30"
+      # (a TASK_HEARTBEAT_SEC var used to sit here -- that key doesn't exist in
+      # Airflow and was silently ignored, the same trap as the zombie-threshold
+      # var name above. The real knob, job_heartbeat_sec, defaults to 5s which
+      # is already what we want.)
     volumes:
       - ./dags:/opt/airflow/dags
       - ./logs:/opt/airflow/logs

@@ -220,6 +220,35 @@ def test_queue_metrics_survives_concurrent_claim_toctou_race(tmp_path):
     assert m["queue_depth"] == 1  # only the un-raced file counted, not a crash
 
 
+def test_in_flight_domains_covers_pending_and_processing(tmp_path):
+    q = FileQueue(str(tmp_path / "q"))
+    q.enqueue([{"registered_domain": "pending.com"}])
+    q.enqueue([{"registered_domain": "will-be-claimed.com"}])
+    q.claim_batch()  # moves the oldest (pending.com's) batch into processing/
+    assert q.in_flight_domains() == {"pending.com", "will-be-claimed.com"}
+
+
+def test_enqueue_domains_skips_already_in_flight_items(tmp_path):
+    """Regression test for a real gap found via code review: enqueue_domains()
+    had no dedup, so an Airflow retry (or reset_dag_run=True re-triggering the
+    same execution_date) re-ran the task from scratch and silently piled a
+    second copy of that day's domain list into the shared queue -- real wasted
+    rate-limited WHOIS/DNS work on every retry, not just a cosmetic depth bump.
+    Simulates exactly that: the same call twice, as a retried task would."""
+    from ct.enrich.enrich_worker import build_queue, enqueue_domains
+
+    cfg = make_cfg(tmp_path)
+    first = enqueue_domains(["a.com", "b.com"], cfg)
+    assert first == 2
+
+    # "retry": the exact same task body runs again from scratch
+    second = enqueue_domains(["a.com", "b.com"], cfg)
+    assert second == 0  # both already in-flight -- nothing new enqueued
+
+    q = build_queue(cfg)
+    assert q.metrics()["queue_depth"] == 2  # not 4 -- no duplicate pile-up
+
+
 def test_worker_requeues_item_when_fetch_times_out(tmp_path):
     from ct.enrich.enrich_worker import build_queue, run_worker
     cfg = make_cfg(tmp_path)
@@ -358,6 +387,51 @@ def test_worker_end_to_end_writes_output_and_ledgers(tmp_path):
     # caches persisted with fetched_at
     whois = pd.read_parquet(str(tmp_path / "lookups" / "whois_cache.parquet"))
     assert "fetched_at" in whois.columns and (whois["domain"] == "hi.com").any()
+
+
+def test_worker_time_budget_stops_cleanly_and_loses_nothing(tmp_path):
+    """Regression test for the run-forever failure that killed whois_rdap_ingest,
+    dns_ip_geo_ingest and pipeline_orchestrator one after another: run_worker
+    drained until the queue was EMPTY, but the shared queue is continuously
+    refilled (enrich_hot every 2h), so an unbounded run mathematically never
+    finished -- it just ran until execution_timeout/dagrun_timeout killed it and
+    the run was recorded FAILED, every time.
+
+    With max_seconds the worker must (a) stop mid-batch once the budget is
+    spent, (b) hand the unprocessed remainder straight back to pending WITHOUT
+    burning failure attempts, (c) leave nothing stuck in processing/, and
+    (d) account for every item: processed + deferred == enqueued."""
+    import time as _time
+    from ct.enrich.enrich_worker import build_queue, run_worker
+
+    cfg = make_cfg(tmp_path)
+    n = 40
+    build_queue(cfg).enqueue([
+        {"registered_domain": f"d{i}.com", "domain": f"d{i}.com", "triage_score": 0.9}
+        for i in range(n)
+    ])
+
+    def slow_whois(d, timeout=10.0):
+        _time.sleep(0.03)  # each item costs ~30ms -> 40 items ~1.2s total
+        return {"domain": d, "registrar": "R"}
+
+    stats = run_worker(
+        cfg, max_seconds=0.15,  # budget only covers a handful of items
+        dns_fetch=lambda d: ["1.1.1.1"],
+        whois_fetch=slow_whois,
+    )
+
+    q = build_queue(cfg)
+    m = q.metrics()
+    # stopped early, deferred the rest
+    assert 0 < stats["processed"] < n
+    assert stats["budget_deferred"] == n - stats["processed"]
+    # every unprocessed item is back in pending -- none lost, none in processing/
+    assert m["queue_depth"] == n - stats["processed"]
+    assert os.listdir(q.processing_dir) == []
+    # budget-deferral is not a failure: no attempt counters burned
+    _, items = q.claim_batch()
+    assert all(it.get("attempts", 0) == 0 for it in items)
 
 
 # ---------------- hot path: whois_mode="cache_only" ----------------

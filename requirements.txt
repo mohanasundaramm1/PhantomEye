@@ -42,3 +42,9 @@ scipy==1.16.3
 matplotlib==3.10.7
 seaborn==0.13.2
 umap-learn==0.5.9.post2
+
+# Campaign-radar application datastore (product/ module): dedicated app Postgres,
+# separate from Airflow's metadata DB. SQLAlchemy 2.x ORM + Alembic migrations.
+SQLAlchemy==2.0.36
+alembic==1.14.0
+psycopg2-binary==2.9.10

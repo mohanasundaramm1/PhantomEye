@@ -180,7 +180,18 @@ def dns_ip_geo_task(ds: str, ts: str, **context):
     # keep this DAG cheap: DNS/geo only, skip Tier 2 WHOIS for these items
     items = [{"registered_domain": d, "domain": d, "triage_score": 0.0} for d in domains]
     enqueue_domains(items, cfg)
-    run_worker(cfg)
+    # BOUNDED drain: this drains the SHARED enrichment queue, which also holds
+    # WHOIS-heavy items enqueued by other DAGs and is continuously refilled by
+    # enrich_hot -- an unbounded drain-until-empty here ran for 4h+ until it was
+    # killed and the run recorded FAILED. Each run now drains a bounded chunk
+    # and exits SUCCESS; the remainder stays queued for the next run.
+    # Override per-trigger: -c '{"drain_budget_seconds": 120}'
+    _dag_run = context.get("dag_run")
+    _conf = (_dag_run.conf if _dag_run is not None and _dag_run.conf else {}) or {}
+    _budget = float(_conf.get("drain_budget_seconds")
+                    or os.getenv("CT_DNS_DRAIN_BUDGET_SECONDS", "1800"))
+    _stats = run_worker(cfg, max_seconds=_budget)
+    log.info("[dns_ip_geo] bounded drain done (budget=%.0fs): %s", _budget, _stats)
 
     # daily subset from refreshed caches: dns pairs joined with ip geo
     caches = build_caches(cfg)
@@ -300,4 +311,7 @@ with DAG(
     PythonOperator(
         task_id="dns_ip_geo_fetch",
         python_callable=dns_ip_geo_task,
+        # hard stop well above the 30-min default drain budget; previously this
+        # task had NO timeout and ran unbounded for 4h+ before being killed
+        execution_timeout=timedelta(hours=1),
     )

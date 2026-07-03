@@ -120,6 +120,42 @@ class FileQueue:
             log.info("[queue] requeued %s (attempt %d, reason=%s)",
                      item.get("registered_domain"), item["attempts"], reason)
 
+    # ---------- dedup ----------
+
+    def in_flight_domains(self) -> set[str]:
+        """Registered domains currently sitting in pending/ or processing/ --
+        i.e. already queued/being worked, not yet completed or failed.
+
+        Used to make enqueue idempotent against retries: an Airflow task that
+        re-runs from scratch (a normal `retries` retry, or reset_dag_run=True
+        re-triggering the same execution_date) calls enqueue_domains() again
+        with the same day's domain list. Without this check, every retry
+        would silently pile another copy of that list into the shared queue --
+        real wasted rate-limited WHOIS/DNS work, not just a cosmetic depth
+        bump. Best-effort/TOCTOU-tolerant like metrics(): a file that's
+        claimed between scan and read here just means (at worst) one
+        duplicate slips through this pass -- never worth raising over, since
+        this is a dedup optimization, not a correctness guarantee."""
+        domains: set[str] = set()
+        for d in (self.pending_dir, self.processing_dir):
+            for path in glob.glob(os.path.join(d, "*.jsonl")):
+                try:
+                    f = open(path)
+                except (FileNotFoundError, OSError):
+                    continue  # claimed/removed between glob() and open()
+                with f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            dom = json.loads(line).get("registered_domain")
+                        except json.JSONDecodeError:
+                            continue
+                        if dom:
+                            domains.add(dom)
+        return domains
+
     # ---------- metrics ----------
 
     def metrics(self) -> dict:
