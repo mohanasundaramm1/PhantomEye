@@ -27,9 +27,9 @@ down:
 #   - FastAPI backend:     make api
 #   - Next.js frontend:    make web
 up-all:
-	@echo "==> [1/2] root stack: kafka, zookeeper, kafdrop, certstream"
+	@echo "==> [1/2] root stack: kafka, zookeeper, kafdrop, certstream, app-db"
 	docker compose up -d
-	@echo "==> [1/2] done. Kafdrop: http://localhost:9000  CertStream: ws://127.0.0.1:4000"
+	@echo "==> [1/2] done. Kafdrop: http://localhost:9000  CertStream: ws://127.0.0.1:4000  app-db: localhost:5433"
 	@echo "==> [2/2] airflow stack: postgres, webserver, scheduler, triggerer"
 	AIRFLOW_UID=$${AIRFLOW_UID:-$$(id -u)} docker compose -f airflow/docker-compose.airflow.yml up -d
 	@echo "==> [2/2] done. Airflow UI: http://localhost:8080 (default admin/admin, unless changed)"
