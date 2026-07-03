@@ -30,6 +30,7 @@ from datetime import timezone
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from ct.ingest.triage import _domain_under, load_config as load_triage_config
 from product.db import SessionLocal
 from product.models import (
     CampaignCluster,
@@ -55,13 +56,22 @@ def load_brands(session) -> list[tuple[str, list[str], int]]:
     return brands
 
 
-def target_brand_for(host: str, brands) -> str | None:
+def target_brand_for(host: str, brands, self_domains: dict | None = None) -> str | None:
     """Attribute a host to the highest-priority watchlist brand whose name/alias
-    appears in it. Substring match for the slice; token-boundary matching is a
-    Track B refinement (so e.g. 'pineapple' would currently match 'apple')."""
+    appears in it, EXCEPT when the host is that brand's own legitimate
+    infrastructure (self_domains, reused from the triage provider-allowlist) --
+    otherwise a brand's own high-scoring infra (e.g. graphql.fabric.microsoft.com)
+    would form a fake "impersonation" campaign, exactly the Day-1 noise leaking
+    back in via attribution. Substring match for the slice; token-boundary
+    matching is a Track B refinement (so e.g. 'pineapple' would still match
+    'apple')."""
     h = (host or "").lower()
+    self_domains = self_domains or {}
     for name, tokens, _prio in brands:
         if any(t and t in h for t in tokens):
+            own = self_domains.get(name)
+            if own and _domain_under(h, own):
+                continue  # the brand's OWN infra, not impersonation -- skip it
             return name
     return None
 
@@ -90,6 +100,10 @@ def assemble(min_risk: float = 0.5) -> dict:
         if not brands:
             return {"ok": False, "reason": "no active watchlist brands; run `make seed-brands`"}
 
+        # reuse the triage provider-allowlist so a brand's own legit infra is
+        # never attributed as impersonation (see target_brand_for).
+        self_domains = load_triage_config().get("brand_self_domains", {})
+
         observations = s.execute(
             select(CtObservation).where(CtObservation.risk_score >= min_risk)
         ).scalars().all()
@@ -99,7 +113,7 @@ def assemble(min_risk: float = 0.5) -> dict:
         for o in observations:
             if o.event_ts is None:
                 continue
-            brand = target_brand_for(o.raw_host, brands)
+            brand = target_brand_for(o.raw_host, brands, self_domains)
             if not brand:
                 continue
             burst_day = o.event_ts.astimezone(timezone.utc).date().isoformat()

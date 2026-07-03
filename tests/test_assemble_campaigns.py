@@ -39,6 +39,17 @@ def test_target_brand_prefers_higher_priority():
     assert target_brand_for("paypal-apple.tk", brands) == "paypal"
 
 
+def test_target_brand_excludes_brands_own_infra():
+    # A brand's own legit infra must not be attributed as impersonation -- this
+    # is the Day-1 provider-allowlist reused for attribution.
+    brands = [("microsoft", ["microsoft"], 150)]
+    self_domains = {"microsoft": ["microsoft.com", "microsoftonline.com"]}
+    assert target_brand_for("graphql.fabric.microsoft.com", brands, self_domains) is None
+    assert target_brand_for("microsoft365-pentesting.com", brands, self_domains) == "microsoft"
+    # lookalike trick under a fake apex is still attributed
+    assert target_brand_for("login.microsoft.com.evil.tk", brands, self_domains) == "microsoft"
+
+
 # ---------- live merge-not-split (W3) ----------
 
 @pytest.mark.skipif(not ping(), reason="app-db not reachable (docker compose up -d app-db)")
