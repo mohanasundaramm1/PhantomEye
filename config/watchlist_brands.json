@@ -1,0 +1,10 @@
+{
+  "_doc": "Bootstrap watchlist for the campaign radar -- 'bring your own brand'. priority is HIGHER = more important (used as a ranking boost for customer-relevant campaigns). aliases are extra tokens matched in a host in addition to brand_name. Edit this and run `make seed-brands`.",
+  "brands": [
+    {"brand_name": "paypal",    "aliases": ["paypa1", "paypal-support", "paypalinc"], "priority": 200},
+    {"brand_name": "coinbase",  "aliases": ["coinbse"],                                "priority": 200},
+    {"brand_name": "binance",   "aliases": [],                                         "priority": 200},
+    {"brand_name": "microsoft", "aliases": ["office365", "msft", "microsft"],          "priority": 150},
+    {"brand_name": "apple",     "aliases": ["appleid"],                                "priority": 150}
+  ]
+}

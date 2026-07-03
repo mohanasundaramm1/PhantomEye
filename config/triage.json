@@ -38,5 +38,21 @@
     "pages.dev", "netlify.app", "vercel.app", "herokuapp.com",
     "github.io", "glitch.me", "000webhostapp.com", "weebly.com",
     "blogspot.com", "wordpress.com", "azurewebsites.net", "no-ip.org"
+  ],
+  "brand_self_domains": {
+    "amazon":    ["amazonaws.com", "amazon.com", "media-amazon.com", "ssl-images-amazon.com", "amazontrust.com"],
+    "google":    ["google.com", "googleapis.com", "gstatic.com", "googleusercontent.com", "googlevideo.com", "withgoogle.com", "google-analytics.com", "googletagmanager.com", "1e100.net"],
+    "microsoft": ["microsoft.com", "microsoftonline.com", "windows.net", "azureedge.net", "office.com", "office365.com", "live.com", "msn.com"],
+    "apple":     ["apple.com", "cdn-apple.com", "icloud.com", "mzstatic.com"],
+    "facebook":  ["facebook.com", "fbcdn.net", "fb.com"],
+    "instagram": ["instagram.com", "cdninstagram.com"],
+    "whatsapp":  ["whatsapp.com", "whatsapp.net"],
+    "netflix":   ["netflix.com", "nflxvideo.net", "nflximg.net", "nflxext.com"],
+    "paypal":    ["paypal.com", "paypalobjects.com"],
+    "coinbase":  ["coinbase.com"],
+    "binance":   ["binance.com", "binance.org"]
+  },
+  "infra_suffixes": [
+    "cloudfront.net", "akamaized.net", "akamaihd.net", "fastly.net", "cloudflare.net"
   ]
 }

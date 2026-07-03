@@ -81,22 +81,70 @@ def _tokens(domain: str) -> list:
     return out
 
 
+def _domain_under(domain: str, suffixes) -> bool:
+    """True if `domain` equals or is a subdomain of any suffix, matched on
+    label boundaries. Anchored on the END of the host so the classic
+    lookalike trick (a.paypal.com.evil.tk) is NOT treated as under paypal.com --
+    that host ends in .evil.tk, not .paypal.com. Same matching rule already used
+    by on_free_subdomain_provider()."""
+    for suf in suffixes:
+        if domain == suf or domain.endswith("." + suf):
+            return True
+    return False
+
+
 def brand_matches(domain: str, cfg: dict = None) -> list:
-    """Return brand keywords matched by substring or Levenshtein <= N on tokens."""
+    """Return brand keywords matched by substring or Levenshtein <= N on tokens.
+
+    Provider-context suppression (the fix for legit-infrastructure false
+    positives, e.g. s3.amazonaws.com wrongly scoring brand_match:amazon):
+
+    - A *real brand* keyword (one with an entry in brand_self_domains) is
+      suppressed ONLY when the host is under that brand's OWN domains. So the
+      brand is never flagged on its own infrastructure, yet a phish for a
+      DIFFERENT brand hosted on that infra (paypal-login.s3.amazonaws.com) still
+      flags -- we only clear the "amazon" hit there, not the "paypal" hit.
+    - A *generic sensitive word* (login/account/secure/verify/...; no
+      brand_self_domains entry) is suppressed on ANY known-legit infrastructure
+      (the union of every brand's own domains + infra_suffixes), since
+      accounts.google.com / login.microsoftonline.com are legitimate. Free
+      subdomain providers (pages.dev, web.app, ...) are deliberately NOT in this
+      allowlist -- phishing lives there, so generic words must still fire.
+    """
     cfg = cfg or load_config()
     max_dist = cfg["triage"].get("levenshtein_max_distance", 2)
     keywords = cfg.get("brand_keywords", [])
+    self_domains = cfg.get("brand_self_domains", {})
+    # aggregate allowlist for generic-word suppression: all brands' own infra
+    # plus generic CDN/cloud suffixes that carry no brand keyword themselves.
+    allow_all = set(cfg.get("infra_suffixes", []))
+    for doms in self_domains.values():
+        allow_all.update(doms)
+
     hits = []
     toks = _tokens(domain)
     for kw in keywords:
-        if kw in domain:
-            hits.append(kw)
+        matched = kw in domain
+        if not matched:
+            for tok in toks:
+                # skip tiny tokens: distance-2 matches on short words are noise
+                if len(tok) >= max(4, len(kw) - max_dist) and levenshtein(tok, kw) <= max_dist:
+                    matched = True
+                    break
+        if not matched:
             continue
-        for tok in toks:
-            # skip tiny tokens: distance-2 matches on short words are noise
-            if len(tok) >= max(4, len(kw) - max_dist) and levenshtein(tok, kw) <= max_dist:
-                hits.append(kw)
-                break
+
+        own = self_domains.get(kw)
+        if own is not None:
+            # real brand: only its own infra is exempt
+            if _domain_under(domain, own):
+                continue
+        else:
+            # generic word: any known-legit infra is exempt
+            if _domain_under(domain, allow_all):
+                continue
+
+        hits.append(kw)
     return hits
 
 

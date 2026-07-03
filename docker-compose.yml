@@ -71,3 +71,29 @@ services:
     ports:
       - "4000:8080"
     restart: unless-stopped
+
+  # Application datastore for the campaign-radar layer (analyst/product state:
+  # observations, campaigns, dispositions, watchlist). Deliberately SEPARATE
+  # from Airflow's own metadata Postgres -- the parquet lake stays the detection
+  # pipeline's source of truth; this DB is the serving/interaction store.
+  # Host port 5433 avoids clashing with a local 5432. APP_DATABASE_URL points
+  # host-run jobs/API here: postgresql+psycopg2://app:app@localhost:5433/campaigns
+  app-db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: campaigns
+    ports:
+      - "5433:5432"
+    volumes:
+      - appdb_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U app -d campaigns" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  appdb_data:
