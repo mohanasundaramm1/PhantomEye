@@ -244,21 +244,32 @@ def whois_rdap_task(ds: str | None = None, ts: str | None = None, **context):
     os.makedirs(LOOKUPS_BASE, exist_ok=True)
     os.makedirs(WHOIS_DAILY_DIR, exist_ok=True)
 
-    labels = _load_labels_for_day(ds)
-    labels["registered_domain"] = labels["domain"].map(_effective_domain)
+    # Two kinds of runs share this task:
+    #   - orchestrator/manual trigger: enqueue this ds's labeled domains, then
+    #     drain a bounded chunk and write the daily whois subset (original job).
+    #   - the DAG's own 2-hourly SCHEDULED runs: DRAIN-ONLY. Their purpose is to
+    #     keep eating the shared queue backlog between orchestrator runs. They
+    #     must not re-enqueue the day's labels 12x/day, and must not skip just
+    #     because the (mid-day) logical ds has no labels file yet.
+    dag_run = context.get("dag_run")
+    drain_only = dag_run is not None and getattr(dag_run, "run_type", "") == "scheduled"
 
-    domains = sorted(
-        d
-        for d in labels["registered_domain"]
-        .dropna()
-        .astype(str)
-        .str.lower()
-        .unique()
-        .tolist()
-        if d
-    )
-    if not domains:
-        raise AirflowSkipException(f"[whois_rdap] no valid domains for ds={ds}")
+    domains: list = []
+    if not drain_only:
+        labels = _load_labels_for_day(ds)
+        labels["registered_domain"] = labels["domain"].map(_effective_domain)
+        domains = sorted(
+            d
+            for d in labels["registered_domain"]
+            .dropna()
+            .astype(str)
+            .str.lower()
+            .unique()
+            .tolist()
+            if d
+        )
+        if not domains:
+            raise AirflowSkipException(f"[whois_rdap] no valid domains for ds={ds}")
 
     # -------- queue-decoupled path --------
     # Enqueue domains into the durable enrichment queue and drain it via the
@@ -269,9 +280,26 @@ def whois_rdap_task(ds: str | None = None, ts: str | None = None, **context):
 
     cfg = load_config()
     cfg["paths"]["lookups_dir"] = LOOKUPS_BASE
-    # labeled malicious domains: no triage_score -> treated as high priority (Tier 2)
-    enqueue_domains(domains, cfg)
-    run_worker(cfg)
+    if domains:
+        # labeled malicious domains: no triage_score -> treated as high priority (Tier 2)
+        enqueue_domains(domains, cfg)
+    # BOUNDED drain (fix for the run-forever failure): the shared queue is
+    # continuously refilled by enrich_hot every 2h, so an unbounded
+    # drain-until-empty here can mathematically never finish -- it just runs
+    # until execution_timeout (4h) kills it and the run is recorded FAILED,
+    # every time. Instead each run drains for at most drain_budget_seconds,
+    # exits SUCCESS, and the next scheduled run continues where it left off
+    # (unprocessed items stay queued, no attempts burned). Override per-trigger:
+    #   airflow dags trigger whois_rdap_ingest -c '{"drain_budget_seconds": 120}'
+    conf = (dag_run.conf if dag_run is not None and dag_run.conf else {}) or {}
+    budget = float(conf.get("drain_budget_seconds")
+                   or os.getenv("CT_WHOIS_DRAIN_BUDGET_SECONDS", "3000"))
+    stats = run_worker(cfg, max_seconds=budget)
+    log.info("[whois_rdap] bounded drain done (budget=%.0fs, drain_only=%s): %s",
+             budget, drain_only, stats)
+
+    if drain_only:
+        return  # scheduled drain runs don't own a ds; no daily subset to write
 
     # Daily subset for this ds, taken from the refreshed rolling cache
     cache = build_caches(cfg)["whois"]._df
@@ -431,7 +459,12 @@ default_args = {
 with DAG(
     dag_id="whois_rdap_ingest",
     start_date=datetime(2025, 11, 1),
-    schedule_interval=None,  # orchestrator triggers
+    # Every 2h (offset :30 to stagger against ct_enrich_and_score_dag's :00
+    # cadence), PLUS the daily orchestrator trigger. Each run drains a bounded
+    # chunk of the shared enrichment queue (see drain_budget_seconds in the
+    # task); trigger-only + unbounded drain could never keep up with the
+    # queue's continuous 2-hourly refill from enrich_hot.
+    schedule_interval="30 */2 * * *",
     catchup=False,
     max_active_runs=1,
     default_args=default_args,
@@ -440,5 +473,7 @@ with DAG(
     PythonOperator(
         task_id="whois_rdap_fetch",
         python_callable=whois_rdap_task,
+        # generous headroom over the 50-min default drain budget; the budget,
+        # not this timeout, is what ends a normal run now
         execution_timeout=timedelta(hours=4),
     )
