@@ -220,6 +220,35 @@ def test_queue_metrics_survives_concurrent_claim_toctou_race(tmp_path):
     assert m["queue_depth"] == 1  # only the un-raced file counted, not a crash
 
 
+def test_in_flight_domains_covers_pending_and_processing(tmp_path):
+    q = FileQueue(str(tmp_path / "q"))
+    q.enqueue([{"registered_domain": "pending.com"}])
+    q.enqueue([{"registered_domain": "will-be-claimed.com"}])
+    q.claim_batch()  # moves the oldest (pending.com's) batch into processing/
+    assert q.in_flight_domains() == {"pending.com", "will-be-claimed.com"}
+
+
+def test_enqueue_domains_skips_already_in_flight_items(tmp_path):
+    """Regression test for a real gap found via code review: enqueue_domains()
+    had no dedup, so an Airflow retry (or reset_dag_run=True re-triggering the
+    same execution_date) re-ran the task from scratch and silently piled a
+    second copy of that day's domain list into the shared queue -- real wasted
+    rate-limited WHOIS/DNS work on every retry, not just a cosmetic depth bump.
+    Simulates exactly that: the same call twice, as a retried task would."""
+    from ct.enrich.enrich_worker import build_queue, enqueue_domains
+
+    cfg = make_cfg(tmp_path)
+    first = enqueue_domains(["a.com", "b.com"], cfg)
+    assert first == 2
+
+    # "retry": the exact same task body runs again from scratch
+    second = enqueue_domains(["a.com", "b.com"], cfg)
+    assert second == 0  # both already in-flight -- nothing new enqueued
+
+    q = build_queue(cfg)
+    assert q.metrics()["queue_depth"] == 2  # not 4 -- no duplicate pile-up
+
+
 def test_worker_requeues_item_when_fetch_times_out(tmp_path):
     from ct.enrich.enrich_worker import build_queue, run_worker
     cfg = make_cfg(tmp_path)

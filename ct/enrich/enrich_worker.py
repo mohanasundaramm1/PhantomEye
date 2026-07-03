@@ -75,21 +75,34 @@ def build_breakers(cfg: dict) -> dict:
 # ---------------- enqueue paths ----------------
 
 def enqueue_domains(domains_or_records, cfg: dict | None = None) -> int:
-    """Enqueue registered domains (strings) or record dicts (may carry triage_score)."""
+    """Enqueue registered domains (strings) or record dicts (may carry triage_score).
+
+    Skips domains already sitting in pending/processing (in-flight dedup): an
+    Airflow retry or a TriggerDagRunOperator reset_dag_run re-run calls this
+    again from scratch with the same day's domain list, and without this guard
+    would silently re-enqueue a duplicate copy on every retry -- real wasted
+    rate-limited WHOIS/DNS work against the shared queue, not just a cosmetic
+    depth bump. See FileQueue.in_flight_domains()."""
     cfg = cfg or load_config()
     queue = build_queue(cfg)
+    in_flight = queue.in_flight_domains()
     items = []
+    skipped = 0
     for r in domains_or_records:
         if isinstance(r, str):
-            items.append({"registered_domain": r, "domain": r, "triage_score": None})
+            item = {"registered_domain": r, "domain": r, "triage_score": None}
         else:
             item = dict(r)
             item.setdefault("registered_domain", item.get("domain"))
             item.setdefault("triage_score", None)
-            items.append(item)
+        dom = item.get("registered_domain")
+        if dom and dom in in_flight:
+            skipped += 1
+            continue
+        items.append(item)
     for i in range(0, len(items), queue.batch_size):
         queue.enqueue(items[i:i + queue.batch_size])
-    log.info("[worker] enqueued %d items", len(items))
+    log.info("[worker] enqueued %d items (%d skipped, already in-flight)", len(items), skipped)
     queue.log_metrics()
     return len(items)
 
