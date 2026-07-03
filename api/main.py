@@ -191,6 +191,24 @@ def lead_time_metrics():
         return {"available": False, "reason": f"could not read summary: {e}"}
     return {"available": True, **summary}
 
+MODEL_META_PATH = "ml/models/registry/ct_risk_meta_latest.json"
+
+@app.get("/model/status")
+def model_status():
+    """Surfaces the real training/promotion metadata written by the ML
+    training job to ml/models/registry/ct_risk_meta_latest.json -- actual
+    dataset size, class balance, and the champion/challenger promotion
+    decision, not a marketing claim. Re-run the training pipeline to
+    refresh this file."""
+    if not os.path.exists(MODEL_META_PATH):
+        return {"available": False, "reason": "no model metadata found; run the ML training pipeline"}
+    try:
+        with open(MODEL_META_PATH) as f:
+            meta = json.load(f)
+    except Exception as e:
+        return {"available": False, "reason": f"could not read model metadata: {e}"}
+    return {"available": True, **meta}
+
 @app.get("/threats/latest")
 def get_latest_threats(limit: int = 50):
     path = get_latest_parquet()

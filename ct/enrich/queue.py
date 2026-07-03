@@ -123,11 +123,24 @@ class FileQueue:
     # ---------- metrics ----------
 
     def metrics(self) -> dict:
-        """Queue depth and enrichment lag (now - oldest pending enqueue time)."""
+        """Queue depth and enrichment lag (now - oldest pending enqueue time).
+
+        Purely observational (logging/reporting), not part of claim/complete/
+        requeue correctness -- must never raise. Multiple DAGs now share one
+        queue directory and can drain concurrently, so a file this method
+        glob()'d can legitimately be claim_batch()'d (atomically renamed into
+        processing/) by another worker before this method's open() runs --
+        a benign TOCTOU race, not a bug in claiming itself (os.rename is
+        atomic, so the file is never partially read). Skip such files for
+        this snapshot rather than crashing the caller's task."""
         depth = 0
         oldest = None
         for path in glob.glob(os.path.join(self.pending_dir, "*.jsonl")):
-            with open(path) as f:
+            try:
+                f = open(path)
+            except (FileNotFoundError, OSError):
+                continue  # claimed by another worker between glob() and open()
+            with f:
                 for line in f:
                     line = line.strip()
                     if not line:
