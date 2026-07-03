@@ -5,11 +5,11 @@
     "max_attempts": 3
   },
   "rate_limits": {
-    "whois_rps": 1.0,
+    "whois_rps": 2.0,
     "dns_rps": 20.0
   },
   "timeouts": {
-    "whois_seconds": 10.0,
+    "whois_seconds": 6.0,
     "dns_seconds": 5.0
   },
   "tiers": {

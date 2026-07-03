@@ -360,6 +360,51 @@ def test_worker_end_to_end_writes_output_and_ledgers(tmp_path):
     assert "fetched_at" in whois.columns and (whois["domain"] == "hi.com").any()
 
 
+def test_worker_time_budget_stops_cleanly_and_loses_nothing(tmp_path):
+    """Regression test for the run-forever failure that killed whois_rdap_ingest,
+    dns_ip_geo_ingest and pipeline_orchestrator one after another: run_worker
+    drained until the queue was EMPTY, but the shared queue is continuously
+    refilled (enrich_hot every 2h), so an unbounded run mathematically never
+    finished -- it just ran until execution_timeout/dagrun_timeout killed it and
+    the run was recorded FAILED, every time.
+
+    With max_seconds the worker must (a) stop mid-batch once the budget is
+    spent, (b) hand the unprocessed remainder straight back to pending WITHOUT
+    burning failure attempts, (c) leave nothing stuck in processing/, and
+    (d) account for every item: processed + deferred == enqueued."""
+    import time as _time
+    from ct.enrich.enrich_worker import build_queue, run_worker
+
+    cfg = make_cfg(tmp_path)
+    n = 40
+    build_queue(cfg).enqueue([
+        {"registered_domain": f"d{i}.com", "domain": f"d{i}.com", "triage_score": 0.9}
+        for i in range(n)
+    ])
+
+    def slow_whois(d, timeout=10.0):
+        _time.sleep(0.03)  # each item costs ~30ms -> 40 items ~1.2s total
+        return {"domain": d, "registrar": "R"}
+
+    stats = run_worker(
+        cfg, max_seconds=0.15,  # budget only covers a handful of items
+        dns_fetch=lambda d: ["1.1.1.1"],
+        whois_fetch=slow_whois,
+    )
+
+    q = build_queue(cfg)
+    m = q.metrics()
+    # stopped early, deferred the rest
+    assert 0 < stats["processed"] < n
+    assert stats["budget_deferred"] == n - stats["processed"]
+    # every unprocessed item is back in pending -- none lost, none in processing/
+    assert m["queue_depth"] == n - stats["processed"]
+    assert os.listdir(q.processing_dir) == []
+    # budget-deferral is not a failure: no attempt counters burned
+    _, items = q.claim_batch()
+    assert all(it.get("attempts", 0) == 0 for it in items)
+
+
 # ---------------- hot path: whois_mode="cache_only" ----------------
 
 def test_cache_only_whois_miss_skips_network_and_flags_backfill(tmp_path):

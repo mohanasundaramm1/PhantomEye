@@ -19,6 +19,7 @@ import argparse
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -151,12 +152,24 @@ def _write_enriched_output(enriched_rows: list[dict], cfg: dict,
 # ---------------- drain loop ----------------
 
 def run_worker(cfg: dict | None = None, max_batches: int | None = None,
-               dns_fetch=None, whois_fetch=None, update_pointer: bool = True) -> dict:
+               dns_fetch=None, whois_fetch=None, update_pointer: bool = True,
+               max_seconds: float | None = None) -> dict:
     """Drain the pending queue. Returns summary stats. Fetchers injectable for tests.
 
     update_pointer=False (cold/backfill mode) warms caches and records enriched
     output without moving _latest_enriched.json, so it never overwrites the
-    fresher hot-path pointer the scorer reads."""
+    fresher hot-path pointer the scorer reads.
+
+    max_seconds bounds the WORK PER RUN, not the queue: when the time budget is
+    exhausted the worker stops cleanly (unprocessed items stay/return to
+    pending, nothing is lost or attempt-penalized) and reports success. This
+    exists because the shared queue is continuously refilled (enrich_hot every
+    2h), so an unbounded drain-until-empty run can mathematically never finish
+    -- it just runs until Airflow's execution_timeout/dagrun_timeout kills it
+    and the DAG records a failure. Bounded runs turn that into: each run drains
+    a chunk, succeeds, and the next scheduled run continues. The budget is
+    checked per-ITEM, not just per-batch, because one 200-item batch of dead
+    registrars at whois_seconds each can alone outlast a whole budget."""
     cfg = cfg or load_config()
     queue = build_queue(cfg)
     caches = build_caches(cfg)
@@ -169,17 +182,36 @@ def run_worker(cfg: dict | None = None, max_batches: int | None = None,
     dns_fetch = dns_fetch or _tiers.default_dns_fetch
     whois_fetch = whois_fetch or _tiers.default_whois_fetch
 
+    deadline = (time.monotonic() + max_seconds) if max_seconds else None
+
     enriched_rows: list[dict] = []
-    stats = {"processed": 0, "requeued": 0, "batches": 0}
+    stats = {"processed": 0, "requeued": 0, "batches": 0, "budget_deferred": 0}
 
     while max_batches is None or stats["batches"] < max_batches:
+        if deadline is not None and time.monotonic() >= deadline:
+            log.info("[worker] time budget (%.0fs) exhausted between batches -- stopping cleanly", max_seconds)
+            break
         queue.log_metrics()
         claimed = queue.claim_batch()
         if claimed is None:
             break
         claim_path, items = claimed
         stats["batches"] += 1
-        for item in items:
+        out_of_budget = False
+        for idx, item in enumerate(items):
+            if deadline is not None and time.monotonic() >= deadline:
+                # Hand the unprocessed remainder straight back to pending via
+                # enqueue() (NOT requeue(): running out of time is not a
+                # failure, so no attempt counter is burned) and finish the
+                # claim so nothing is left in processing/.
+                remainder = items[idx:]
+                queue.enqueue(remainder)
+                stats["budget_deferred"] += len(remainder)
+                log.info("[worker] time budget (%.0fs) exhausted mid-batch -- "
+                         "deferred %d unprocessed item(s) back to pending",
+                         max_seconds, len(remainder))
+                out_of_budget = True
+                break
             try:
                 row = enrich_item(
                     item,
@@ -202,6 +234,8 @@ def run_worker(cfg: dict | None = None, max_batches: int | None = None,
             queue.record_processed({**item, "enrichment_level": row["enrichment_level"]})
             stats["processed"] += 1
         queue.complete_batch(claim_path)
+        if out_of_budget:
+            break
 
     # persist caches (atomic temp-swap) + hit-rate stats
     for c in caches.values():
@@ -326,6 +360,8 @@ def main(argv=None):
     ap.add_argument("--no-pointer", action="store_true",
                     help="drain without advancing _latest_enriched.json (backfill / cache-warming)")
     ap.add_argument("--max-batches", type=int, default=None)
+    ap.add_argument("--max-seconds", type=float, default=None,
+                    help="time budget for this drain run; unprocessed items stay queued")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -340,9 +376,11 @@ def main(argv=None):
         enqueue_domains(args.enqueue_domains, cfg)
         did = True
     if args.drain:
-        run_worker(cfg, max_batches=args.max_batches, update_pointer=not args.no_pointer)
+        run_worker(cfg, max_batches=args.max_batches, update_pointer=not args.no_pointer,
+                   max_seconds=args.max_seconds)
     elif not did:
-        run_worker(cfg, max_batches=args.max_batches, update_pointer=not args.no_pointer)
+        run_worker(cfg, max_batches=args.max_batches, update_pointer=not args.no_pointer,
+                   max_seconds=args.max_seconds)
 
 
 if __name__ == "__main__":
