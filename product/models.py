@@ -23,6 +23,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     Float,
+    ForeignKey,
     Integer,
     String,
     Text,
@@ -100,4 +101,61 @@ class WatchlistBrand(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class CampaignCluster(Base):
+    """One infrastructure cluster = one campaign lead. Identity is a STABLE
+    cluster_key (W3 decision): sha1(target_brand | burst-day | lexical-family).
+    Clusters MERGE as new matching observations arrive (re-run finds the key and
+    grows the cluster); they are never auto-split. Stage/merge transitions get
+    logged to campaign_stage_history in a later track."""
+
+    __tablename__ = "campaign_clusters"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cluster_key: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+
+    status: Mapped[str] = mapped_column(String(16), default="open")
+    stage: Mapped[str] = mapped_column(String(16), default="new")  # new/warming/active/confirmed/suppressed
+    confidence_score: Mapped[float] = mapped_column(Float, default=0.0, index=True)
+
+    target_brand: Mapped[str | None] = mapped_column(String(128), index=True)
+    target_workflow: Mapped[str | None] = mapped_column(String(32))  # filled in Track C
+
+    first_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    observation_count: Mapped[int] = mapped_column(Integer, default=0)
+    summary_reason: Mapped[str | None] = mapped_column(Text)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ClusterMember(Base):
+    """Join row: an observation belongs to a cluster, with the reason/score it
+    was admitted. Unique on (cluster_id, observation_id) so re-runs are
+    idempotent (an observation is added to a cluster at most once)."""
+
+    __tablename__ = "cluster_members"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cluster_id: Mapped[int] = mapped_column(
+        ForeignKey("campaign_clusters.id", ondelete="CASCADE"), index=True
+    )
+    observation_id: Mapped[int] = mapped_column(
+        ForeignKey("ct_observations.id", ondelete="CASCADE"), index=True
+    )
+    membership_reason: Mapped[str | None] = mapped_column(String(256))
+    membership_score: Mapped[float | None] = mapped_column(Float)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("cluster_id", "observation_id", name="uq_member_cluster_obs"),
     )
