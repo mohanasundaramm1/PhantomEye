@@ -64,6 +64,18 @@ To handle the volatility of live internet data, the platform implements several 
 *   **Atomic Persistence**: All data writes use a temp-swap mechanism to ensure Parquet partitions are never corrupted.
 *   **Production/Legacy Separation**: Standardized `ml/core` for production logic, isolating legacy artifacts to `ml/legacy`.
 
+### Self-healing real-time ingest (macOS)
+
+The real-time CT lane (`forwarder.py` → Kafka → `stream_ct.py`) is the substrate everything downstream depends on, so it is built to survive crashes, laptop sleep, and reboots rather than failing silently:
+
+*   **Process supervision** — `make supervise-install` registers the two host consumers as launchd agents (`KeepAlive` + `RunAtLoad`): they restart on crash and come back on login/boot/wake. See [`ops/launchd/`](ops/launchd/).
+*   **Container restart policies** — Kafka, Zookeeper, Kafdrop, and certstream all run `restart: unless-stopped`, so a broker crash self-recovers instead of stranding the lane.
+*   **Loud staleness alerting** — a freshness watchdog (`scripts/ct_freshness_watchdog.py`, every 5 min) checks whether fresh data is actually *landing* and fires a macOS notification if not. This catches the worst failure mode — a process that is alive but has silently stopped producing output — which process supervision alone cannot see.
+*   **Non-destructive restarts** — under supervision the Spark consumer preserves its Kafka checkpoint across restarts (`CT_RESET_CHK_ON_START=0`), so an automatic restart *resumes* from the last committed offset instead of dropping everything produced during the downtime.
+*   **Freshness gate** — `ct_enrich_and_score_dag` runs `scripts/check_ct_freshness.py` as a gate, failing the batch (rather than silently emitting stale scores) if raw data is old or the scorer is re-scoring a static snapshot.
+
+Manage it with `make supervise-status` / `make supervise-uninstall`; full details in [`ops/launchd/README.md`](ops/launchd/README.md). launchd is the right fit for this laptop deployment; a server would map the same agents onto systemd units or containers.
+
 ---
 
 ## 🛡️ Privacy & Ethical Considerations
@@ -102,8 +114,16 @@ Bring everything back down with `make down-all`.
 
 Once Airflow is up, unpause `pipeline_orchestrator` (Lane 1, daily OSINT) and `ct_enrich_and_score_dag` (Lane 2, every 2h) in the Airflow UI so they run on schedule.
 
-### 2. Start the real-time CT stream (Lane 2 — two foreground processes)
-The CertStream *source* is a Docker service (started in step 1), but the consumers that read from it are foreground dev processes on purpose — they're short scripts you'll want to watch/restart while iterating, not opaque background containers:
+### 2. Start the real-time CT stream (Lane 2)
+The CertStream *source* is a Docker service (started in step 1); two consumers read from it. Two ways to run them:
+
+**Supervised (recommended, macOS)** — self-healing agents that restart on crash/sleep/reboot and alert on staleness (see [Reliability](#️-reliability--senior-engineering-patterns)):
+```bash
+make supervise-install     # forwarder + stream consumer + freshness watchdog
+make supervise-status      # check them;  make supervise-uninstall to remove
+```
+
+**Manual (foreground, best while iterating)** — watch/restart the short scripts yourself:
 ```bash
 # terminal A: certstream ws -> Kafka topic "ct-events"
 make forward-ct
@@ -111,7 +131,7 @@ make forward-ct
 # terminal B: Kafka "ct-events" -> ct/data/raw/ (Spark)
 make stream-ct
 ```
-Enrichment (`ct/enrich/`) and scoring (`ct/score/`) run automatically every 2 hours via the `ct_enrich_and_score_dag` Airflow DAG started in step 1 — no extra process needed for those. To run a one-off score pass without waiting for the DAG, see `ct/score/score_ct_with_latest.py`.
+Don't run both ways at once — the supervised agents already run these processes. Enrichment (`ct/enrich/`) and scoring (`ct/score/`) run automatically every 2 hours via the `ct_enrich_and_score_dag` Airflow DAG started in step 1 — no extra process needed for those. To run a one-off score pass without waiting for the DAG, see `ct/score/score_ct_with_latest.py`.
 
 ### 3. Start the API and console (two more foreground processes)
 ```bash
@@ -133,9 +153,10 @@ Checks whether `ct/data/raw` has fresh partitions and whether `gold/threat_score
 | # | What | How | URL |
 |---|------|-----|-----|
 | 1 | Kafka + CertStream + Airflow | `make up-all` | Kafdrop `:9000`, Airflow `:8080` |
-| 2 | CT forwarder + stream consumer | `make forward-ct` / `make stream-ct` | (Kafka `ct-events` -> `ct/data/raw/`) |
+| 2 | CT forwarder + stream consumer | `make supervise-install` (self-healing) or manual `make forward-ct` / `make stream-ct` | (Kafka `ct-events` -> `ct/data/raw/`) |
 | 3 | FastAPI backend | `make api` | `:8000` |
 | 3 | Next.js console | `make web` | `:3000` |
+| — | Ingest supervision status | `make supervise-status` | (self-healing agents' health) |
 | — | Freshness check | `make check-freshness` | (exits non-zero if stale) |
 
 Legacy Streamlit dashboard, if needed:

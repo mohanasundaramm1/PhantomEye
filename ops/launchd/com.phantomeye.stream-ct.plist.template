@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Supervises ct/ingest/stream_ct.py (Spark Structured Streaming: Kafka
+  ct-events -> ct/data/raw parquet).
+
+  Placeholders (__NAME__) are substituted by ops/launchd/install.sh at install
+  time. Do not hand-edit the rendered copy; re-run `make supervise-install`.
+
+  Two hard-won settings baked in here (both discovered live):
+
+    SPARK_LOCAL_IP=127.0.0.1
+      On this Mac, Spark's driver otherwise binds to the LAN IP (hostname
+      resolves to a routable address), which produces intermittent
+      RpcEndpointNotFoundException churn. Pinning to loopback fixes it.
+
+    CT_RESET_CHK_ON_START=0
+      This is the critical difference between a manual run and a *supervised*
+      run. The code default is 1 (wipe checkpoint on start) for dev ergonomics.
+      But under KeepAlive, every automatic restart would then wipe the
+      checkpoint and resume from `latest` Kafka offsets -- dropping everything
+      produced during the downtime, i.e. a guaranteed freshness GAP at exactly
+      the moment you can least afford one. With 0, a crash-restart resumes from
+      the last committed offset (failOnDataLoss=false already tolerates expired
+      offsets), so supervision becomes non-destructive: restarts RESUME instead
+      of dropping data.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.phantomeye.stream-ct</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__VENV_PY__</string>
+    <string>__REPO_ROOT__/ct/ingest/stream_ct.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__REPO_ROOT__</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>
+    <key>JAVA_HOME</key>
+    <string>__JAVA_HOME__</string>
+    <key>PYTHONPATH</key>
+    <string>__REPO_ROOT__</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+    <key>KAFKA_BOOTSTRAP_SERVERS</key>
+    <string>localhost:29092</string>
+    <key>KAFKA_TOPIC</key>
+    <string>ct-events</string>
+    <key>SPARK_LOCAL_IP</key>
+    <string>127.0.0.1</string>
+    <key>CT_RESET_CHK_ON_START</key>
+    <string>0</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <!-- Spark is heavy to boot (JVM + connector jar resolution); give it 30s
+       between respawns so a restart storm can't thrash the machine. -->
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>StandardOutPath</key>
+  <string>__REPO_ROOT__/ops/launchd/logs/stream-ct.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__REPO_ROOT__/ops/launchd/logs/stream-ct.err.log</string>
+</dict>
+</plist>

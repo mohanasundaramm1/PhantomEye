@@ -3,7 +3,8 @@ VENV_ACT = . .venv/bin/activate
 # api/ and web/ are real directories in this repo; without .PHONY, `make api`
 # and `make web` would be (incorrectly) considered "up to date" and no-op.
 .PHONY: up down up-all down-all topic-reset produce stream stream-fast \
-        stream-fresh stream-ct forward-ct api web check-freshness test
+        stream-fresh stream-ct forward-ct api web check-freshness test \
+        supervise-install supervise-uninstall supervise-status
 
 up:
 	docker compose up -d
@@ -82,6 +83,32 @@ web:
 # gold/threat_scores files look byte-identical (scorer re-scoring a stale snapshot).
 check-freshness:
 	$(VENV_ACT) && python scripts/check_ct_freshness.py
+
+# Real-time CT lane supervision (macOS launchd). Turns forwarder.py + stream_ct.py
+# from unsupervised foreground processes into self-healing agents (restart on
+# crash/sleep/reboot) plus a freshness watchdog that alerts on silent stalls.
+# See ops/launchd/README.md. These install standing login agents; remove with
+# supervise-uninstall.
+supervise-install:
+	./ops/launchd/install.sh
+
+supervise-uninstall:
+	./ops/launchd/uninstall.sh
+
+# Show each agent's state/pid and the watchdog's last recorded result.
+supervise-status:
+	@UID_NUM=$$(id -u); \
+	for label in com.phantomeye.forwarder com.phantomeye.stream-ct com.phantomeye.freshness-watchdog; do \
+	  if launchctl print gui/$$UID_NUM/$$label >/dev/null 2>&1; then \
+	    state=$$(launchctl print gui/$$UID_NUM/$$label 2>/dev/null | awk -F'= ' '/state = /{print $$2; exit}'); \
+	    pid=$$(launchctl print gui/$$UID_NUM/$$label 2>/dev/null | awk -F'= ' '/pid = /{print $$2; exit}'); \
+	    printf "  %-40s state=%s pid=%s\n" "$$label" "$${state:-?}" "$${pid:-none}"; \
+	  else \
+	    printf "  %-40s NOT LOADED\n" "$$label"; \
+	  fi; \
+	done; \
+	echo "  --- last watchdog result ---"; \
+	cat ops/launchd/logs/watchdog_state.json 2>/dev/null || echo "  (no watchdog run yet)"
 
 test:
 	$(VENV_ACT) && pytest -q

@@ -31,3 +31,7 @@ ml/reports/
 
 console.log
 .claude/worktrees/
+
+# launchd supervisor runtime artifacts (logs + watchdog state). The plist
+# *templates* under ops/launchd/ are tracked; the rendered logs/state are not.
+ops/launchd/logs/

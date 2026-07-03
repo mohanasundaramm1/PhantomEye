@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Periodic freshness watchdog: runs scripts/ct_freshness_watchdog.py every
+  StartInterval seconds. Unlike the forwarder/stream-ct agents (KeepAlive, i.e.
+  "keep this daemon alive"), this one is a PERIODIC task (StartInterval, i.e.
+  "run this every N seconds and exit"), because its job is to *poll* output
+  freshness, not to stay resident.
+
+  This is the safety net for the failure mode KeepAlive cannot see: a process
+  that is alive but not producing output. It checks whether fresh CT data is
+  actually landing and fires a macOS notification if not.
+
+  Placeholders (__NAME__) are substituted by ops/launchd/install.sh.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.phantomeye.freshness-watchdog</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__VENV_PY__</string>
+    <string>__REPO_ROOT__/scripts/ct_freshness_watchdog.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__REPO_ROOT__</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>
+    <key>PYTHONPATH</key>
+    <string>__REPO_ROOT__</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+    <!-- Alert if no fresh ct/data/raw file in this many minutes. The stream
+         normally writes every few seconds; 60m is well clear of false alarms
+         while still catching a real stall long before a human would notice. -->
+    <key>CT_WATCHDOG_MAX_AGE_MIN</key>
+    <string>60</string>
+    <key>CT_WATCHDOG_THROTTLE_MIN</key>
+    <string>30</string>
+  </dict>
+
+  <!-- Run every 5 minutes. RunAtLoad also fires it once immediately on install
+       so you get an instant baseline instead of waiting for the first tick. -->
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>StandardOutPath</key>
+  <string>__REPO_ROOT__/ops/launchd/logs/watchdog.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__REPO_ROOT__/ops/launchd/logs/watchdog.err.log</string>
+</dict>
+</plist>

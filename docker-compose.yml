@@ -1,4 +1,11 @@
 services:
+  # NOTE on restart policies: the real-time CT lane is a chain --
+  # certstream -> forwarder.py -> kafka -> stream_ct.py -> ct/data/raw. A crash
+  # anywhere in that chain silently stalls everything downstream (this is
+  # exactly how an 8h ingestion outage went unnoticed). certstream already had
+  # `restart: unless-stopped`; the broker + zookeeper it depends on did not, so
+  # a broker OOM/crash was unrecoverable. `unless-stopped` restarts on crash and
+  # on Docker/host boot, but respects an explicit `docker compose stop`.
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.1
     environment:
@@ -6,6 +13,7 @@ services:
       ZOOKEEPER_TICK_TIME: 2000
     ports:
       - "2181:2181"
+    restart: unless-stopped
 
   kafka:
     image: confluentinc/cp-kafka:7.5.1
@@ -22,6 +30,7 @@ services:
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    restart: unless-stopped
 
   kafdrop:
     image: obsidiandynamics/kafdrop:3.31.0
@@ -31,6 +40,7 @@ services:
       - "9000:9000"
     environment:
       KAFKA_BROKERCONNECT: kafka:9092
+    restart: unless-stopped
 
   # Certificate-Transparency-log websocket source for the real-time CT lane.
   # ct/ingest/forwarder.py (CERTSTREAM_WS, default "ws://127.0.0.1:4000") connects
