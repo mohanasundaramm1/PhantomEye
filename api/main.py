@@ -10,7 +10,7 @@ import numpy as np
 import tldextract
 import math
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import Counter
 
 from ml.core.features import build_features
@@ -208,6 +208,171 @@ def model_status():
     except Exception as e:
         return {"available": False, "reason": f"could not read model metadata: {e}"}
     return {"available": True, **meta}
+
+# ==================== campaign radar (product layer) ====================
+# Serves the analyst-facing campaign queue from the application Postgres
+# (product/ package). Guarded import so the rest of the API still loads if the
+# product DB deps/service aren't present.
+try:
+    from sqlalchemy import select
+    from product.db import SessionLocal, ping as _app_db_ping
+    from product.models import CampaignCluster, ClusterMember, CtObservation
+    _PRODUCT_DB = True
+except Exception:  # noqa: BLE001
+    _PRODUCT_DB = False
+
+WATCHDOG_STATE_PATH = "ops/launchd/logs/watchdog_state.json"
+# A cluster is "in the queue" once its confidence crosses this bar. (Queue
+# lifecycle -- queue_status/assignee/disposition -- lands with the analyst
+# workflow track; the read-only ranked queue only needs this promotion gate.)
+PROMOTION_MIN_CONFIDENCE = float(os.getenv("CAMPAIGN_PROMOTION_MIN_CONFIDENCE", "0.5"))
+
+
+def _read_json_safe(path: str):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _newest_age_hours(root: str):
+    """Age in hours of the most recently modified file under root, or None."""
+    newest = -1.0
+    for dirpath, _dirs, files in os.walk(root):
+        for fn in files:
+            try:
+                m = os.path.getmtime(os.path.join(dirpath, fn))
+                if m > newest:
+                    newest = m
+            except OSError:
+                pass
+    if newest < 0:
+        return None
+    return round((datetime.now().timestamp() - newest) / 3600.0, 2)
+
+
+@app.get("/health/pipeline")
+def health_pipeline():
+    """Real end-to-end pipeline health for the analyst: CT raw freshness,
+    scoring freshness, model age, the reliability watchdog's last verdict, and
+    app-DB liveness. This is observability layered over the already-self-healing
+    ingest (launchd supervision + freshness watchdog, see ops/launchd) -- it
+    reports real state, it does not simulate it."""
+    watchdog = _read_json_safe(WATCHDOG_STATE_PATH)
+    db_ok = bool(_app_db_ping()) if _PRODUCT_DB else False
+    ingest_stale = bool(watchdog.get("stale")) if watchdog else None
+    model_meta = _read_json_safe(MODEL_META_PATH) or {}
+    return {
+        # healthy = serving DB up AND the ingest canary isn't flagging staleness
+        "healthy": db_ok and (ingest_stale is not True),
+        "app_db": {"reachable": db_ok},
+        "ct_raw": {"newest_age_hours": _newest_age_hours("ct/data/raw")},
+        "scoring": {"newest_scored_age_hours": _newest_age_hours(GOLD_DIR)},
+        "model": {
+            "created_utc": model_meta.get("created_utc"),
+            "promoted": (model_meta.get("promotion_decision") or {}).get("promote"),
+        },
+        "ingest_watchdog": (
+            {
+                "stale": ingest_stale,
+                "last_checked_utc": watchdog.get("last_checked_iso"),
+                "note": "self-healing launchd supervision + freshness watchdog",
+            }
+            if watchdog is not None
+            else {"available": False, "note": "watchdog has not run yet"}
+        ),
+    }
+
+
+def _campaign_card(c) -> dict:
+    last = c.last_seen
+    fresh_min = None
+    if last is not None:
+        try:
+            fresh_min = round((datetime.now(timezone.utc) - last).total_seconds() / 60.0, 1)
+        except Exception:
+            fresh_min = None
+    return {
+        "campaign_id": c.id,
+        "target_brand": c.target_brand,
+        "target_workflow": c.target_workflow,
+        "stage": c.stage,
+        "status": c.status,
+        "confidence_score": round(c.confidence_score, 4) if c.confidence_score is not None else None,
+        "member_count": c.observation_count,
+        "first_seen": c.first_seen.isoformat() if c.first_seen else None,
+        "last_seen": last.isoformat() if last else None,
+        "freshness_age_minutes": fresh_min,
+        "summary_reason": c.summary_reason,
+    }
+
+
+@app.get("/campaigns")
+def list_campaigns(
+    target_brand: str = None,
+    min_confidence: float = None,
+    stage: str = None,
+    limit: int = 100,
+):
+    """Ranked campaign queue: brand-attributed clusters above the promotion
+    confidence bar, newest/strongest first. Filters: target_brand, stage,
+    min_confidence."""
+    if not _PRODUCT_DB:
+        return {"available": False, "reason": "product DB not configured", "campaigns": []}
+    try:
+        thr = PROMOTION_MIN_CONFIDENCE if min_confidence is None else min_confidence
+        with SessionLocal() as s:
+            q = select(CampaignCluster).where(CampaignCluster.confidence_score >= thr)
+            if target_brand:
+                q = q.where(CampaignCluster.target_brand == target_brand.lower())
+            if stage:
+                q = q.where(CampaignCluster.stage == stage)
+            q = q.order_by(CampaignCluster.confidence_score.desc()).limit(limit)
+            cards = [_campaign_card(c) for c in s.execute(q).scalars().all()]
+        return {"available": True, "count": len(cards), "campaigns": cards}
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "reason": f"query failed: {e}", "campaigns": []}
+
+
+@app.get("/campaigns/{campaign_id}")
+def get_campaign(campaign_id: int):
+    """Campaign detail: the queue card plus its member domains (the infra in
+    the cluster), ranked by risk."""
+    if not _PRODUCT_DB:
+        raise HTTPException(status_code=503, detail="product DB not configured")
+    try:
+        with SessionLocal() as s:
+            c = s.get(CampaignCluster, campaign_id)
+            if c is None:
+                raise HTTPException(status_code=404, detail="campaign not found")
+            members = s.execute(
+                select(CtObservation)
+                .join(ClusterMember, ClusterMember.observation_id == CtObservation.id)
+                .where(ClusterMember.cluster_id == campaign_id)
+                .order_by(CtObservation.risk_score.desc())
+            ).scalars().all()
+            domains = [
+                {
+                    "raw_host": o.raw_host,
+                    "registered_domain": o.registered_domain,
+                    "risk_score": round(o.risk_score, 4) if o.risk_score is not None else None,
+                    "decision_reason": o.decision_reason,
+                    "enrichment_level": o.enrichment_level,
+                    "registrar": o.registrar,
+                    "sample_country": o.sample_country,
+                    "sample_asn": o.sample_asn,
+                    "event_ts": o.event_ts.isoformat() if o.event_ts else None,
+                }
+                for o in members
+            ]
+            card = _campaign_card(c)
+        card["domains"] = domains
+        return {"available": True, **card}
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"query failed: {e}")
 
 @app.get("/threats/latest")
 def get_latest_threats(limit: int = 50):

@@ -4,7 +4,8 @@ VENV_ACT = . .venv/bin/activate
 # and `make web` would be (incorrectly) considered "up to date" and no-op.
 .PHONY: up down up-all down-all topic-reset produce stream stream-fast \
         stream-fresh stream-ct forward-ct api web check-freshness test \
-        supervise-install supervise-uninstall supervise-status
+        supervise-install supervise-uninstall supervise-status \
+        seed-brands ingest-observations assemble-campaigns
 
 up:
 	docker compose up -d
@@ -27,9 +28,9 @@ down:
 #   - FastAPI backend:     make api
 #   - Next.js frontend:    make web
 up-all:
-	@echo "==> [1/2] root stack: kafka, zookeeper, kafdrop, certstream"
+	@echo "==> [1/2] root stack: kafka, zookeeper, kafdrop, certstream, app-db"
 	docker compose up -d
-	@echo "==> [1/2] done. Kafdrop: http://localhost:9000  CertStream: ws://127.0.0.1:4000"
+	@echo "==> [1/2] done. Kafdrop: http://localhost:9000  CertStream: ws://127.0.0.1:4000  app-db: localhost:5433"
 	@echo "==> [2/2] airflow stack: postgres, webserver, scheduler, triggerer"
 	AIRFLOW_UID=$${AIRFLOW_UID:-$$(id -u)} docker compose -f airflow/docker-compose.airflow.yml up -d
 	@echo "==> [2/2] done. Airflow UI: http://localhost:8080 (default admin/admin, unless changed)"
@@ -83,6 +84,19 @@ web:
 # gold/threat_scores files look byte-identical (scorer re-scoring a stale snapshot).
 check-freshness:
 	$(VENV_ACT) && python scripts/check_ct_freshness.py
+
+# Campaign-radar product jobs (need app-db up: docker compose up -d app-db).
+# seed-brands: load config/watchlist_brands.json into watchlist_brands ("bring
+# your own brand"). ingest-observations: scored parquet -> ct_observations.
+# assemble-campaigns: observations -> campaign clusters.
+seed-brands:
+	$(VENV_ACT) && python -m product.seed_brands
+
+ingest-observations:
+	$(VENV_ACT) && python -m product.ingest_observations
+
+assemble-campaigns:
+	$(VENV_ACT) && python -m product.assemble_campaigns
 
 # Real-time CT lane supervision (macOS launchd). Turns forwarder.py + stream_ct.py
 # from unsupervised foreground processes into self-healing agents (restart on
