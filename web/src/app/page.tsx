@@ -60,6 +60,48 @@ interface Stats {
   detection_source_breakdown?: { reason: string, count: number, pct: number }[];
 }
 
+// Mirrors the GET /campaigns queue-card contract (api/main.py _campaign_card).
+interface Campaign {
+  campaign_id: number;
+  target_brand: string | null;
+  target_workflow: string | null;
+  stage: string;
+  status: string;
+  confidence_score: number | null;
+  member_count: number;
+  first_seen: string | null;
+  last_seen: string | null;
+  freshness_age_minutes: number | null;
+  summary_reason: string | null;
+}
+
+interface CampaignDomain {
+  raw_host: string;
+  registered_domain: string | null;
+  risk_score: number | null;
+  decision_reason: string | null;
+  enrichment_level: string | null;
+  registrar: string | null;
+  sample_country: string | null;
+  sample_asn: string | null;
+  event_ts: string | null;
+}
+
+interface CampaignDetail extends Campaign {
+  domains: CampaignDomain[];
+}
+
+// Mirrors GET /health/pipeline — real freshness/DB/watchdog state, the
+// observability layer over the already-self-healing ingest (ops/launchd).
+interface PipelineHealth {
+  healthy: boolean;
+  app_db: { reachable: boolean };
+  ct_raw: { newest_age_hours: number | null };
+  scoring: { newest_scored_age_hours: number | null };
+  model: { created_utc: string | null; promoted: boolean | null };
+  ingest_watchdog: { stale?: boolean | null; last_checked_utc?: string; note?: string; available?: boolean };
+}
+
 // Mirrors ml/models/registry/ct_risk_meta_latest.json via GET /model/status —
 // real training/promotion metadata, not a marketing claim.
 interface ModelStatus {
@@ -102,6 +144,21 @@ const nameMapping: { [key: string]: string } = {
   "The Netherlands": "Netherlands",
   "Russia": "Russia",
 };
+
+const STAGE_COLORS: Record<string, string> = {
+  new: "text-white/50 bg-white/5",
+  warming: "text-yellow-400 bg-yellow-400/10",
+  active: "text-cyan-400 bg-cyan-400/10",
+  confirmed: "text-tactical-red bg-tactical-red/10",
+  suppressed: "text-white/20 bg-white/5",
+};
+
+function formatFreshness(minutes: number | null): string {
+  if (minutes == null) return "unknown";
+  if (minutes < 60) return `${Math.round(minutes)}m ago`;
+  if (minutes < 1440) return `${(minutes / 60).toFixed(1)}h ago`;
+  return `${(minutes / 1440).toFixed(1)}d ago`;
+}
 
 // --- Specialized Components ---
 
@@ -149,6 +206,14 @@ export default function PhantomEyeAdvancedDashboard() {
   const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
   const [mounted, setMounted] = useState(false);
 
+  // Campaign Queue state — the analyst-grade "bring your own brand" surface.
+  const [campaigns, setCampaigns] = useState<Campaign[] | null>(null);
+  const [pipelineHealth, setPipelineHealth] = useState<PipelineHealth | null>(null);
+  const [brandFilter, setBrandFilter] = useState<string | null>(null);
+  const [expandedCampaignId, setExpandedCampaignId] = useState<number | null>(null);
+  const [campaignDetail, setCampaignDetail] = useState<CampaignDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+
   // Real-time Scanner State
   const [scanTarget, setScanTarget] = useState("");
   const [scanResult, setScanResult] = useState<any>(null);
@@ -163,10 +228,12 @@ export default function PhantomEyeAdvancedDashboard() {
     setMounted(true);
     async function fetchData() {
       try {
-        const [threatRes, statsRes, networkRes] = await Promise.all([
+        const [threatRes, statsRes, networkRes, campaignsRes, healthRes] = await Promise.all([
           fetch(`${API_BASE}/threats/latest?limit=50`),
           fetch(`${API_BASE}/threats/stats`),
-          fetch(`${API_BASE}/threats/network`)
+          fetch(`${API_BASE}/threats/network`),
+          fetch(`${API_BASE}/campaigns?limit=50`),
+          fetch(`${API_BASE}/health/pipeline`),
         ]);
         // Skip this cycle on any bad response — keep last-good data rather than
         // poisoning state with an error body (e.g. {detail:"Not Found"}).
@@ -180,6 +247,18 @@ export default function PhantomEyeAdvancedDashboard() {
         if (Array.isArray(threatData?.data)) setThreats(threatData.data);
         if (statsData && typeof statsData.total_parsed === "number") setStats(statsData);
         if (networkData && Array.isArray(networkData.nodes)) setNetwork(networkData);
+        // Campaign queue + pipeline health are additive surfaces — a bad/absent
+        // response (e.g. product DB not configured) must not block the rest of
+        // the dashboard, so these are checked independently rather than folded
+        // into the guard above.
+        if (campaignsRes.ok) {
+          const campaignsData = await campaignsRes.json();
+          if (Array.isArray(campaignsData?.campaigns)) setCampaigns(campaignsData.campaigns);
+        }
+        if (healthRes.ok) {
+          const healthData = await healthRes.json();
+          if (healthData && typeof healthData.healthy === "boolean") setPipelineHealth(healthData);
+        }
       } catch (err) {
         console.error("Global Sync Error:", err);
       }
@@ -220,6 +299,42 @@ export default function PhantomEyeAdvancedDashboard() {
     }
   };
 
+  // Distinct brands actually present in the queue right now — derived from
+  // live campaign data, not a hardcoded list, so it stays honest as the
+  // watchlist changes (make seed-brands).
+  const availableBrands = useMemo(() => {
+    if (!campaigns) return [];
+    return Array.from(new Set(campaigns.map(c => c.target_brand).filter((b): b is string => !!b))).sort();
+  }, [campaigns]);
+
+  const filteredCampaigns = useMemo(() => {
+    if (!campaigns) return null;
+    const filtered = brandFilter ? campaigns.filter(c => c.target_brand === brandFilter) : campaigns;
+    return [...filtered].sort((a, b) => (b.confidence_score ?? 0) - (a.confidence_score ?? 0));
+  }, [campaigns, brandFilter]);
+
+  const toggleCampaign = async (id: number) => {
+    if (expandedCampaignId === id) {
+      setExpandedCampaignId(null);
+      setCampaignDetail(null);
+      return;
+    }
+    setExpandedCampaignId(id);
+    setCampaignDetail(null);
+    setDetailLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/campaigns/${id}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.available) setCampaignDetail(data);
+      }
+    } catch (err) {
+      console.error("Campaign detail fetch failed:", err);
+    } finally {
+      setDetailLoading(false);
+    }
+  };
+
   if (!mounted) return <div className="bg-[#050505] min-h-screen" />;
 
   return (
@@ -255,6 +370,141 @@ export default function PhantomEyeAdvancedDashboard() {
           <span>UPLINK_STRENGTH: 98.4%</span>
           <span>VERSION: 2.9.1_PRO_ANALYST</span>
         </div>
+      </section>
+
+      {/* --- 0. CAMPAIGN QUEUE (primary analyst workflow) --- */}
+      <section className="max-w-[1600px] mx-auto p-12 mt-20">
+        <SectionHeader
+          title="Campaign Queue"
+          subtitle="Clustered, brand-attributed infrastructure ranked by confidence — not a flat domain list. Add a brand via `make seed-brands` to bring your own coverage."
+          icon={Target}
+        />
+
+        {/* Pipeline health strip — real freshness/DB/watchdog state, not decoration */}
+        <div className="mb-8 flex flex-wrap items-center gap-x-8 gap-y-2 p-4 border border-white/10 bg-white/[0.02] text-[10px] uppercase font-black tracking-widest">
+          <span className={`flex items-center gap-2 ${pipelineHealth ? (pipelineHealth.healthy ? "text-cyan-400" : "text-tactical-red") : "text-white/20"}`}>
+            <span className={`w-1.5 h-1.5 rounded-full ${pipelineHealth ? (pipelineHealth.healthy ? "bg-cyan-400 animate-pulse" : "bg-tactical-red animate-pulse") : "bg-white/20"}`} />
+            {pipelineHealth ? (pipelineHealth.healthy ? "PIPELINE HEALTHY" : "PIPELINE DEGRADED") : "HEALTH_SYNC..."}
+          </span>
+          {pipelineHealth && (
+            <>
+              <span className="text-white/30">CT_RAW: {pipelineHealth.ct_raw.newest_age_hours != null ? `${pipelineHealth.ct_raw.newest_age_hours.toFixed(1)}h old` : "n/a"}</span>
+              <span className="text-white/30">SCORING: {pipelineHealth.scoring.newest_scored_age_hours != null ? `${pipelineHealth.scoring.newest_scored_age_hours.toFixed(1)}h old` : "n/a"}</span>
+              <span className="text-white/30">APP_DB: {pipelineHealth.app_db.reachable ? "REACHABLE" : "UNREACHABLE"}</span>
+              {pipelineHealth.ingest_watchdog?.stale === true && (
+                <span className="text-tactical-red">[warn] INGEST WATCHDOG REPORTS STALE</span>
+              )}
+            </>
+          )}
+        </div>
+
+        {/* Brand filter — derived from campaigns actually in the queue, not hardcoded */}
+        {availableBrands.length > 0 && (
+          <div className="mb-8 flex flex-wrap items-center gap-3">
+            <Filter className="w-4 h-4 text-white/30" />
+            <button
+              onClick={() => setBrandFilter(null)}
+              className={`px-3 py-1.5 text-[10px] uppercase font-black tracking-widest border transition-colors ${brandFilter === null ? "border-tactical-red text-tactical-red bg-tactical-red/10" : "border-white/10 text-white/40 hover:text-white/70"}`}
+            >
+              All ({campaigns?.length ?? 0})
+            </button>
+            {availableBrands.map(brand => (
+              <button
+                key={brand}
+                onClick={() => setBrandFilter(brand)}
+                className={`px-3 py-1.5 text-[10px] uppercase font-black tracking-widest border transition-colors ${brandFilter === brand ? "border-tactical-red text-tactical-red bg-tactical-red/10" : "border-white/10 text-white/40 hover:text-white/70"}`}
+              >
+                {brand} ({campaigns?.filter(c => c.target_brand === brand).length ?? 0})
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* Ranked queue */}
+        {campaigns === null ? (
+          <div className="h-[200px] flex items-center justify-center opacity-20 italic text-[10px] uppercase font-black tracking-widest border border-white/10">
+            SYNCING_CAMPAIGN_QUEUE...
+          </div>
+        ) : filteredCampaigns && filteredCampaigns.length === 0 ? (
+          <div className="h-[200px] flex flex-col items-center justify-center gap-2 opacity-40 italic text-[10px] uppercase font-black tracking-widest border border-white/10">
+            <span>{brandFilter ? `NO CAMPAIGNS FOR ${brandFilter} ABOVE CONFIDENCE THRESHOLD` : "NO CAMPAIGNS ABOVE CONFIDENCE THRESHOLD IN CURRENT BATCH"}</span>
+            <span className="text-white/20 normal-case">candidate observations exist but haven't clustered into a queue-worthy campaign yet</span>
+          </div>
+        ) : (
+          <div className="flex flex-col gap-4">
+            {filteredCampaigns?.map(c => (
+              <div key={c.campaign_id} className="tactical-border bg-[#080808]/50 backdrop-blur-xl">
+                <button
+                  onClick={() => toggleCampaign(c.campaign_id)}
+                  className="w-full flex items-center gap-6 p-5 text-left hover:bg-white/[0.03] transition-colors"
+                >
+                  <div className="flex flex-col items-center justify-center w-20 shrink-0">
+                    <span className="text-2xl font-black text-tactical-red text-glow-red">
+                      {c.confidence_score != null ? `${Math.round(c.confidence_score * 100)}%` : "--"}
+                    </span>
+                    <span className="text-[8px] text-white/20 uppercase font-black tracking-widest">confidence</span>
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-3 mb-1">
+                      <span className="text-lg font-black uppercase tracking-widest italic">{c.target_brand ?? "unattributed"}</span>
+                      <span className={`px-2 py-0.5 text-[9px] uppercase font-black tracking-widest ${STAGE_COLORS[c.stage] ?? "text-white/40 bg-white/5"}`}>{c.stage}</span>
+                    </div>
+                    <p className="text-[11px] text-white/40 font-bold uppercase tracking-wide truncate">{c.summary_reason ?? "no summary available"}</p>
+                  </div>
+                  <div className="flex flex-col items-end gap-1 shrink-0 text-[10px] uppercase font-black tracking-widest text-white/30">
+                    <span>{c.member_count} domain{c.member_count === 1 ? "" : "s"}</span>
+                    <span>{formatFreshness(c.freshness_age_minutes)}</span>
+                  </div>
+                  <ChevronRight className={`w-5 h-5 text-white/20 shrink-0 transition-transform ${expandedCampaignId === c.campaign_id ? "rotate-90" : ""}`} />
+                </button>
+
+                <AnimatePresence>
+                  {expandedCampaignId === c.campaign_id && (
+                    <motion.div
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: "auto", opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }}
+                      className="overflow-hidden border-t border-white/10"
+                    >
+                      <div className="p-5">
+                        {detailLoading ? (
+                          <div className="opacity-20 italic text-[10px] uppercase font-black tracking-widest py-8 text-center">LOADING_EVIDENCE...</div>
+                        ) : campaignDetail && campaignDetail.campaign_id === c.campaign_id ? (
+                          <table className="w-full text-[10px]">
+                            <thead>
+                              <tr className="text-white/20 uppercase font-black tracking-widest border-b border-white/10">
+                                <th className="text-left pb-2 font-black">Domain</th>
+                                <th className="text-left pb-2 font-black">Risk</th>
+                                <th className="text-left pb-2 font-black">Decision</th>
+                                <th className="text-left pb-2 font-black">Enrichment</th>
+                                <th className="text-left pb-2 font-black">Registrar</th>
+                                <th className="text-left pb-2 font-black">Country / ASN</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {campaignDetail.domains.map((d, i) => (
+                                <tr key={i} className="border-b border-white/5 text-white/60">
+                                  <td className="py-2 pr-4 font-bold text-white/80 break-all">{d.raw_host}</td>
+                                  <td className="py-2 pr-4 text-tactical-red font-bold">{d.risk_score != null ? d.risk_score.toFixed(3) : "--"}</td>
+                                  <td className="py-2 pr-4 uppercase">{d.decision_reason ?? "--"}</td>
+                                  <td className="py-2 pr-4 uppercase text-cyan-400">{d.enrichment_level ?? "--"}</td>
+                                  <td className="py-2 pr-4">{d.registrar ?? "--"}</td>
+                                  <td className="py-2 pr-4">{d.sample_country ?? "--"}{d.sample_asn ? ` / ${d.sample_asn}` : ""}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        ) : (
+                          <div className="opacity-20 italic text-[10px] uppercase font-black tracking-widest py-8 text-center">EVIDENCE_UNAVAILABLE</div>
+                        )}
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
+            ))}
+          </div>
+        )}
       </section>
 
       {/* --- 1. GLOBAL SITUATION ROOM --- */}
@@ -532,11 +782,12 @@ export default function PhantomEyeAdvancedDashboard() {
         </div>
       </section>
 
-      {/* --- LIVE NEURAL INTERROGATION --- */}
+      {/* --- SINGLE-DOMAIN DRILLDOWN (secondary tool — the campaign queue above
+           is the primary workflow; this is for ad-hoc lookups outside it) --- */}
       <section ref={scannerRef} className="max-w-[1200px] mx-auto p-12 mt-40">
         <SectionHeader
-          title="Neural Interrogation"
-          subtitle="Input a suspicious domain to trigger a real-time behavioral audit against our latest predictive model weights."
+          title="Single-Domain Drilldown"
+          subtitle="Secondary tool: audit one domain outside the campaign queue. Confidence reflects live enrichment depth, not a promised full profile."
           icon={Crosshair}
         />
 
