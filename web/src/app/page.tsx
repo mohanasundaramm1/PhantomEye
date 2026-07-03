@@ -60,6 +60,22 @@ interface Stats {
   detection_source_breakdown?: { reason: string, count: number, pct: number }[];
 }
 
+// Mirrors ml/models/registry/ct_risk_meta_latest.json via GET /model/status —
+// real training/promotion metadata, not a marketing claim.
+interface ModelStatus {
+  available: boolean;
+  reason?: string;
+  created_utc?: string;
+  n_rows?: number;
+  n_pos?: number;
+  n_neg?: number;
+  promotion_decision?: {
+    promote: boolean;
+    reason: string;
+    checked_utc?: string;
+  };
+}
+
 // --- Configuration ---
 // Backend base URL — override with NEXT_PUBLIC_API_BASE (e.g. for non-localhost
 // or IPv4-only environments); defaults to localhost:8000 for local dev.
@@ -130,6 +146,7 @@ export default function PhantomEyeAdvancedDashboard() {
   const [threats, setThreats] = useState<Threat[]>([]);
   const [stats, setStats] = useState<Stats | null>(null);
   const [network, setNetwork] = useState<any>(null);
+  const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
   const [mounted, setMounted] = useState(false);
 
   // Real-time Scanner State
@@ -169,6 +186,21 @@ export default function PhantomEyeAdvancedDashboard() {
     }
     fetchData();
     const interval = setInterval(fetchData, 10000);
+
+    // Model metadata only changes when the training pipeline re-runs, so it's
+    // fetched once here rather than on the 10s live-threat poll cadence above.
+    async function fetchModelStatus() {
+      try {
+        const res = await fetch(`${API_BASE}/model/status`);
+        if (!res.ok) return;
+        const data = await res.json();
+        setModelStatus(data);
+      } catch (err) {
+        console.error("Model status sync error:", err);
+      }
+    }
+    fetchModelStatus();
+
     return () => clearInterval(interval);
   }, []);
 
@@ -251,9 +283,18 @@ export default function PhantomEyeAdvancedDashboard() {
               <span>STREAM_ID: HV_TRIAGE_B1000</span>
             </div>
 
-            <div className="w-full h-full p-4">
+            <div className="w-full h-full p-4 relative">
               {stats ? (
-                <TacticalGlobe data={stats.map_data} />
+                <>
+                  <TacticalGlobe data={stats.map_data} />
+                  {stats.map_data.length === 0 && (
+                    <div className="absolute inset-0 flex items-center justify-center pointer-events-none px-6">
+                      <span className="text-[10px] tracking-[0.2em] font-black italic opacity-40 bg-black/60 px-4 py-2 border border-white/10 text-center break-words">
+                        NO GEO ENRICHMENT IN CURRENT BATCH
+                      </span>
+                    </div>
+                  )}
+                </>
               ) : (
                 <div className="w-full h-full flex flex-col items-center justify-center gap-4 opacity-20">
                   <Radio className="w-16 h-16 animate-pulse" />
@@ -316,7 +357,11 @@ export default function PhantomEyeAdvancedDashboard() {
           <div className="col-span-4">
             <TacticalCard title="TLD Pollution Index" subTitle="Malicious saturation by suffix" status="ANALYTIC">
               <div className="h-[350px] w-full mt-4">
-                {stats?.tld_analysis ? (
+                {!stats ? (
+                  <div className="h-full flex items-center justify-center opacity-20 italic">SYNC_TLD_VECTOR...</div>
+                ) : stats.tld_analysis.length === 0 ? (
+                  <div className="h-full flex items-center justify-center opacity-30 italic text-center px-6 text-[10px] break-words leading-relaxed">NO TLD DATA IN CURRENT BATCH</div>
+                ) : (
                   <ResponsiveContainer width="100%" height="100%">
                     <ReBarChart data={stats.tld_analysis} layout="vertical">
                       <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" horizontal={false} />
@@ -330,7 +375,7 @@ export default function PhantomEyeAdvancedDashboard() {
                       </Bar>
                     </ReBarChart>
                   </ResponsiveContainer>
-                ) : <div className="h-full flex items-center justify-center opacity-20 italic">SYNC_TLD_VECTOR...</div>}
+                )}
               </div>
             </TacticalCard>
           </div>
@@ -338,7 +383,14 @@ export default function PhantomEyeAdvancedDashboard() {
           <div className="col-span-4">
             <TacticalCard title="Network Origin Reputation" subTitle="High-Correlation mal-hosting" status="SUSPICIOUS">
               <div className="flex flex-col gap-4 mt-4 h-[350px] overflow-y-auto pr-2 scrollbar-custom">
-                {stats?.isp_reputation ? stats.isp_reputation.map((isp, i) => (
+                {!stats ? (
+                  <div className="h-full flex items-center justify-center opacity-20 italic">SYNC_ISP_REPUTATION...</div>
+                ) : stats.isp_reputation.length === 0 ? (
+                  <div className="h-full flex flex-col items-center justify-center gap-2 opacity-30 italic text-center px-4">
+                    <span className="text-[10px] break-words leading-relaxed">INSUFFICIENT ISP DIVERSITY IN CURRENT BATCH</span>
+                    <span className="text-[9px] not-italic tracking-widest opacity-70 break-words leading-relaxed">sample_isp unpopulated for current high-risk set</span>
+                  </div>
+                ) : stats.isp_reputation.map((isp, i) => (
                   <div key={i} className="flex flex-col gap-2 p-3 bg-white/5 border border-white/5 group hover:border-tactical-red transition-all">
                     <div className="flex justify-between items-center">
                       <span className="text-[10px] font-black italic text-white/60 truncate max-w-[200px] uppercase group-hover:text-white transition-colors">
@@ -356,7 +408,7 @@ export default function PhantomEyeAdvancedDashboard() {
                       />
                     </div>
                   </div>
-                )) : <div className="h-full flex items-center justify-center opacity-20 italic">SYNC_ISP_REPUTATION...</div>}
+                ))}
               </div>
             </TacticalCard>
           </div>
@@ -365,7 +417,11 @@ export default function PhantomEyeAdvancedDashboard() {
             <TacticalCard title="Temporal Risk Decay" subTitle="Age-Correlated maliciousness" status="LOGISTIC">
               <div className="h-[200px] w-full mt-4 flex flex-col justify-between">
                 <div className="flex-1">
-                  {stats?.age_impact ? (
+                  {!stats ? (
+                    <div className="h-full flex items-center justify-center opacity-20 italic">SYNC_TEMPORAL_DATA...</div>
+                  ) : stats.age_impact.length === 0 ? (
+                    <div className="h-full flex items-center justify-center opacity-30 italic text-center px-6 text-[10px] break-words leading-relaxed">NO AGE DATA IN CURRENT BATCH</div>
+                  ) : (
                     <ResponsiveContainer width="100%" height="100%">
                       <AreaChart data={stats.age_impact}>
                         <defs>
@@ -381,28 +437,40 @@ export default function PhantomEyeAdvancedDashboard() {
                         <Area type="monotone" dataKey="risk" stroke="#ff0000" fillOpacity={1} fill="url(#colorRisk)" />
                       </AreaChart>
                     </ResponsiveContainer>
-                  ) : <div className="h-full flex items-center justify-center opacity-20 italic">SYNC_TEMPORAL_DATA...</div>}
+                  )}
                 </div>
               </div>
             </TacticalCard>
 
-            <TacticalCard title="Analyst Triage Context" status="STATION_ID">
-              <div className="space-y-4 pt-2">
-                <div className="flex items-center gap-4 p-3 bg-white/5 border border-white/10 italic">
-                  <TrendingUp className="w-5 h-5 text-cyan-400" />
-                  <div>
-                    <p className="text-[10px] font-black text-white/80">PREDICTIVE_DRIFT</p>
-                    <p className="text-[9px] text-white/40 font-bold uppercase tracking-widest">Model updated with 42k new samples</p>
+            <TacticalCard title="Model Training Status" subTitle="Real metadata from latest training run" status="STATION_ID">
+              {modelStatus?.available ? (
+                <div className="space-y-4 pt-2">
+                  <div className="flex items-center gap-4 p-3 bg-white/5 border border-white/10 italic">
+                    <TrendingUp className="w-5 h-5 text-cyan-400" />
+                    <div>
+                      <p className="text-[10px] font-black text-white/80">TRAINING_SET_COMPOSITION</p>
+                      <p className="text-[9px] text-white/40 font-bold uppercase tracking-widest">
+                        {modelStatus.n_rows?.toLocaleString() ?? "--"} rows &middot; {modelStatus.n_pos?.toLocaleString() ?? "--"} positive &middot; {modelStatus.n_neg?.toLocaleString() ?? "--"} negative
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-4 p-3 bg-white/5 border border-white/10 italic">
+                    <Lock className={`w-5 h-5 ${modelStatus.promotion_decision?.promote ? 'text-cyan-400' : 'text-tactical-red'}`} />
+                    <div>
+                      <p className="text-[10px] font-black text-white/80">
+                        {modelStatus.promotion_decision?.promote ? "CHALLENGER_PROMOTED" : "CHALLENGER_REJECTED"}
+                      </p>
+                      <p className="text-[9px] text-white/40 font-bold uppercase tracking-widest">
+                        {modelStatus.created_utc ? `Trained ${new Date(modelStatus.created_utc).toISOString().slice(0, 10)}` : "Promotion outcome from latest eval"}
+                      </p>
+                    </div>
                   </div>
                 </div>
-                <div className="flex items-center gap-4 p-3 bg-white/5 border border-white/10 italic">
-                  <Lock className="w-5 h-5 text-tactical-red" />
-                  <div>
-                    <p className="text-[10px] font-black text-white/80">RECON_MODE: ACTIVE</p>
-                    <p className="text-[9px] text-white/40 font-bold uppercase tracking-widest">Aggressive heuristic filtering active</p>
-                  </div>
+              ) : (
+                <div className="h-full flex items-center justify-center opacity-20 italic min-h-[150px]">
+                  {modelStatus?.reason ?? "SYNC_MODEL_STATUS..."}
                 </div>
-              </div>
+              )}
             </TacticalCard>
           </div>
         </div>
@@ -427,7 +495,7 @@ export default function PhantomEyeAdvancedDashboard() {
           
           <div className="col-span-4 flex flex-col gap-10 h-[700px]">
             <TacticalCard title="Detection Source" subTitle="How high-risk domains were flagged" status="MISP + ML FUSION" className="flex-1">
-              {stats?.detection_source_breakdown ? (
+              {stats?.detection_source_breakdown && stats.detection_source_breakdown.length > 0 ? (
                 <>
                   <div className="w-full h-[200px] mt-2">
                     <ResponsiveContainer width="100%" height="100%">
@@ -567,16 +635,22 @@ export default function PhantomEyeAdvancedDashboard() {
             </div>
           </TacticalCard>
 
-          <TacticalCard title="System Kernel Log" status="STABLE" subTitle="Real-time station status">
+          <TacticalCard title="System Status" status={stats ? "STABLE" : "SYNCING"} subTitle="Live pipeline & model telemetry — no simulated events">
             <div className="space-y-4 pt-4 h-[300px] overflow-hidden flex flex-col justify-end">
               <div className="h-px bg-white/10 w-full mb-4" />
-              <div className="space-y-2 opacity-30 text-[10px] uppercase font-black tracking-widest group-hover:opacity-100 transition-opacity">
-                <p className="text-cyan-400">[info] LINK_SCAN: ACTIVE_OVERWATCH</p>
-                <p>[info] GEOGRAPHY_ENRICHMENT_SYNC: OK</p>
-                <p>[info] RDAP_QUERY_RESOLVED: 142ms</p>
-                <p className="text-tactical-red">[warn] THREAT_DENSITY_SPIKE_DETECTED: GERMANY_REGION</p>
-                <p>[info] ANALYTICS_KERNEL_UPDATE: v2.9.0_STABLE</p>
-                <p>[info] SCAN_UPLINK_ESTABLISHED: MORDOR_01</p>
+              <div className="space-y-2 opacity-70 text-[10px] uppercase font-black tracking-widest transition-opacity">
+                <p className="text-cyan-400">[info] GOLD_LAYER_PARSED_ROWS: {stats?.total_parsed != null ? stats.total_parsed.toLocaleString() : "--"}</p>
+                <p>[info] HIGH_RISK_DOMAINS: {stats?.total_domains != null ? stats.total_domains.toLocaleString() : "--"}</p>
+                <p>[info] NETWORK_GRAPH_NODES: {network?.nodes?.length ?? "--"} / LINKS: {network?.links?.length ?? "--"}</p>
+                {stats && stats.countries === 0 && (
+                  <p className="text-tactical-red">[warn] GEO_ENRICHMENT: 0 COUNTRIES POPULATED IN CURRENT BATCH</p>
+                )}
+                <p>
+                  [info] MODEL_LAST_CHECKED: {modelStatus?.promotion_decision?.checked_utc
+                    ? new Date(modelStatus.promotion_decision.checked_utc).toISOString().replace("T", " ").slice(0, 19) + "Z"
+                    : "unavailable"}
+                </p>
+                <p>[info] HEALTH_ENDPOINT: {stats ? "REACHABLE" : "AWAITING_SYNC"}</p>
               </div>
             </div>
           </TacticalCard>

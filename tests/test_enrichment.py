@@ -196,6 +196,30 @@ def test_queue_metrics_depth_and_lag(tmp_path):
     assert m["enrichment_lag_seconds"] is not None and m["enrichment_lag_seconds"] > 0
 
 
+def test_queue_metrics_survives_concurrent_claim_toctou_race(tmp_path):
+    """Regression test for a real bug found live: multiple DAGs (whois_rdap_ingest,
+    dns_ip_geo_ingest, ct_enrich_and_score_dag) share one queue directory and can
+    drain concurrently. metrics() globs pending/*.jsonl then opens each file in a
+    loop -- if another worker's claim_batch() atomically renames a file into
+    processing/ in the gap between glob() and open(), the open() used to raise
+    FileNotFoundError and crash the CALLING TASK, even though metrics() is purely
+    observational and the claim itself was completely correct. Must skip the
+    raced-away file for this snapshot instead of raising."""
+    q = FileQueue(str(tmp_path / "q"))
+    q.enqueue([{"registered_domain": "a.com", "enqueued_at": "2026-07-01T00:00:00+00:00"}])
+    q.enqueue([{"registered_domain": "b.com", "enqueued_at": "2026-07-01T00:00:00+00:00"}])
+
+    # Simulate another worker's claim_batch() racing in right as metrics() is
+    # about to open one of the two pending files.
+    pending_files = sorted(os.listdir(q.pending_dir))
+    assert len(pending_files) == 2
+    raced_away = os.path.join(q.pending_dir, pending_files[0])
+    os.rename(raced_away, os.path.join(q.processing_dir, pending_files[0]))  # atomic claim
+
+    m = q.metrics()  # must not raise
+    assert m["queue_depth"] == 1  # only the un-raced file counted, not a crash
+
+
 def test_worker_requeues_item_when_fetch_times_out(tmp_path):
     from ct.enrich.enrich_worker import build_queue, run_worker
     cfg = make_cfg(tmp_path)
