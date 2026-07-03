@@ -59,6 +59,52 @@ def test_brand_no_match_benign():
     assert brand_matches("wikipedia.org", CFG) == []
 
 
+# ---------- provider-context suppression (legit-infra false positives) ----------
+
+def test_provider_own_infra_not_brand_matched():
+    # The exact bug: a brand's own infrastructure must not flag as impersonation.
+    assert "amazon" not in brand_matches("s3.amazonaws.com", CFG)
+    assert "amazon" not in brand_matches(
+        "bucket.vpce-029ec9ec13b648d4b-k0um8now-mx-central-1c.s3.mx-central-1.amazonaws.com", CFG)
+    assert "google" not in brand_matches("storage.googleapis.com", CFG)
+    assert "microsoft" not in brand_matches("login.microsoftonline.com", CFG)
+
+def test_generic_words_suppressed_on_legit_infra():
+    # Generic sensitive words are legitimate on a provider's own infra.
+    assert brand_matches("accounts.google.com", CFG) == []       # 'account' + 'google'
+    assert brand_matches("login.microsoftonline.com", CFG) == [] # 'login' + 'microsoft'
+    assert brand_matches("support.apple.com", CFG) == []         # 'support' + 'apple'
+
+def test_impersonation_still_flags_off_provider_infra():
+    # A brand keyword on a domain that is NOT the brand's own infra must still flag.
+    assert "paypal" in brand_matches("secure-paypal.example.com", CFG)
+    assert "paypal" in brand_matches("paypal-secure-login.tk", CFG)
+    assert "apple" in brand_matches("appleid-account-update.xyz", CFG)
+
+def test_phish_hosted_on_legit_cloud_still_flags_other_brand():
+    # A phish for brand X HOSTED on provider Y's infra: X still flags, only Y is
+    # exempt on its own infra. This is why real brands are suppressed only on
+    # their OWN domains, never blanket-suppressed across a whole cloud.
+    hits = brand_matches("paypal-login.s3.amazonaws.com", CFG)
+    assert "paypal" in hits          # the impersonated brand still fires
+    assert "amazon" not in hits      # the hosting provider is exempt on its own infra
+    hits2 = brand_matches("coinbase-verify.web.app", CFG)
+    assert "coinbase" in hits2       # phish on a free provider still flags
+    assert "verify" in hits2         # free providers are NOT allowlisted infra
+
+def test_lookalike_subdomain_trick_not_treated_as_legit():
+    # a.paypal.com.evil.tk is registered under evil.tk, NOT paypal.com -- the
+    # label-boundary anchoring must not treat it as paypal's own infra.
+    assert "paypal" in brand_matches("login.paypal.com.evil.tk", CFG)
+
+def test_provider_infra_drops_below_threshold():
+    # A short legit provider host with no other signals should no longer be a
+    # candidate now that the spurious brand_match is gone.
+    score, reasons = triage_score("s3.amazonaws.com", CFG)
+    assert score < CFG["triage"]["pass_threshold"], (score, reasons)
+    assert not any(r.startswith("brand_match") for r in reasons)
+
+
 # ---------- TLD flagging ----------
 
 def test_suspicious_tld_flagged():
