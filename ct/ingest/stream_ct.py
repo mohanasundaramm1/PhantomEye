@@ -82,9 +82,24 @@ print(f"[stream_ct] CT_MAX_OFFSETS_PER_TRIGGER={MAX_OFFSETS_PER_TRIGGER}")
 print("[stream_ct] ------------------------")
 
 # Optional: reset corrupted checkpoint safely on start
+#
+# The parquet sink's _spark_metadata manifest (under OUT_DIR, e.g.
+# ct/data/raw/_spark_metadata) is a SEPARATE structure from the checkpoint
+# and is never touched by Spark's own checkpoint APIs -- it persists across
+# restarts even when the checkpoint is wiped. Resetting only the checkpoint
+# makes this run's FileStreamSink batch counter restart at 0 while the old
+# manifest already has entries far ahead (e.g. batch 2147 from a prior run).
+# Spark's sink log rejects/ignores batch ids that regress behind what it's
+# already seen, so every "successful", exception-free micro-batch after a
+# reset silently writes zero visible output files. Must reset both together
+# or neither -- never just the checkpoint.
+_raw_sink_metadata_dir = os.path.join(OUT_DIR, "_spark_metadata")
 if RESET_CHK and os.path.exists(CHK_DIR):
     print(f"[stream_ct] RESET CHECKPOINT enabled → removing {CHK_DIR}")
     shutil.rmtree(CHK_DIR, ignore_errors=True)
+    if os.path.exists(_raw_sink_metadata_dir):
+        print(f"[stream_ct] RESET CHECKPOINT enabled → removing {_raw_sink_metadata_dir} (kept in sync with checkpoint reset)")
+        shutil.rmtree(_raw_sink_metadata_dir, ignore_errors=True)
 
 # Ensure checkpoint directory exists after optional reset
 os.makedirs(CHK_DIR, exist_ok=True)

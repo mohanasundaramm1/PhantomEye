@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Supervises ct/ingest/forwarder.py (CertStream websocket -> Kafka topic ct-events).
+
+  Placeholders (__NAME__) are substituted by ops/launchd/install.sh with this
+  machine's real paths at install time, so this template stays portable and
+  machine-agnostic in the repo. Do not hand-edit the rendered copy in
+  ~/Library/LaunchAgents -- re-run `make supervise-install` instead.
+
+  KeepAlive+RunAtLoad = restart on crash AND start on login/boot/wake. This is
+  the fix for the "forwarder died silently and stayed dead" failure mode.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.phantomeye.forwarder</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__VENV_PY__</string>
+    <string>__REPO_ROOT__/ct/ingest/forwarder.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__REPO_ROOT__</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>
+    <key>PYTHONPATH</key>
+    <string>__REPO_ROOT__</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+    <key>KAFKA_BOOTSTRAP_SERVERS</key>
+    <string>localhost:29092</string>
+    <key>KAFKA_TOPIC</key>
+    <string>ct-events</string>
+    <key>CERTSTREAM_WS</key>
+    <string>ws://127.0.0.1:4000</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <!-- Wait at least 10s between respawns so a hard-failing process (e.g. Kafka
+       not up yet) doesn't hot-loop and burn CPU; it will keep retrying. -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>StandardOutPath</key>
+  <string>__REPO_ROOT__/ops/launchd/logs/forwarder.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__REPO_ROOT__/ops/launchd/logs/forwarder.err.log</string>
+</dict>
+</plist>
