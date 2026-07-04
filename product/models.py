@@ -79,8 +79,8 @@ class CtObservation(Base):
     num_countries = Column(Integer)
     num_asns = Column(Integer)
 
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
     __table_args__ = (
         # the upsert conflict target (W4 decision: one row per host+event_ts)
@@ -99,10 +99,10 @@ class WatchlistBrand(Base):
     brand_name = Column(String(128), unique=True, index=True, nullable=False)
     # comma-separated aliases/tokens to also match (e.g. "paypalinc,paypal-support")
     aliases = Column(Text)
-    priority = Column(Integer, default=100)
-    customer_scope = Column(String(64), default="default")
-    active = Column(Boolean, default=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    priority = Column(Integer, default=100, nullable=False)
+    customer_scope = Column(String(64), default="default", nullable=False)
+    active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class CampaignCluster(Base):
@@ -117,22 +117,30 @@ class CampaignCluster(Base):
     id = Column(Integer, primary_key=True)
     cluster_key = Column(String(64), unique=True, index=True, nullable=False)
 
-    status = Column(String(16), default="open")
-    stage = Column(String(16), default="new")  # new/warming/active/confirmed/suppressed
-    confidence_score = Column(Float, default=0.0, index=True)
+    status = Column(String(16), default="open", nullable=False)
+    stage = Column(String(16), default="new", nullable=False)  # new/warming/active/confirmed/suppressed
+    confidence_score = Column(Float, default=0.0, index=True, nullable=False)
 
     target_brand = Column(String(128), index=True)
     target_workflow = Column(String(32))  # filled in Track C
 
     first_seen = Column(DateTime(timezone=True))
     last_seen = Column(DateTime(timezone=True))
-    observation_count = Column(Integer, default=0)
+    observation_count = Column(Integer, default=0, nullable=False)
     summary_reason = Column(Text)
 
-    # NOTE: queue_status/assignee/sla_bucket/promoted_at/last_ranked_at (the
-    # campaign_alerts-folded-in columns, decision #1 in the plan) land in the
-    # Day 8 migration, not here -- keeping this file in sync with exactly what
-    # the applied migrations describe.
+    # Queue/assignment state (decision #1: folded in here rather than a
+    # separate campaign_alerts table -- no benefit to a redundant 1:1 join at
+    # this scale; this table already IS "the queue item" for its cluster).
+    # server_default (not just Python-side default=) so ALTER TABLE ... NOT
+    # NULL can backfill existing rows -- this column is added to a table that
+    # already has data, unlike status/stage which existed since Day 4's
+    # original (empty-table) migration.
+    queue_status = Column(String(16), default="new", server_default="new", nullable=False)  # new/in_review/escalated/closed/suppressed
+    assignee = Column(String(64))
+    sla_bucket = Column(String(16))
+    promoted_at = Column(DateTime(timezone=True))
+    last_ranked_at = Column(DateTime(timezone=True))
 
     # Manual disposition lock (product/stage_engine.py). Not a bool: the UI
     # needs "confirmed by analyst X on <date>", and an audit trail needs to
@@ -143,8 +151,8 @@ class CampaignCluster(Base):
     stage_locked_by = Column(String(64))
     stage_locked_at = Column(DateTime(timezone=True))
 
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
 
 class EvidenceEvent(Base):
@@ -161,7 +169,27 @@ class EvidenceEvent(Base):
     event_type = Column(String(64), index=True, nullable=False)
     observed_at = Column(DateTime(timezone=True), index=True, nullable=False)
     detail = Column(JSONB)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class AnalystDisposition(Base):
+    """An analyst's recorded verdict on a campaign. The MOST RECENT disposition
+    for a cluster is what product/stage_engine.py's apply_stage_transition()
+    treats as authoritative (it also sets stage_locked_by/stage_locked_at on
+    CampaignCluster in the same transaction as this row's insert -- see
+    POST /campaigns/{id}/disposition in api/main.py)."""
+
+    __tablename__ = "analyst_dispositions"
+
+    id = Column(Integer, primary_key=True)
+    cluster_id = Column(Integer, ForeignKey("campaign_clusters.id", ondelete="CASCADE"), index=True, nullable=False)
+    verdict = Column(String(16), nullable=False)  # confirmed/suppressed/benign
+    severity = Column(String(16))
+    notes = Column(Text)
+    actor_guess = Column(String(128))  # analyst's free-text guess at the threat actor, if any
+    action_taken = Column(String(128))
+    analyst = Column(String(64), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class ClusterMember(Base):
@@ -176,7 +204,7 @@ class ClusterMember(Base):
     observation_id = Column(Integer, ForeignKey("ct_observations.id", ondelete="CASCADE"), index=True, nullable=False)
     membership_reason = Column(String(256))
     membership_score = Column(Float)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     __table_args__ = (
         UniqueConstraint("cluster_id", "observation_id", name="uq_member_cluster_obs"),

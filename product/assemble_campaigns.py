@@ -38,6 +38,7 @@ from product.models import (
     CtObservation,
     WatchlistBrand,
 )
+from product.stage_engine import apply_stage_transition
 
 
 def load_brands(session) -> list[tuple[str, list[str], int]]:
@@ -167,7 +168,19 @@ def assemble(min_risk: float = 0.5) -> dict:
                 f"burst on {g['burst_day']} (family {g['family']})"
             )
 
-        s.commit()
+            # Call site 1/4 of the stage engine (product/stage_engine.py):
+            # re-evaluate this cluster's stage now that its membership/aggregates
+            # just changed (a newly-created cluster starts at "new"; a merge
+            # might have just added a member whose enrichment/MISP status
+            # justifies moving forward). Automatic path only -- no disposition,
+            # so this can never touch a stage an analyst has locked, and can
+            # only move forward (new->warming->active) or into a terminal
+            # stage via real evidence (MISP hit), never backward.
+            apply_stage_transition(s, cluster.id)
+
+        s.commit()  # no-op for cluster rows (each already committed via the
+                    # stage-transition call above); harmless / keeps the
+                    # session's own transaction boundary clean either way.
         return {
             "ok": True,
             "candidate_obs": len(observations),
