@@ -216,7 +216,8 @@ def model_status():
 try:
     from sqlalchemy import select
     from product.db import SessionLocal, ping as _app_db_ping
-    from product.models import CampaignCluster, ClusterMember, CtObservation
+    from product.models import AnalystDisposition, CampaignCluster, ClusterMember, CtObservation
+    from product.stage_engine import apply_stage_transition
     _PRODUCT_DB = True
 except Exception:  # noqa: BLE001
     _PRODUCT_DB = False
@@ -305,6 +306,13 @@ def _campaign_card(c) -> dict:
         "last_seen": last.isoformat() if last else None,
         "freshness_age_minutes": fresh_min,
         "summary_reason": c.summary_reason,
+        "queue_status": c.queue_status,
+        "assignee": c.assignee,
+        "sla_bucket": c.sla_bucket,
+        # None when never locked -- an analyst hasn't recorded a disposition yet,
+        # so stage is still fully auto-managed (product/stage_engine.py).
+        "stage_locked_by": c.stage_locked_by,
+        "stage_locked_at": c.stage_locked_at.isoformat() if c.stage_locked_at else None,
     }
 
 
@@ -316,14 +324,21 @@ def list_campaigns(
     limit: int = 100,
 ):
     """Ranked campaign queue: brand-attributed clusters above the promotion
-    confidence bar, newest/strongest first. Filters: target_brand, stage,
-    min_confidence."""
+    confidence bar, newest/strongest first, OR anything an analyst has already
+    recorded a disposition on (stage_locked_by is set) -- an analyst-confirmed
+    campaign must never silently drop out of the queue just because its
+    auto-computed confidence happens to sit below the promotion bar (found
+    live: a confirmed cluster at 0.49 confidence vanished from the default
+    view entirely, meaning the analyst couldn't find their own disposed
+    campaign again). Filters: target_brand, stage, min_confidence."""
     if not _PRODUCT_DB:
         return {"available": False, "reason": "product DB not configured", "campaigns": []}
     try:
         thr = PROMOTION_MIN_CONFIDENCE if min_confidence is None else min_confidence
         with SessionLocal() as s:
-            q = select(CampaignCluster).where(CampaignCluster.confidence_score >= thr)
+            q = select(CampaignCluster).where(
+                (CampaignCluster.confidence_score >= thr) | (CampaignCluster.stage_locked_by.isnot(None))
+            )
             if target_brand:
                 q = q.where(CampaignCluster.target_brand == target_brand.lower())
             if stage:
@@ -373,6 +388,84 @@ def get_campaign(campaign_id: int):
         raise
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"query failed: {e}")
+
+
+class DispositionRequest(BaseModel):
+    verdict: str  # confirmed | suppressed | benign
+    analyst: str  # mandatory, not defaulted -- no auth means this IS the audit trail
+    severity: str | None = None
+    notes: str | None = None
+    actor_guess: str | None = None
+    action_taken: str | None = None
+
+
+class AssignRequest(BaseModel):
+    assignee: str
+
+
+@app.post("/campaigns/{campaign_id}/disposition")
+def create_disposition(campaign_id: int, request: DispositionRequest):
+    """Record an analyst's verdict on a campaign. Authoritative: it locks the
+    cluster's stage (product/stage_engine.py) so automatic re-evaluation from
+    ingest/assemble/the content probe can no longer move it, until a future
+    disposition explicitly changes the verdict again.
+
+    The disposition row and the stage/lock/evidence write happen in ONE
+    transaction (apply_stage_transition's own commit finalizes both) -- never
+    split across round trips, so a crash between them can't leave a
+    disposition on record with no matching stage change, or vice versa."""
+    if not _PRODUCT_DB:
+        raise HTTPException(status_code=503, detail="product DB not configured")
+    if request.verdict not in ("confirmed", "suppressed", "benign"):
+        raise HTTPException(status_code=422, detail="verdict must be confirmed, suppressed, or benign")
+    try:
+        with SessionLocal() as s:
+            if s.get(CampaignCluster, campaign_id) is None:
+                raise HTTPException(status_code=404, detail="campaign not found")
+            s.add(AnalystDisposition(
+                cluster_id=campaign_id,
+                verdict=request.verdict,
+                analyst=request.analyst,
+                severity=request.severity,
+                notes=request.notes,
+                actor_guess=request.actor_guess,
+                action_taken=request.action_taken,
+            ))
+            transition = apply_stage_transition(
+                s, campaign_id,
+                disposition={"verdict": request.verdict},
+                actor=request.analyst,
+            )
+            card = _campaign_card(s.get(CampaignCluster, campaign_id))
+        return {"available": True, "transition": transition, **card}
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"disposition failed: {e}")
+
+
+@app.post("/campaigns/{campaign_id}/assign")
+def assign_campaign(campaign_id: int, request: AssignRequest):
+    """Assign a campaign to an analyst. Pure queue-workflow metadata -- does
+    not touch stage (assignment is not a verdict, so it never goes through
+    the stage engine)."""
+    if not _PRODUCT_DB:
+        raise HTTPException(status_code=503, detail="product DB not configured")
+    try:
+        with SessionLocal() as s:
+            c = s.get(CampaignCluster, campaign_id)
+            if c is None:
+                raise HTTPException(status_code=404, detail="campaign not found")
+            c.assignee = request.assignee
+            if c.queue_status == "new":
+                c.queue_status = "in_review"
+            s.commit()
+            card = _campaign_card(c)
+        return {"available": True, **card}
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"assign failed: {e}")
 
 @app.get("/threats/latest")
 def get_latest_threats(limit: int = 50):
