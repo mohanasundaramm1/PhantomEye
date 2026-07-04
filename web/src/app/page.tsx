@@ -73,6 +73,11 @@ interface Campaign {
   last_seen: string | null;
   freshness_age_minutes: number | null;
   summary_reason: string | null;
+  queue_status: string | null;
+  assignee: string | null;
+  sla_bucket: string | null;
+  stage_locked_by: string | null;
+  stage_locked_at: string | null;
 }
 
 interface CampaignDomain {
@@ -214,6 +219,24 @@ export default function PhantomEyeAdvancedDashboard() {
   const [campaignDetail, setCampaignDetail] = useState<CampaignDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
 
+  // Analyst workflow state: no auth in this system, so the analyst identity
+  // that goes on every disposition/assignment IS the audit trail — persisted
+  // locally so it's not retyped every action, but always explicit (never a
+  // silent server-side default; see api/main.py's DispositionRequest).
+  const [analystName, setAnalystName] = useState("");
+  const [dispositionNotes, setDispositionNotes] = useState("");
+  const [assigneeInput, setAssigneeInput] = useState("");
+  const [actionLoading, setActionLoading] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const saved = window.localStorage.getItem("phantomeye_analyst_name");
+    if (saved) setAnalystName(saved);
+  }, []);
+  useEffect(() => {
+    if (analystName) window.localStorage.setItem("phantomeye_analyst_name", analystName);
+  }, [analystName]);
+
   // Real-time Scanner State
   const [scanTarget, setScanTarget] = useState("");
   const [scanResult, setScanResult] = useState<any>(null);
@@ -321,17 +344,91 @@ export default function PhantomEyeAdvancedDashboard() {
     }
     setExpandedCampaignId(id);
     setCampaignDetail(null);
+    setDispositionNotes("");
+    setAssigneeInput("");
+    setActionError(null);
     setDetailLoading(true);
     try {
       const res = await fetch(`${API_BASE}/campaigns/${id}`);
       if (res.ok) {
         const data = await res.json();
-        if (data?.available) setCampaignDetail(data);
+        if (data?.available) {
+          setCampaignDetail(data);
+          setAssigneeInput(data.assignee ?? "");
+        }
       }
     } catch (err) {
       console.error("Campaign detail fetch failed:", err);
     } finally {
       setDetailLoading(false);
+    }
+  };
+
+  // Shared by disposition/assign: refresh both the open drawer and the
+  // background queue-list row so confidence/stage/queue_status/lock state
+  // stay in sync without waiting for the next 10s poll.
+  const refreshCampaign = async (id: number) => {
+    try {
+      const res = await fetch(`${API_BASE}/campaigns/${id}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      if (!data?.available) return;
+      setCampaignDetail(data);
+      setCampaigns(prev => prev ? prev.map(c => (c.campaign_id === id ? { ...c, ...data } : c)) : prev);
+    } catch (err) {
+      console.error("Campaign refresh failed:", err);
+    }
+  };
+
+  const submitDisposition = async (id: number, verdict: "confirmed" | "suppressed" | "benign") => {
+    if (!analystName.trim()) {
+      setActionError("Enter your analyst name first.");
+      return;
+    }
+    setActionLoading(true);
+    setActionError(null);
+    try {
+      const res = await fetch(`${API_BASE}/campaigns/${id}/disposition`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ verdict, analyst: analystName.trim(), notes: dispositionNotes || undefined }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setActionError(data?.detail ? JSON.stringify(data.detail) : `Request failed (${res.status})`);
+        return;
+      }
+      setDispositionNotes("");
+      await refreshCampaign(id);
+    } catch (err) {
+      setActionError("Disposition request failed — see console.");
+      console.error("Disposition failed:", err);
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const submitAssign = async (id: number) => {
+    if (!assigneeInput.trim()) return;
+    setActionLoading(true);
+    setActionError(null);
+    try {
+      const res = await fetch(`${API_BASE}/campaigns/${id}/assign`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ assignee: assigneeInput.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setActionError(data?.detail ? JSON.stringify(data.detail) : `Request failed (${res.status})`);
+        return;
+      }
+      await refreshCampaign(id);
+    } catch (err) {
+      setActionError("Assign request failed — see console.");
+      console.error("Assign failed:", err);
+    } finally {
+      setActionLoading(false);
     }
   };
 
@@ -396,6 +493,15 @@ export default function PhantomEyeAdvancedDashboard() {
               )}
             </>
           )}
+          <span className="flex items-center gap-2 ml-auto normal-case">
+            <span className="text-white/20">analyst:</span>
+            <input
+              value={analystName}
+              onChange={e => setAnalystName(e.target.value)}
+              placeholder="your name"
+              className="bg-white/5 border border-white/10 px-2 py-1 text-white/70 text-[10px] w-32 focus:outline-none focus:border-tactical-red/50"
+            />
+          </span>
         </div>
 
         {/* Brand filter — derived from campaigns actually in the queue, not hardcoded */}
@@ -448,6 +554,14 @@ export default function PhantomEyeAdvancedDashboard() {
                     <div className="flex items-center gap-3 mb-1">
                       <span className="text-lg font-black uppercase tracking-widest italic">{c.target_brand ?? "unattributed"}</span>
                       <span className={`px-2 py-0.5 text-[9px] uppercase font-black tracking-widest ${STAGE_COLORS[c.stage] ?? "text-white/40 bg-white/5"}`}>{c.stage}</span>
+                      {c.stage_locked_by && (
+                        <span className="flex items-center gap-1 text-[9px] uppercase font-black tracking-widest text-white/30">
+                          <Lock className="w-3 h-3" /> {c.stage_locked_by}
+                        </span>
+                      )}
+                      {c.assignee && (
+                        <span className="text-[9px] uppercase font-black tracking-widest text-cyan-400/70">→ {c.assignee}</span>
+                      )}
                     </div>
                     <p className="text-[11px] text-white/40 font-bold uppercase tracking-wide truncate">{c.summary_reason ?? "no summary available"}</p>
                   </div>
@@ -496,6 +610,76 @@ export default function PhantomEyeAdvancedDashboard() {
                           </table>
                         ) : (
                           <div className="opacity-20 italic text-[10px] uppercase font-black tracking-widest py-8 text-center">EVIDENCE_UNAVAILABLE</div>
+                        )}
+
+                        {/* Analyst actions — disposition + assignment. Disabled
+                            once locked by a disposition until a new verdict is
+                            recorded (product/stage_engine.py never auto-clears
+                            a lock; only a fresh disposition call here can). */}
+                        {campaignDetail && campaignDetail.campaign_id === c.campaign_id && (
+                          <div className="mt-6 pt-5 border-t border-white/10 flex flex-col gap-4">
+                            <div className="flex items-center justify-between">
+                              <span className="text-[9px] uppercase font-black tracking-widest text-white/30">Analyst Actions</span>
+                              {c.stage_locked_by && (
+                                <span className="text-[9px] uppercase font-black tracking-widest text-white/30 flex items-center gap-1">
+                                  <Lock className="w-3 h-3" /> locked by {c.stage_locked_by}
+                                  {c.stage_locked_at ? ` · ${new Date(c.stage_locked_at).toISOString().slice(0, 16).replace("T", " ")}Z` : ""}
+                                </span>
+                              )}
+                            </div>
+
+                            <textarea
+                              value={dispositionNotes}
+                              onChange={e => setDispositionNotes(e.target.value)}
+                              placeholder="notes for this disposition (optional)..."
+                              rows={2}
+                              className="w-full bg-white/5 border border-white/10 px-3 py-2 text-[11px] text-white/70 focus:outline-none focus:border-tactical-red/50 resize-none"
+                            />
+
+                            <div className="flex flex-wrap gap-3">
+                              <button
+                                disabled={actionLoading}
+                                onClick={() => submitDisposition(c.campaign_id, "confirmed")}
+                                className="px-4 py-2 text-[10px] uppercase font-black tracking-widest border border-tactical-red/40 text-tactical-red hover:bg-tactical-red/10 transition-colors disabled:opacity-30"
+                              >
+                                Confirm
+                              </button>
+                              <button
+                                disabled={actionLoading}
+                                onClick={() => submitDisposition(c.campaign_id, "suppressed")}
+                                className="px-4 py-2 text-[10px] uppercase font-black tracking-widest border border-white/10 text-white/50 hover:bg-white/5 transition-colors disabled:opacity-30"
+                              >
+                                Suppress
+                              </button>
+                              <button
+                                disabled={actionLoading}
+                                onClick={() => submitDisposition(c.campaign_id, "benign")}
+                                className="px-4 py-2 text-[10px] uppercase font-black tracking-widest border border-white/10 text-white/50 hover:bg-white/5 transition-colors disabled:opacity-30"
+                              >
+                                Mark Benign
+                              </button>
+
+                              <div className="flex items-center gap-2 ml-auto">
+                                <input
+                                  value={assigneeInput}
+                                  onChange={e => setAssigneeInput(e.target.value)}
+                                  placeholder="assignee"
+                                  className="bg-white/5 border border-white/10 px-2 py-2 text-[10px] text-white/70 w-28 focus:outline-none focus:border-tactical-red/50"
+                                />
+                                <button
+                                  disabled={actionLoading}
+                                  onClick={() => submitAssign(c.campaign_id)}
+                                  className="px-3 py-2 text-[10px] uppercase font-black tracking-widest border border-cyan-400/30 text-cyan-400 hover:bg-cyan-400/10 transition-colors disabled:opacity-30"
+                                >
+                                  Assign
+                                </button>
+                              </div>
+                            </div>
+
+                            {actionError && (
+                              <p className="text-[10px] uppercase font-black tracking-widest text-tactical-red">{actionError}</p>
+                            )}
+                          </div>
                         )}
                       </div>
                     </motion.div>

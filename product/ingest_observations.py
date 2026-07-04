@@ -28,11 +28,12 @@ import math
 import os
 
 import pandas as pd
-from sqlalchemy import func
+from sqlalchemy import func, select, tuple_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from product.db import SessionLocal
-from product.models import CtObservation
+from product.models import ClusterMember, CtObservation
+from product.stage_engine import apply_stage_transition
 
 GOLD_DIR = os.getenv("CT_SCORED_DIR", "gold/threat_scores")
 
@@ -154,6 +155,43 @@ def upsert_observations(session, rows: list[dict], chunk: int = 500) -> int:
     return total
 
 
+def reevaluate_stage_for_enriched_members(session, rows: list[dict]) -> int:
+    """Call site 2/4 of the stage engine (product/stage_engine.py): after an
+    upsert, find clusters whose membership includes any just-ingested
+    observation with enrichment_level in (tier1, tier2), and re-evaluate them.
+
+    Deliberately does NOT try to diff "did enrichment_level change tier for
+    THIS row" against the pre-upsert value -- the bulk INSERT...ON CONFLICT
+    DO UPDATE doesn't cheaply return per-row old values, and
+    apply_stage_transition()'s own idempotency guard already makes an
+    unnecessary re-evaluation call a safe, cheap no-op (proven live: repeated
+    calls against an already-warming cluster write nothing new). Simpler and
+    equally correct to just check the CURRENT stored value, which is exactly
+    what evaluate_stage() reads anyway.
+
+    Returns the number of distinct clusters re-evaluated."""
+    if not rows:
+        return 0
+    keys = [(r["raw_host"], r["event_ts"]) for r in rows if r.get("enrichment_level") in ("tier1", "tier2")]
+    if not keys:
+        return 0
+    # composite (raw_host, event_ts) tuple match -- NOT separate .in_() clauses
+    # on each column, which would cross-match unrelated pairs (e.g. host A's
+    # raw_host with host B's event_ts) since raw_host/event_ts are only
+    # meaningful as a pair (the table's actual unique key).
+    cluster_ids = session.execute(
+        select(ClusterMember.cluster_id.distinct())
+        .join(CtObservation, CtObservation.id == ClusterMember.observation_id)
+        .where(
+            tuple_(CtObservation.raw_host, CtObservation.event_ts).in_(keys),
+            CtObservation.enrichment_level.in_(("tier1", "tier2")),
+        )
+    ).scalars().all()
+    for cid in cluster_ids:
+        apply_stage_transition(session, cid)
+    return len(cluster_ids)
+
+
 def ingest_file(path: str | None = None, min_risk: float = 0.5) -> dict:
     path = path or get_latest_scored_parquet()
     if not path or not os.path.exists(path):
@@ -162,9 +200,11 @@ def ingest_file(path: str | None = None, min_risk: float = 0.5) -> dict:
     rows, skipped = rows_from_df(df, os.path.basename(path), min_risk)
     with SessionLocal() as session:
         upserted = upsert_observations(session, rows)
+        reevaluated = reevaluate_stage_for_enriched_members(session, rows)
     return {
         "ok": True, "file": os.path.basename(path), "scored_rows": len(df),
         "candidates": len(rows), "upserted": upserted, "skipped_no_key": skipped,
+        "clusters_reevaluated": reevaluated,
     }
 
 
