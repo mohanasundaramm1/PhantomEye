@@ -79,6 +79,14 @@ class CtObservation(Base):
     num_countries = Column(Integer)
     num_asns = Column(Integer)
 
+    # Track C prep (content/lifecycle probe, disabled by default -- see
+    # product/content_probe.py): schema landed a day early so Day 10 starts
+    # with the columns ready. All null until the probe runs (and it won't,
+    # until explicitly enabled via config/content_probe.json).
+    http_status = Column(Integer)
+    content_fingerprint = Column(String(64))  # sha256 of title+favicon+keyword hits
+    mx_present = Column(Boolean)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -189,6 +197,26 @@ class AnalystDisposition(Base):
     actor_guess = Column(String(128))  # analyst's free-text guess at the threat actor, if any
     action_taken = Column(String(128))
     analyst = Column(String(64), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class SuppressionRule(Base):
+    """An analyst-authored rule excluding matching observations from campaign
+    assembly. rule_type is one of domain/registrar/asn (matching logic lives
+    in product/suppression.py, reused by assemble_campaigns.py). A rule with
+    expires_at in the past is inert without needing a cleanup job -- the
+    matcher checks both active and expiry at read time."""
+
+    __tablename__ = "suppression_rules"
+
+    id = Column(Integer, primary_key=True)
+    rule_type = Column(String(16), nullable=False, index=True)  # domain | registrar | asn
+    match_value = Column(String(320), nullable=False)
+    scope = Column(String(64), default="default", server_default="default", nullable=False)
+    reason = Column(Text)
+    expires_at = Column(DateTime(timezone=True))
+    created_by = Column(String(64), nullable=False)
+    active = Column(Boolean, default=True, server_default="true", nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
