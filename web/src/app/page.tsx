@@ -123,6 +123,39 @@ interface ModelStatus {
   };
 }
 
+// Mirrors GET /metrics/operations (product/metrics.py) -- real SQL aggregates
+// over the campaign-radar tables, not simulated.
+interface OperationsMetrics {
+  available: boolean;
+  reason?: string;
+  analyst_confirmation?: { rate: number | null; n_dispositions: number; n_confirmed: number };
+  median_time_to_first_review?: { median_hours: number | null; n: number };
+  suppression?: { rate: number | null; n_total: number; n_suppressed: number };
+  campaigns_created?: { per_day: number | null; window_days: number; n_in_window: number };
+  enrichment_completeness?: { rate: number | null; n_total: number; n_tier2: number };
+}
+
+// Mirrors GET /metrics/lead-time (ct/score/measure_lead_time.py) -- exact-
+// hostname vs. apex-only breakdown already computed server-side.
+interface LeadTimeMetrics {
+  available: boolean;
+  reason?: string;
+  n_matched_exact_hostname?: number;
+  n_matched_registered_domain_only?: number;
+  pct_of_matches_ct_was_ahead?: number;
+  median_lead_time_hours_when_ahead?: number | null;
+  confidence_note?: string;
+}
+
+// Mirrors GET /metrics/precision-at-k (ml/core/eval_precision_at_k.py).
+interface PrecisionAtKMetrics {
+  available: boolean;
+  reason?: string;
+  n_misp_hits_total?: number;
+  confidence_note?: string;
+  precision_at_k?: { k: number; precision: number | null; n_evaluated: number; n_hits: number }[];
+}
+
 // --- Configuration ---
 // Backend base URL — override with NEXT_PUBLIC_API_BASE (e.g. for non-localhost
 // or IPv4-only environments); defaults to localhost:8000 for local dev.
@@ -209,6 +242,9 @@ export default function PhantomEyeAdvancedDashboard() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [network, setNetwork] = useState<any>(null);
   const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
+  const [operationsMetrics, setOperationsMetrics] = useState<OperationsMetrics | null>(null);
+  const [leadTimeMetrics, setLeadTimeMetrics] = useState<LeadTimeMetrics | null>(null);
+  const [precisionAtK, setPrecisionAtK] = useState<PrecisionAtKMetrics | null>(null);
   const [mounted, setMounted] = useState(false);
 
   // Campaign Queue state — the analyst-grade "bring your own brand" surface.
@@ -302,6 +338,24 @@ export default function PhantomEyeAdvancedDashboard() {
       }
     }
     fetchModelStatus();
+
+    // Proof/metrics panel data -- same "fetch once, doesn't need the 10s
+    // poll" reasoning as model status above.
+    async function fetchProofMetrics() {
+      try {
+        const [opsRes, leadRes, precRes] = await Promise.all([
+          fetch(`${API_BASE}/metrics/operations`),
+          fetch(`${API_BASE}/metrics/lead-time`),
+          fetch(`${API_BASE}/metrics/precision-at-k`),
+        ]);
+        if (opsRes.ok) setOperationsMetrics(await opsRes.json());
+        if (leadRes.ok) setLeadTimeMetrics(await leadRes.json());
+        if (precRes.ok) setPrecisionAtK(await precRes.json());
+      } catch (err) {
+        console.error("Proof metrics sync error:", err);
+      }
+    }
+    fetchProofMetrics();
 
     return () => clearInterval(interval);
   }, []);
@@ -903,6 +957,118 @@ export default function PhantomEyeAdvancedDashboard() {
               ) : (
                 <div className="h-full flex items-center justify-center opacity-20 italic min-h-[150px]">
                   {modelStatus?.reason ?? "SYNC_MODEL_STATUS..."}
+                </div>
+              )}
+            </TacticalCard>
+          </div>
+        </div>
+      </section>
+
+      {/* --- ANALYST METRICS & PROOF (Track D) --- */}
+      <section className="max-w-[1600px] mx-auto p-12 mt-40 pt-32 border-t border-white/5">
+        <SectionHeader
+          title="Metrics & Proof"
+          subtitle="Real measurements, not marketing claims — precision, lead-time, analyst throughput, and enrichment coverage, each with its own honesty check for small/zero sample sizes."
+          icon={BarChart3}
+        />
+        <div className="grid grid-cols-12 gap-10">
+          <div className="col-span-3">
+            <TacticalCard title="Precision @ K" subTitle="vs. ti_misp_hit (independent ground truth)" status="ML_PROOF">
+              {!precisionAtK ? (
+                <div className="h-[200px] flex items-center justify-center opacity-20 italic text-[10px] uppercase font-black tracking-widest">SYNC_PRECISION...</div>
+              ) : !precisionAtK.available ? (
+                <div className="h-[200px] flex items-center justify-center opacity-30 italic text-center px-4 text-[10px] uppercase font-black tracking-widest break-words">{precisionAtK.reason ?? "NOT YET MEASURED"}</div>
+              ) : (
+                <div className="space-y-3 pt-2">
+                  {precisionAtK.precision_at_k?.map(p => (
+                    <div key={p.k} className="flex items-center justify-between p-2 bg-white/5 border border-white/10">
+                      <span className="text-[10px] uppercase font-black tracking-widest text-white/50">P@{p.k}</span>
+                      <span className="text-sm font-black text-tactical-red">{p.precision != null ? `${(p.precision * 100).toFixed(0)}%` : "--"}</span>
+                    </div>
+                  ))}
+                  {precisionAtK.n_misp_hits_total === 0 && (
+                    <p className="text-[9px] text-white/30 italic leading-relaxed pt-1">{precisionAtK.confidence_note}</p>
+                  )}
+                </div>
+              )}
+            </TacticalCard>
+          </div>
+
+          <div className="col-span-3">
+            <TacticalCard title="Lead-Time Breakdown" subTitle="CT ahead of public blocklists" status="DETECTION">
+              {!leadTimeMetrics ? (
+                <div className="h-[200px] flex items-center justify-center opacity-20 italic text-[10px] uppercase font-black tracking-widest">SYNC_LEAD_TIME...</div>
+              ) : !leadTimeMetrics.available ? (
+                <div className="h-[200px] flex items-center justify-center opacity-30 italic text-center px-4 text-[10px] uppercase font-black tracking-widest break-words">{leadTimeMetrics.reason ?? "NOT YET MEASURED"}</div>
+              ) : (
+                <div className="space-y-3 pt-2 text-[10px]">
+                  <div className="flex justify-between p-2 bg-white/5 border border-white/10">
+                    <span className="uppercase font-black tracking-widest text-white/50">Exact hostname</span>
+                    <span className="font-black text-cyan-400">{leadTimeMetrics.n_matched_exact_hostname ?? 0}</span>
+                  </div>
+                  <div className="flex justify-between p-2 bg-white/5 border border-white/10">
+                    <span className="uppercase font-black tracking-widest text-white/50">Apex-only</span>
+                    <span className="font-black text-white/60">{leadTimeMetrics.n_matched_registered_domain_only ?? 0}</span>
+                  </div>
+                  <div className="flex justify-between p-2 bg-white/5 border border-white/10">
+                    <span className="uppercase font-black tracking-widest text-white/50">Median lead (ahead)</span>
+                    <span className="font-black text-tactical-red">{leadTimeMetrics.median_lead_time_hours_when_ahead != null ? `${leadTimeMetrics.median_lead_time_hours_when_ahead.toFixed(1)}h` : "--"}</span>
+                  </div>
+                  <p className="text-[9px] text-white/30 italic leading-relaxed pt-1">{leadTimeMetrics.confidence_note}</p>
+                </div>
+              )}
+            </TacticalCard>
+          </div>
+
+          <div className="col-span-3">
+            <TacticalCard title="Analyst Throughput" subTitle="Confirmation rate & review speed" status="WORKFLOW">
+              {!operationsMetrics ? (
+                <div className="h-[200px] flex items-center justify-center opacity-20 italic text-[10px] uppercase font-black tracking-widest">SYNC_METRICS...</div>
+              ) : !operationsMetrics.available ? (
+                <div className="h-[200px] flex items-center justify-center opacity-30 italic text-center px-4 text-[10px] uppercase font-black tracking-widest break-words">{operationsMetrics.reason ?? "PRODUCT DB UNAVAILABLE"}</div>
+              ) : (
+                <div className="space-y-3 pt-2 text-[10px]">
+                  <div className="flex justify-between p-2 bg-white/5 border border-white/10">
+                    <span className="uppercase font-black tracking-widest text-white/50">Confirmation rate</span>
+                    <span className="font-black text-cyan-400">
+                      {operationsMetrics.analyst_confirmation?.rate != null ? `${(operationsMetrics.analyst_confirmation.rate * 100).toFixed(0)}%` : "n/a"}
+                      <span className="text-white/30 font-bold"> ({operationsMetrics.analyst_confirmation?.n_dispositions ?? 0})</span>
+                    </span>
+                  </div>
+                  <div className="flex justify-between p-2 bg-white/5 border border-white/10">
+                    <span className="uppercase font-black tracking-widest text-white/50">Median time to review</span>
+                    <span className="font-black text-white/60">{operationsMetrics.median_time_to_first_review?.median_hours != null ? `${operationsMetrics.median_time_to_first_review.median_hours.toFixed(1)}h` : "n/a"}</span>
+                  </div>
+                  <div className="flex justify-between p-2 bg-white/5 border border-white/10">
+                    <span className="uppercase font-black tracking-widest text-white/50">Suppression rate</span>
+                    <span className="font-black text-white/60">{operationsMetrics.suppression?.rate != null ? `${(operationsMetrics.suppression.rate * 100).toFixed(0)}%` : "n/a"}</span>
+                  </div>
+                  <div className="flex justify-between p-2 bg-white/5 border border-white/10">
+                    <span className="uppercase font-black tracking-widest text-white/50">Campaigns/day</span>
+                    <span className="font-black text-white/60">{operationsMetrics.campaigns_created?.per_day ?? "n/a"}</span>
+                  </div>
+                </div>
+              )}
+            </TacticalCard>
+          </div>
+
+          <div className="col-span-3">
+            <TacticalCard title="Enrichment Coverage" subTitle="Pipeline depth, not analyst workflow" status="PIPELINE">
+              {!operationsMetrics ? (
+                <div className="h-[200px] flex items-center justify-center opacity-20 italic text-[10px] uppercase font-black tracking-widest">SYNC_COVERAGE...</div>
+              ) : !operationsMetrics.available ? (
+                <div className="h-[200px] flex items-center justify-center opacity-30 italic text-center px-4 text-[10px] uppercase font-black tracking-widest break-words">{operationsMetrics.reason ?? "PRODUCT DB UNAVAILABLE"}</div>
+              ) : (
+                <div className="pt-4">
+                  <div className="flex flex-col items-center justify-center gap-2 py-6">
+                    <span className="text-4xl font-black text-tactical-red text-glow-red">
+                      {operationsMetrics.enrichment_completeness?.rate != null ? `${(operationsMetrics.enrichment_completeness.rate * 100).toFixed(0)}%` : "--"}
+                    </span>
+                    <span className="text-[9px] uppercase font-black tracking-widest text-white/30">reached full (tier2) enrichment</span>
+                  </div>
+                  <p className="text-[9px] text-white/30 italic text-center leading-relaxed">
+                    {operationsMetrics.enrichment_completeness?.n_tier2 ?? 0} of {operationsMetrics.enrichment_completeness?.n_total ?? 0} observations
+                  </p>
                 </div>
               )}
             </TacticalCard>
