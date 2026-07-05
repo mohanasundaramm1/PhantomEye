@@ -1,0 +1,10 @@
+{
+  "_doc": "Keyword lists for target_workflow intent classification (Track C), same pattern as config/triage.json's brand_keywords. Checked in PRIORITY ORDER (see assemble_campaigns.py's _WORKFLOW_PRIORITY) against cluster member hostnames; first category with any match wins. A cluster matching none of these is 'generic'.",
+  "login": ["login", "signin", "sign-in", "auth", "account", "verify"],
+  "sso": ["sso", "identity", "okta", "adfs", "saml"],
+  "billing": ["billing", "invoice", "payment", "pay", "checkout"],
+  "payroll": ["payroll", "hr-portal", "employee", "salary", "paystub"],
+  "wallet": ["wallet", "crypto", "coin", "exchange", "withdraw"],
+  "support": ["support", "helpdesk", "ticket", "service-desk"],
+  "shipping": ["shipping", "delivery", "tracking", "parcel", "courier"]
+}

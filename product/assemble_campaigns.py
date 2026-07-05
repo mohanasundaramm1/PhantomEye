@@ -28,10 +28,15 @@ is unchanged (still brand|burst_day|lexical_family); this only changes the
 score attached to a member, not which cluster it joins, so the merge-never-
 split guarantee is untouched.
 
+target_workflow intent (Track C): config/workflow_intent.json's keyword lists
+(same pattern as config/triage.json's brand_keywords), checked in a fixed
+priority order against ALL of a cluster's member hostnames (existing +
+this run's additions). First category with any match wins; "generic" if none
+match. Informational/ranking signal, does not affect clustering or stage.
+
 Deferred to later tracks (documented, not silently missing):
     - SAN/nameserver overlap (would need a cert-level identifier the CT
       ingest pipeline doesn't currently capture -- see forwarder.py)
-    - target_workflow intent extraction -> Track C
 
 Run:
     python -m product.assemble_campaigns [--min-risk 0.5]
@@ -40,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 from datetime import timezone
 
@@ -56,6 +62,28 @@ from product.models import (
 )
 from product.stage_engine import apply_stage_transition
 from product.suppression import load_live_rules, matching_rule
+
+WORKFLOW_INTENT_CONFIG = os.getenv("WORKFLOW_INTENT_CONFIG", "config/workflow_intent.json")
+# Checked in this fixed order; the JSON's key order isn't relied on. "generic"
+# (no config entry -- it's the fallback, not a matchable category) is last.
+_WORKFLOW_PRIORITY = ["login", "sso", "billing", "payroll", "wallet", "support", "shipping"]
+
+
+def load_workflow_keywords(path: str = WORKFLOW_INTENT_CONFIG) -> dict:
+    with open(path) as f:
+        data = json.load(f)
+    return {k: v for k, v in data.items() if not k.startswith("_")}
+
+
+def classify_workflow(hosts: list[str], keywords: dict) -> str:
+    """First workflow category (in _WORKFLOW_PRIORITY order) with any keyword
+    match across any of `hosts`; "generic" if none match."""
+    lowered = [(h or "").lower() for h in hosts]
+    for category in _WORKFLOW_PRIORITY:
+        kw_list = keywords.get(category, [])
+        if any(kw in h for h in lowered for kw in kw_list):
+            return category
+    return "generic"
 
 
 def load_brands(session) -> list[tuple[str, list[str], int]]:
@@ -198,6 +226,7 @@ def assemble(min_risk: float = 0.5) -> dict:
         # never attributed as impersonation (see target_brand_for).
         self_domains = load_triage_config().get("brand_self_domains", {})
         suppression_rules = load_live_rules(s)
+        workflow_keywords = load_workflow_keywords()
 
         observations = s.execute(
             select(CtObservation).where(CtObservation.risk_score >= min_risk)
@@ -274,6 +303,8 @@ def assemble(min_risk: float = 0.5) -> dict:
                 f"{count} domain(s) impersonating {g['brand']} in a cert-issuance "
                 f"burst on {g['burst_day']} (family {g['family']})"
             )
+            all_hosts = [m.raw_host for m in existing_members] + [o.raw_host for o in obs_list]
+            cluster.target_workflow = classify_workflow(all_hosts, workflow_keywords)
 
             # Call site 1/4 of the stage engine (product/stage_engine.py):
             # re-evaluate this cluster's stage now that its membership/aggregates
