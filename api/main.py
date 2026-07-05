@@ -191,6 +191,40 @@ def lead_time_metrics():
         return {"available": False, "reason": f"could not read summary: {e}"}
     return {"available": True, **summary}
 
+PRECISION_AT_K_PATH = "ml/models/registry/precision_at_k_latest.json"
+
+@app.get("/metrics/precision-at-k")
+def precision_at_k_metrics():
+    """Surfaces ml/core/eval_precision_at_k.py's output: precision@10/25/50
+    against ti_misp_hit (an INDEPENDENT ground truth, not the model's own
+    fused decision -- see that module's docstring for why that distinction
+    matters). Includes confidence_note verbatim, same rationale as
+    /metrics/lead-time: a batch with 0 MISP hits makes precision trivially 0
+    for every K, which must not be misread as the model failing."""
+    if not os.path.exists(PRECISION_AT_K_PATH):
+        return {"available": False, "reason": "no measurement has been run yet; run ml/core/eval_precision_at_k.py"}
+    try:
+        with open(PRECISION_AT_K_PATH) as f:
+            summary = json.load(f)
+    except Exception as e:
+        return {"available": False, "reason": f"could not read summary: {e}"}
+    return summary
+
+
+@app.get("/metrics/operations")
+def operations_metrics():
+    """Analyst-facing operational metrics (product/metrics.py): confirmation
+    rate, time-to-first-review, suppression rate, campaign creation rate,
+    enrichment completeness -- real SQL aggregates over the campaign-radar
+    tables, not simulated."""
+    if not _PRODUCT_DB:
+        return {"available": False, "reason": "product DB not configured"}
+    try:
+        from product.metrics import operations_summary
+        return {"available": True, **operations_summary()}
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "reason": f"query failed: {e}"}
+
 MODEL_META_PATH = "ml/models/registry/ct_risk_meta_latest.json"
 
 @app.get("/model/status")
