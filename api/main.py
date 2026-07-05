@@ -216,7 +216,13 @@ def model_status():
 try:
     from sqlalchemy import select
     from product.db import SessionLocal, ping as _app_db_ping
-    from product.models import AnalystDisposition, CampaignCluster, ClusterMember, CtObservation
+    from product.models import (
+        AnalystDisposition,
+        CampaignCluster,
+        ClusterMember,
+        CtObservation,
+        SuppressionRule,
+    )
     from product.stage_engine import apply_stage_transition
     _PRODUCT_DB = True
 except Exception:  # noqa: BLE001
@@ -466,6 +472,83 @@ def assign_campaign(campaign_id: int, request: AssignRequest):
         raise
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"assign failed: {e}")
+
+
+class SuppressionRuleRequest(BaseModel):
+    rule_type: str  # domain | registrar | asn
+    match_value: str
+    created_by: str  # mandatory, not defaulted -- same audit-trail rationale as DispositionRequest.analyst
+    scope: str = "default"
+    reason: str | None = None
+    expires_at: str | None = None  # ISO 8601; None = never expires
+
+
+def _suppression_rule_dict(r) -> dict:
+    return {
+        "id": r.id,
+        "rule_type": r.rule_type,
+        "match_value": r.match_value,
+        "scope": r.scope,
+        "reason": r.reason,
+        "expires_at": r.expires_at.isoformat() if r.expires_at else None,
+        "created_by": r.created_by,
+        "active": r.active,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    }
+
+
+@app.get("/suppressions")
+def list_suppressions(active_only: bool = False):
+    """List suppression rules. active_only=true filters to active AND
+    unexpired (product/suppression.py's is_rule_live), matching what
+    assemble_campaigns.py actually applies -- not just the raw `active` flag,
+    since an expired-but-still-flagged-active rule is inert in practice."""
+    if not _PRODUCT_DB:
+        return {"available": False, "reason": "product DB not configured", "rules": []}
+    try:
+        from product.suppression import is_rule_live
+        with SessionLocal() as s:
+            rows = s.execute(select(SuppressionRule).order_by(SuppressionRule.created_at.desc())).scalars().all()
+            if active_only:
+                rows = [r for r in rows if is_rule_live(r)]
+            return {"available": True, "count": len(rows), "rules": [_suppression_rule_dict(r) for r in rows]}
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "reason": f"query failed: {e}", "rules": []}
+
+
+@app.post("/suppressions")
+def create_suppression(request: SuppressionRuleRequest):
+    """Create a suppression rule. Takes effect on the NEXT assemble_campaigns.py
+    run (every ~2h via campaign_radar_dag, or `make assemble-campaigns` for an
+    immediate pass) -- this endpoint only writes the row."""
+    if not _PRODUCT_DB:
+        raise HTTPException(status_code=503, detail="product DB not configured")
+    if request.rule_type not in ("domain", "registrar", "asn"):
+        raise HTTPException(status_code=422, detail="rule_type must be domain, registrar, or asn")
+    expires_at = None
+    if request.expires_at:
+        try:
+            expires_at = datetime.fromisoformat(request.expires_at)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="expires_at must be ISO 8601")
+    try:
+        with SessionLocal() as s:
+            rule = SuppressionRule(
+                rule_type=request.rule_type,
+                match_value=request.match_value,
+                scope=request.scope,
+                reason=request.reason,
+                expires_at=expires_at,
+                created_by=request.created_by,
+                active=True,
+            )
+            s.add(rule)
+            s.commit()
+            return {"available": True, **_suppression_rule_dict(rule)}
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"create suppression failed: {e}")
 
 @app.get("/threats/latest")
 def get_latest_threats(limit: int = 50):
