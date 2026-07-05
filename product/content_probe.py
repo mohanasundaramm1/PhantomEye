@@ -169,7 +169,24 @@ def probe_target(
 
 # ---------------- main run ----------------
 
-def run_probe(cfg: dict | None = None, http_fetch=None, mx_fetch=None) -> dict:
+def run_probe(cfg: dict | None = None, http_fetch=None, mx_fetch=None,
+             cluster_ids: list[int] | None = None) -> dict:
+    """cluster_ids restricts the run to exactly those clusters, ignoring
+    min_confidence entirely -- an explicit ID list is a deliberate override
+    (an operator re-probing specific campaigns, or a test isolating itself
+    from real data). Without it, every cluster above min_confidence is in
+    scope, same as always.
+
+    This parameter exists because of a real incident: a live test called
+    run_probe() with only a confidence filter, which -- with injected FAKE
+    fetchers -- matched real production clusters above that confidence
+    alongside the test's own synthetic one, overwriting 43 real observations'
+    http_status/content_fingerprint/mx_present with fabricated "Fake Login"
+    content and incorrectly advancing 35 real clusters to stage=active on
+    evidence that was never actually fetched. Confidence-based filtering
+    alone can NEVER safely isolate a test from shared production data --
+    only an explicit ID allowlist can. Caught during Day 12 end-to-end
+    verification, repaired via a one-off data-correction pass; see git log."""
     cfg = cfg or load_probe_config()
     if not cfg.get("enabled", False):
         log.info("[content_probe] disabled (config/content_probe.json enabled=false) -- no network calls made")
@@ -177,15 +194,20 @@ def run_probe(cfg: dict | None = None, http_fetch=None, mx_fetch=None) -> dict:
 
     breaker = CircuitBreaker("content_probe", **cfg.get("circuit_breaker", {}))
     limiter = TokenBucket(rate=float(cfg.get("rate_limit_rps", 0.5)))
-    min_confidence = float(cfg.get("min_confidence", 0.5))
     max_per_cluster = int(cfg.get("max_targets_per_cluster", 2))
 
     probed = 0
     active_transitions = 0
     with SessionLocal() as s:
-        clusters = s.execute(
-            select(CampaignCluster).where(CampaignCluster.confidence_score >= min_confidence)
-        ).scalars().all()
+        if cluster_ids is not None:
+            clusters = s.execute(
+                select(CampaignCluster).where(CampaignCluster.id.in_(cluster_ids))
+            ).scalars().all()
+        else:
+            min_confidence = float(cfg.get("min_confidence", 0.5))
+            clusters = s.execute(
+                select(CampaignCluster).where(CampaignCluster.confidence_score >= min_confidence)
+            ).scalars().all()
 
         for cluster in clusters:
             members = s.execute(

@@ -172,8 +172,13 @@ def test_run_probe_enabled_writes_evidence_and_advances_stage():
             cid, oid = cluster.id, obs.id
 
             result = run_probe(
-                cfg={"enabled": True, "min_confidence": 0.5, "max_targets_per_cluster": 2,
+                cfg={"enabled": True, "max_targets_per_cluster": 2,
                      "rate_limit_rps": 100, "timeout_seconds": 8},
+                # cluster_ids scopes this to EXACTLY the synthetic cluster above --
+                # a confidence-only filter here previously matched real production
+                # clusters too and corrupted them with this test's fake fetcher
+                # output (see run_probe()'s docstring for the full incident).
+                cluster_ids=[cid],
                 http_fetch=fake_http, mx_fetch=lambda d: True,
             )
             assert result["enabled"] is True
@@ -198,5 +203,87 @@ def test_run_probe_enabled_writes_evidence_and_advances_stage():
             s.execute(delete(ClusterMember).where(ClusterMember.cluster_id == cid))
             s.execute(delete(CampaignCluster).where(CampaignCluster.id == cid))
             s.execute(delete(CtObservation).where(CtObservation.raw_host == host))
+            s.execute(delete(WatchlistBrand).where(WatchlistBrand.brand_name == BRAND))
+            s.commit()
+
+
+def test_cluster_ids_isolates_run_probe_from_other_high_confidence_clusters():
+    """The exact regression this incident calls for: a DECOY cluster with
+    confidence_score high enough that a naive min_confidence-only filter
+    would have swept it in (simulating a real production cluster sitting
+    alongside a test's synthetic one) must be completely untouched when
+    cluster_ids scopes the run elsewhere -- no probe call, no evidence row,
+    no stage change."""
+    import datetime as dt
+
+    import pytest as _pytest
+    from sqlalchemy import delete, select
+
+    from product.db import SessionLocal, ping
+    if not ping():
+        _pytest.skip("app-db not reachable (docker compose up -d app-db)")
+
+    from product.models import CampaignCluster, ClusterMember, CtObservation, EvidenceEvent, WatchlistBrand
+
+    BRAND = "zzisolationbrand"
+    day = dt.datetime(2026, 7, 5, 9, 0, 0, tzinfo=dt.timezone.utc)
+    target_host = f"{BRAND}-target.tk"
+    decoy_host = f"{BRAND}-decoy.tk"
+
+    calls = []
+
+    def tracking_http(url, timeout, ua):
+        calls.append(url)
+        return {"status_code": 200, "final_url": url, "text": "<title>OK</title>"}
+
+    with SessionLocal() as s:
+        try:
+            s.add(WatchlistBrand(brand_name=BRAND, priority=999, active=True))
+
+            target_obs = CtObservation(raw_host=target_host, registered_domain=target_host,
+                                       event_ts=day, risk_score=0.9)
+            decoy_obs = CtObservation(raw_host=decoy_host, registered_domain=decoy_host,
+                                      event_ts=day, risk_score=0.9)
+            s.add_all([target_obs, decoy_obs])
+            s.flush()
+
+            target_cluster = CampaignCluster(cluster_key=f"{BRAND}-target-key", target_brand=BRAND,
+                                             stage="new", confidence_score=0.9,
+                                             first_seen=day, last_seen=day, observation_count=1)
+            # decoy has HIGHER confidence than target -- if isolation were broken,
+            # it would be the first one swept in by a confidence-only filter
+            decoy_cluster = CampaignCluster(cluster_key=f"{BRAND}-decoy-key", target_brand=BRAND,
+                                            stage="new", confidence_score=0.99,
+                                            first_seen=day, last_seen=day, observation_count=1)
+            s.add_all([target_cluster, decoy_cluster])
+            s.flush()
+            s.add(ClusterMember(cluster_id=target_cluster.id, observation_id=target_obs.id))
+            s.add(ClusterMember(cluster_id=decoy_cluster.id, observation_id=decoy_obs.id))
+            s.commit()
+            target_cid, decoy_cid = target_cluster.id, decoy_cluster.id
+
+            run_probe(
+                cfg={"enabled": True, "max_targets_per_cluster": 2, "rate_limit_rps": 100, "timeout_seconds": 8},
+                cluster_ids=[target_cid],  # decoy deliberately NOT included
+                http_fetch=tracking_http, mx_fetch=lambda d: True,
+            )
+
+            assert calls == [f"https://{target_host}/"]  # decoy never fetched
+
+            s.expire_all()
+            decoy_after = s.get(CampaignCluster, decoy_cid)
+            decoy_obs_after = s.get(CtObservation, decoy_obs.id)
+            assert decoy_after.stage == "new"                      # untouched
+            assert decoy_obs_after.http_status is None              # untouched
+            decoy_evidence = s.execute(
+                select(EvidenceEvent).where(EvidenceEvent.cluster_id == decoy_cid)
+            ).scalars().all()
+            assert decoy_evidence == []                             # no evidence written
+        finally:
+            for cid in (target_cid, decoy_cid):
+                s.execute(delete(EvidenceEvent).where(EvidenceEvent.cluster_id == cid))
+                s.execute(delete(ClusterMember).where(ClusterMember.cluster_id == cid))
+                s.execute(delete(CampaignCluster).where(CampaignCluster.id == cid))
+            s.execute(delete(CtObservation).where(CtObservation.raw_host.in_([target_host, decoy_host])))
             s.execute(delete(WatchlistBrand).where(WatchlistBrand.brand_name == BRAND))
             s.commit()
