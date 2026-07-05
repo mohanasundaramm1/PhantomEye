@@ -10,9 +10,11 @@ from product.assemble_campaigns import (
     _burst_proximity,
     _lexical_similarity,
     _overlap_fraction,
+    classify_workflow,
     cluster_key_for,
     compute_membership_score,
     lexical_family_root,
+    load_workflow_keywords,
     target_brand_for,
 )
 from product.db import ping
@@ -108,6 +110,37 @@ def test_compute_membership_score_strong_overlap_scores_higher_than_none():
     weak = CtObservation(raw_host="zzz-unrelated.xyz", event_ts=ts + dt.timedelta(hours=20),
                          sample_asn="AS999", registrar="GoDaddy")
     assert compute_membership_score(strong, existing) > compute_membership_score(weak, existing)
+
+
+# ---------- target_workflow intent classification (Track C, no DB) ----------
+
+_WF_KEYWORDS = {
+    "login": ["login", "signin"],
+    "billing": ["billing", "invoice"],
+    "wallet": ["wallet", "crypto"],
+}
+
+
+def test_classify_workflow_matches_by_priority_order():
+    # both "login" and "billing" keywords present -- login comes first in
+    # _WORKFLOW_PRIORITY, so it wins regardless of dict iteration order
+    assert classify_workflow(["billing-login-portal.tk"], _WF_KEYWORDS) == "login"
+
+
+def test_classify_workflow_checks_all_hosts_not_just_first():
+    hosts = ["random-noise.tk", "secure-wallet-access.tk"]
+    assert classify_workflow(hosts, _WF_KEYWORDS) == "wallet"
+
+
+def test_classify_workflow_defaults_to_generic():
+    assert classify_workflow(["totally-unrelated-domain.tk"], _WF_KEYWORDS) == "generic"
+    assert classify_workflow([], _WF_KEYWORDS) == "generic"
+
+
+def test_workflow_intent_config_loads_and_strips_doc_key():
+    keywords = load_workflow_keywords()
+    assert "_doc" not in keywords
+    assert "login" in keywords and isinstance(keywords["login"], list)
 
 
 # ---------- live merge-not-split (W3) ----------
