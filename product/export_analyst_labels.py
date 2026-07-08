@@ -1,12 +1,18 @@
 # product/export_analyst_labels.py
 """Export confirmed/suppressed dispositions as labeled training signal.
 
-Scoped as EXPORT ONLY -- this writes a parquet file of analyst-confirmed
-ground truth; it does not wire into ml/core's feature selection or retraining
-pipeline. That integration (deciding how much weight analyst labels should
-carry vs. the existing MISP-fusion labels, whether they need a minimum sample
-size before use, etc.) is a real ML-engineering decision deserving its own
-scoped work, not a side effect of a metrics day.
+DUAL-WRITE. The detailed export (ml/data/analyst_labels/latest.parquet, full
+schema below) was originally scoped as export-only and NOT wired into
+retraining. It now also writes a second, schema-adapted parquet to
+ml/data/feedback/feedback_labels_analyst.parquet -- ml/core/train_model.py's
+existing feedback-ingestion hook (load_all_labels(), lines ~129-137) already
+auto-concatenates ANY parquet matching ml/data/feedback/feedback_labels_*.parquet
+with columns [domain, label, source, ingest_date], so this needed zero changes
+to train_model.py itself, just writing the right file in the right shape.
+This closes the loop the analyst disposition workflow was built toward: when
+an analyst marks a false positive (e.g. a legitimate business wrongly scored
+high-risk) as "suppressed" or "benign", that becomes a real negative training
+example for the next retrain, not just a UI-only annotation.
 
 One row per cluster's MOST RECENT disposition, joined to its member raw_hosts
 (one row per member -- a disposition covers every domain in the campaign).
@@ -17,6 +23,7 @@ verdict column itself preserves for anyone who wants that distinction later).
 
 Run:
     python -m product.export_analyst_labels [--output ml/data/analyst_labels/latest.parquet]
+                                             [--feedback-output ml/data/feedback/feedback_labels_analyst.parquet]
 """
 from __future__ import annotations
 
@@ -31,6 +38,7 @@ from product.db import SessionLocal
 from product.models import AnalystDisposition, CampaignCluster, ClusterMember, CtObservation
 
 OUTPUT_PATH_DEFAULT = "ml/data/analyst_labels/latest.parquet"
+FEEDBACK_OUTPUT_DEFAULT = "ml/data/feedback/feedback_labels_analyst.parquet"
 
 
 def _latest_disposition_ids(session):
@@ -70,15 +78,39 @@ def build_export(session) -> pd.DataFrame:
     return pd.DataFrame.from_records(records)
 
 
-def export(output_path: str = OUTPUT_PATH_DEFAULT) -> dict:
+def to_feedback_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """Adapt the detailed export schema to what train_model.py's feedback
+    loader expects: [domain, label, source, ingest_date]. Falls back to
+    raw_host when registered_domain is missing -- train_model.py's own
+    reg_domain() will re-derive the registered domain from whichever we give
+    it, same as it does for every other label source."""
+    domain = df["registered_domain"].where(df["registered_domain"].notna(), df["raw_host"])
+    return pd.DataFrame({
+        "domain": domain,
+        "label": df["label"],
+        "source": "analyst_disposition",
+        "ingest_date": pd.to_datetime(df["disposed_at"]).dt.strftime("%Y-%m-%d"),
+    })
+
+
+def _atomic_write_parquet(df: pd.DataFrame, path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    df.to_parquet(tmp, index=False)
+    os.replace(tmp, path)
+
+
+def export(output_path: str = OUTPUT_PATH_DEFAULT,
+          feedback_output_path: str = FEEDBACK_OUTPUT_DEFAULT) -> dict:
     with SessionLocal() as s:
         df = build_export(s)
     if len(df) == 0:
-        return {"ok": True, "n_rows": 0, "reason": "no dispositions recorded yet", "output_path": None}
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    tmp = output_path + ".tmp"
-    df.to_parquet(tmp, index=False)
-    os.replace(tmp, output_path)
+        return {"ok": True, "n_rows": 0, "reason": "no dispositions recorded yet",
+                "output_path": None, "feedback_output_path": None}
+
+    _atomic_write_parquet(df, output_path)
+    _atomic_write_parquet(to_feedback_schema(df), feedback_output_path)
+
     return {
         "ok": True,
         "n_rows": len(df),
@@ -86,14 +118,16 @@ def export(output_path: str = OUTPUT_PATH_DEFAULT) -> dict:
         "n_negative": int((df["label"] == 0).sum()),
         "exported_utc": datetime.now(timezone.utc).isoformat(),
         "output_path": output_path,
+        "feedback_output_path": feedback_output_path,
     }
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--output", default=OUTPUT_PATH_DEFAULT)
+    ap.add_argument("--feedback-output", default=FEEDBACK_OUTPUT_DEFAULT)
     args = ap.parse_args(argv)
-    print(export(args.output))
+    print(export(args.output, args.feedback_output))
     return 0
 
 
