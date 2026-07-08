@@ -56,6 +56,33 @@ def test_target_brand_excludes_brands_own_infra():
     assert target_brand_for("login.microsoft.com.evil.tk", brands, self_domains) == "microsoft"
 
 
+def test_target_brand_rejects_coincidental_substrings_found_live():
+    """Regression test for a real incident: raw-substring matching on "apple"
+    clustered a produce association, a Wisconsin VW dealer, and a Costa Rica
+    pineapple company under a fabricated "APPLE" impersonation campaign in the
+    live product. Token-boundary + bounded Levenshtein matching must reject
+    all of these while still catching genuine impersonation patterns."""
+    brands = [("apple", ["apple"], 150)]
+    false_positives = [
+        "nzapplesandpears.com",              # produce industry association
+        "rappleyplumbingandheating.com",     # r + APPLE + y
+        "bergstromvolkswagenappleton.com",   # VW dealer in Appleton, WI
+        "test.pineapplecostarica.com",       # pineapple company
+        "www.applecell.com",                 # concatenated compound, no separator
+        "gs2526888andapple.com",             # digits strip out, tokens glue together
+    ]
+    for host in false_positives:
+        assert target_brand_for(host, brands) is None, f"{host} should NOT match 'apple'"
+
+    genuine_matches = [
+        "secure-apple-id.tk",
+        "appleid-login.com",
+        "www.gravity-apple.com",
+    ]
+    for host in genuine_matches:
+        assert target_brand_for(host, brands) == "apple", f"{host} SHOULD match 'apple'"
+
+
 # ---------- weighted membership scoring (Track B, no DB) ----------
 
 def test_lexical_similarity_no_others_is_zero():

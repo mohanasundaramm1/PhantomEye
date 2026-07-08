@@ -94,7 +94,18 @@ def _domain_under(domain: str, suffixes) -> bool:
 
 
 def brand_matches(domain: str, cfg: dict = None) -> list:
-    """Return brand keywords matched by substring or Levenshtein <= N on tokens.
+    """Return brand keywords matched by exact token or Levenshtein <= N on
+    tokens -- token-BOUNDARY matching, not raw substring containment.
+
+    A prior version matched via `kw in domain` as a fast-path before falling
+    back to tokens, which happily matched "apple" inside "nzapplesandpears.com"
+    (a produce association), "rappleyplumbingandheating.com" (r+APPLE+y), and
+    "bergstromvolkswagenappleton.com" (a VW dealer in Appleton, WI) -- found
+    live in the campaign queue, not a theoretical concern. _tokens() already
+    splits on dots/hyphens/underscores, so exact-token-or-near-token matching
+    correctly rejects all of those (they tokenize to one long unsplit token
+    with a large Levenshtein distance from "apple") while still catching
+    genuine attempts like "secure-apple-id.tk" (tokenizes to "apple" exactly).
 
     Provider-context suppression (the fix for legit-infrastructure false
     positives, e.g. s3.amazonaws.com wrongly scoring brand_match:amazon):
@@ -124,13 +135,14 @@ def brand_matches(domain: str, cfg: dict = None) -> list:
     hits = []
     toks = _tokens(domain)
     for kw in keywords:
-        matched = kw in domain
-        if not matched:
-            for tok in toks:
-                # skip tiny tokens: distance-2 matches on short words are noise
-                if len(tok) >= max(4, len(kw) - max_dist) and levenshtein(tok, kw) <= max_dist:
-                    matched = True
-                    break
+        matched = False
+        for tok in toks:
+            # skip tiny tokens: distance-2 matches on short words are noise.
+            # exact match is distance 0, already covered by this check --
+            # no separate substring fast-path.
+            if len(tok) >= max(4, len(kw) - max_dist) and levenshtein(tok, kw) <= max_dist:
+                matched = True
+                break
         if not matched:
             continue
 

@@ -59,6 +59,18 @@ def test_brand_no_match_benign():
     assert brand_matches("wikipedia.org", CFG) == []
 
 
+def test_brand_rejects_coincidental_substrings_found_live():
+    """Regression test: raw-substring matching (`kw in domain`) on "apple"
+    flagged a produce association, a Wisconsin VW dealer, and a pineapple
+    company as brand_match:apple in the live product -- inflating their
+    triage_score with a fabricated signal. Token-boundary matching must
+    reject these while still catching genuine impersonation."""
+    for host in ["nzapplesandpears.com", "rappleyplumbingandheating.com",
+                 "bergstromvolkswagenappleton.com", "test.pineapplecostarica.com"]:
+        assert "apple" not in brand_matches(host, CFG), f"{host} should NOT brand_match apple"
+    assert "apple" in brand_matches("secure-apple-id.tk", CFG)
+
+
 # ---------- provider-context suppression (legit-infra false positives) ----------
 
 def test_provider_own_infra_not_brand_matched():
