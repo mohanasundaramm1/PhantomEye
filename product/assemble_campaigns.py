@@ -52,7 +52,7 @@ from datetime import timezone
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from ct.ingest.triage import _domain_under, levenshtein, load_config as load_triage_config
+from ct.ingest.triage import _domain_under, _tokens, levenshtein, load_config as load_triage_config
 from product.db import SessionLocal
 from product.models import (
     CampaignCluster,
@@ -75,13 +75,18 @@ def load_workflow_keywords(path: str = WORKFLOW_INTENT_CONFIG) -> dict:
     return {k: v for k, v in data.items() if not k.startswith("_")}
 
 
-def classify_workflow(hosts: list[str], keywords: dict) -> str:
+def classify_workflow(hosts: list[str], keywords: dict, max_dist: int = 2) -> str:
     """First workflow category (in _WORKFLOW_PRIORITY order) with any keyword
-    match across any of `hosts`; "generic" if none match."""
-    lowered = [(h or "").lower() for h in hosts]
+    TOKEN match (exact or bounded Levenshtein, same fix as target_brand_for
+    -- raw substring would match "pay" inside "paypercall.com" or "support"
+    inside "supporthost.net") across any of `hosts`; "generic" if none match."""
+    all_toks = [tok for h in hosts for tok in _tokens((h or "").lower())]
     for category in _WORKFLOW_PRIORITY:
         kw_list = keywords.get(category, [])
-        if any(kw in h for h in lowered for kw in kw_list):
+        if any(
+            tok and kw and len(tok) >= max(4, len(kw) - max_dist) and levenshtein(tok, kw) <= max_dist
+            for kw in kw_list for tok in all_toks
+        ):
             return category
     return "generic"
 
@@ -102,19 +107,35 @@ def load_brands(session) -> list[tuple[str, list[str], int]]:
     return brands
 
 
-def target_brand_for(host: str, brands, self_domains: dict | None = None) -> str | None:
+def target_brand_for(host: str, brands, self_domains: dict | None = None,
+                     max_dist: int = 2) -> str | None:
     """Attribute a host to the highest-priority watchlist brand whose name/alias
-    appears in it, EXCEPT when the host is that brand's own legitimate
-    infrastructure (self_domains, reused from the triage provider-allowlist) --
-    otherwise a brand's own high-scoring infra (e.g. graphql.fabric.microsoft.com)
-    would form a fake "impersonation" campaign, exactly the Day-1 noise leaking
-    back in via attribution. Substring match for the slice; token-boundary
-    matching is a Track B refinement (so e.g. 'pineapple' would still match
-    'apple')."""
+    matches one of its TOKENS (exact or bounded Levenshtein) -- not a raw
+    substring of the whole host, EXCEPT when the host is that brand's own
+    legitimate infrastructure (self_domains, reused from the triage
+    provider-allowlist) -- otherwise a brand's own high-scoring infra (e.g.
+    graphql.fabric.microsoft.com) would form a fake "impersonation" campaign,
+    exactly the Day-1 noise leaking back in via attribution.
+
+    A raw-substring version of this shipped through Day 9 and was caught live
+    in the campaign queue: "apple" as a substring matched
+    nzapplesandpears.com (a produce association), rappleyplumbingandheating.com
+    (r+APPLE+y), and bergstromvolkswagenappleton.com (a VW dealer in Appleton,
+    WI) -- all clustered under "APPLE" as fabricated impersonation campaigns.
+    Token-boundary matching (same fix applied to ct/ingest/triage.py's
+    brand_matches(), mirrored here) rejects all of those, since each
+    tokenizes to one long unsplit token with a large Levenshtein distance
+    from "apple", while still catching genuine attempts like
+    "secure-apple-id.tk" (tokenizes to "apple" exactly)."""
     h = (host or "").lower()
     self_domains = self_domains or {}
+    toks = _tokens(h)
     for name, tokens, _prio in brands:
-        if any(t and t in h for t in tokens):
+        matched = any(
+            tok and t and len(tok) >= max(4, len(t) - max_dist) and levenshtein(tok, t) <= max_dist
+            for t in tokens for tok in toks
+        )
+        if matched:
             own = self_domains.get(name)
             if own and _domain_under(h, own):
                 continue  # the brand's OWN infra, not impersonation -- skip it
