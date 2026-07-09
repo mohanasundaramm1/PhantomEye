@@ -121,8 +121,13 @@ _ENRICH_CACHES = {
 }
 _ENRICH_LIMITERS = {"whois": TokenBucket(_ENRICH_CFG["rate_limits"]["whois_rps"]),
                     "dns": TokenBucket(_ENRICH_CFG["rate_limits"]["dns_rps"])}
+# "whois_other" required alongside "whois" any time enrich_item() may reach
+# tier-2 WHOIS -- see ct.enrich.tiers._tld_bucket()'s docstring.
+_ENRICH_BREAKER_CFG_OTHER = _ENRICH_CFG.get("circuit_breaker_other", _ENRICH_CFG["circuit_breaker"])
 _ENRICH_BREAKERS = {"whois": CircuitBreaker("whois", failure_threshold=_ENRICH_CFG["circuit_breaker"]["failure_threshold"],
                                             cooldown_seconds=_ENRICH_CFG["circuit_breaker"]["cooldown_seconds"]),
+                    "whois_other": CircuitBreaker("whois_other", failure_threshold=_ENRICH_BREAKER_CFG_OTHER["failure_threshold"],
+                                                  cooldown_seconds=_ENRICH_BREAKER_CFG_OTHER["cooldown_seconds"]),
                     "dns": CircuitBreaker("dns", failure_threshold=_ENRICH_CFG["circuit_breaker"]["failure_threshold"],
                                           cooldown_seconds=_ENRICH_CFG["circuit_breaker"]["cooldown_seconds"])}
 
