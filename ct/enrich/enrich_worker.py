@@ -59,6 +59,12 @@ def build_caches(cfg: dict) -> dict:
 
 
 def build_rate_limiters(cfg: dict) -> dict:
+    # whois_rps was 2.0 until a live backfill run showed rdap.org actively
+    # rate-limiting this system with HTTP 429 "Too Many Requests" at that
+    # rate (found live, config/enrichment.json's whois_rps -- see also
+    # ct.enrich.tiers.default_whois_fetch's docstring for the related
+    # timeout-budget incident found in the same investigation). Lowered to
+    # 1.0 to stay under whatever threshold rdap.org enforces.
     rl = cfg["rate_limits"]
     return {"whois": TokenBucket(rl["whois_rps"]), "dns": TokenBucket(rl["dns_rps"])}
 

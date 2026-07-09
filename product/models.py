@@ -110,6 +110,31 @@ class WatchlistBrand(Base):
     priority = Column(Integer, default=100, nullable=False)
     customer_scope = Column(String(64), default="default", nullable=False)
     active = Column(Boolean, default=True, nullable=False)
+    # comma-separated legitimate domains for this brand (e.g. "apple.com,icloud.com").
+    # A convenience mirror, not the source of truth: matching code (ct/ingest/triage.py,
+    # product/assemble_campaigns.py) reads config/triage.json::brand_self_domains
+    # directly. The API write-through keeps the two in sync for brands tracked here;
+    # config/triage.json can still cover brands with no WatchlistBrand row at all.
+    self_domains = Column(Text)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class Analyst(Base):
+    """Minimal analyst directory -- NOT an auth system (no password/session,
+    no login). Exists to populate an assignee dropdown and support a "my
+    queue" filter in the UI. CampaignCluster.assignee and
+    AnalystDisposition.analyst deliberately stay free-text String columns,
+    not a hard FK to this table: those tables already have live data, and a
+    soft directory (used for dropdown population / reporting, not
+    constraint enforcement) avoids a disruptive migration and a hard
+    failure mode if someone assigns to a name not yet listed here."""
+
+    __tablename__ = "analysts"
+
+    id = Column(Integer, primary_key=True)
+    username = Column(String(64), unique=True, index=True, nullable=False)
+    display_name = Column(String(128))
+    active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 

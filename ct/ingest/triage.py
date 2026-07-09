@@ -93,9 +93,29 @@ def _domain_under(domain: str, suffixes) -> bool:
     return False
 
 
+def _brand_match_distance_budget(kw: str) -> int:
+    """Names <=5 chars match by exact token only -- edit distance is too
+    collision-prone at short lengths: "apps", "able", "applied", "wappl",
+    "maple" are all within distance 2 of "apple", and "ample" is distance 1
+    -- found live, a 100%-confidence "apple" campaign whose members were
+    apps.curdil.com, box.wappl.com, applied-pedagogy.com. Names >=6 chars
+    keep a distance-1 budget (with a first-char anchor, see below, to stop
+    that budget drifting onto unrelated words) -- this preserves catching
+    genuine single-character typosquats like "paypal"->"paypai" (i/l swap)
+    or "paypal"->"pypal" (missing letter, the classic homograph-attack
+    shape), which distance<=6-chars-exact-only would otherwise also block
+    despite those having no relationship to the apple/apps-style collision
+    problem. The line sits between "apple" (5, exact-only, since even its
+    own distance-1 neighbor "ample" is unrelated noise) and "paypal" (6,
+    keeps its budget, no observed collision at that distance)."""
+    return 0 if len(kw) <= 5 else 1
+
+
 def brand_matches(domain: str, cfg: dict = None) -> list:
-    """Return brand keywords matched by exact token or Levenshtein <= N on
-    tokens -- token-BOUNDARY matching, not raw substring containment.
+    """Return brand keywords matched by exact token, or by bounded Levenshtein
+    distance on longer tokens -- token-BOUNDARY matching, not raw substring
+    containment. See _brand_match_distance_budget() for why the distance
+    budget depends on keyword length rather than being a single global value.
 
     A prior version matched via `kw in domain` as a fast-path before falling
     back to tokens, which happily matched "apple" inside "nzapplesandpears.com"
@@ -123,7 +143,6 @@ def brand_matches(domain: str, cfg: dict = None) -> list:
       allowlist -- phishing lives there, so generic words must still fire.
     """
     cfg = cfg or load_config()
-    max_dist = cfg["triage"].get("levenshtein_max_distance", 2)
     keywords = cfg.get("brand_keywords", [])
     self_domains = cfg.get("brand_self_domains", {})
     # aggregate allowlist for generic-word suppression: all brands' own infra
@@ -136,11 +155,15 @@ def brand_matches(domain: str, cfg: dict = None) -> list:
     toks = _tokens(domain)
     for kw in keywords:
         matched = False
+        budget = _brand_match_distance_budget(kw)
         for tok in toks:
-            # skip tiny tokens: distance-2 matches on short words are noise.
-            # exact match is distance 0, already covered by this check --
-            # no separate substring fast-path.
-            if len(tok) >= max(4, len(kw) - max_dist) and levenshtein(tok, kw) <= max_dist:
+            if tok == kw:
+                matched = True
+                break
+            # fuzzy branch only for keywords long enough to have a nonzero
+            # budget; first-char anchor stops that budget drifting onto an
+            # unrelated word that merely happens to be close in length.
+            if budget > 0 and len(tok) >= 4 and tok[0] == kw[0] and levenshtein(tok, kw) <= budget:
                 matched = True
                 break
         if not matched:
