@@ -136,6 +136,34 @@ def needs_tier2(item: dict, threshold: float, missing_is_high: bool = True) -> b
         return bool(missing_is_high)
 
 
+def _tld_bucket(domain: str, reliable_tlds) -> str:
+    """"reliable" (Verisign .com/.net, PIR .org by default -- config-driven
+    via reliable_tlds) or "other" (everything else, federated per-TLD to a
+    registry of much more variable RDAP reliability/latency).
+
+    Found live: a single shared WHOIS circuit breaker meant a run of
+    failures on a handful of flaky-registry domains (they cluster together
+    in a batch -- a CT burst tends to share a TLD) tripped the breaker and
+    then blocked WHOIS for every domain, including .com/.net/.org lookups
+    that work fine on their own. Bucketing by TLD reliability gives each
+    group its own breaker (see enrich_worker.py::build_breakers) so a bad
+    "other" streak can never block a "reliable" domain, and its own longer
+    timeout budget (timeouts.whois_seconds_other_tld) so a registry that's
+    merely slower doesn't get miscounted as a failure at all.
+
+    Plain last-dot-segment extraction (not full public-suffix parsing) --
+    consistent with how this codebase already buckets TLDs elsewhere (e.g.
+    config/triage.json's suspicious_tlds), and correct for the purpose here:
+    a domain actually registered under a second-level suffix like .co.uk
+    still gets RDAP-federated via its last segment's registry ("uk"), which
+    is exactly the reliability signal this bucket needs.
+    """
+    if not domain or "." not in domain:
+        return "other"
+    tld = domain.rsplit(".", 1)[-1].lower()
+    return "reliable" if tld in reliable_tlds else "other"
+
+
 # ---------------- per-item enrichment ----------------
 
 def enrich_item(item: dict, *, whois_cache, dns_cache, geo_cache,
@@ -146,6 +174,10 @@ def enrich_item(item: dict, *, whois_cache, dns_cache, geo_cache,
 
     whois_mode:
       "network"    - Tier 2 does a rate-limited RDAP call on cache miss (cold path).
+                     Routed through one of TWO breakers by _tld_bucket() --
+                     breakers["whois"] for reliable_tlds, breakers["whois_other"]
+                     for everything else -- so `breakers` must carry both keys
+                     whenever whois_mode="network" enrichment is possible.
       "cache_only" - Tier 2 uses the WHOIS cache only; on a miss it does NOT make
                      the (slow, rate-limited) network call, leaves WHOIS fields
                      empty, and sets row["whois_backfill_needed"]=True so the hot
@@ -219,12 +251,16 @@ def enrich_item(item: dict, *, whois_cache, dns_cache, geo_cache,
             w = None
             row["whois_backfill_needed"] = True
         else:
-            breaker = breakers["whois"]
+            bucket = _tld_bucket(domain, cfg.get("reliable_tlds", ("com", "net", "org")))
+            breaker_key = "whois" if bucket == "reliable" else "whois_other"
+            breaker = breakers[breaker_key]
             if not breaker.allow():
-                raise CircuitOpen("whois")
+                raise CircuitOpen(breaker_key)
             rate_limiters["whois"].acquire()
             try:
-                whois_budget = cfg["timeouts"]["whois_seconds"]
+                whois_budget = (cfg["timeouts"]["whois_seconds"] if bucket == "reliable"
+                                else cfg["timeouts"].get("whois_seconds_other_tld",
+                                                          cfg["timeouts"]["whois_seconds"]))
                 # Pass the SAME budget to both the outer hard-timeout (below)
                 # and the function's own internal request timeout -- these
                 # used to be two independently-configured numbers (6.0
@@ -236,7 +272,11 @@ def enrich_item(item: dict, *, whois_cache, dns_cache, geo_cache,
                 # `timeout` parameter -- the OUTER budget -- already owns
                 # that name.
                 bound_whois_fetch = functools.partial(whois_fetch, timeout=whois_budget)
-                w = call_with_timeout(bound_whois_fetch, whois_budget, "whois", domain)
+                # service=breaker_key (not a bare "whois") so a genuine
+                # failure's EnrichFailure -- and the failed_ledger.jsonl
+                # entry it becomes -- says which bucket it came from, same
+                # as CircuitOpen(breaker_key) above.
+                w = call_with_timeout(bound_whois_fetch, whois_budget, breaker_key, domain)
             except EnrichFailure:
                 breaker.record_failure()
                 raise
