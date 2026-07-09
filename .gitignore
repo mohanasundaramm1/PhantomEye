@@ -36,3 +36,9 @@ console.log
 # launchd supervisor runtime artifacts (logs + watchdog state). The plist
 # *templates* under ops/launchd/ are tracked; the rendered logs/state are not.
 ops/launchd/logs/
+
+# Runtime audit-trail output from one-off repair/rescore scripts (product/
+# repair_brand_matcher_clusters.py, product/rescore_ct_observations.py) --
+# a local record of what a run did, not source, same category as the
+# runtime logs above.
+product/logs/

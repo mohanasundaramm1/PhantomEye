@@ -52,7 +52,13 @@ from datetime import timezone
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from ct.ingest.triage import _domain_under, _tokens, levenshtein, load_config as load_triage_config
+from ct.ingest.triage import (
+    _brand_match_distance_budget,
+    _domain_under,
+    _tokens,
+    levenshtein,
+    load_config as load_triage_config,
+)
 from product.db import SessionLocal
 from product.models import (
     CampaignCluster,
@@ -75,19 +81,23 @@ def load_workflow_keywords(path: str = WORKFLOW_INTENT_CONFIG) -> dict:
     return {k: v for k, v in data.items() if not k.startswith("_")}
 
 
-def classify_workflow(hosts: list[str], keywords: dict, max_dist: int = 2) -> str:
+def classify_workflow(hosts: list[str], keywords: dict) -> str:
     """First workflow category (in _WORKFLOW_PRIORITY order) with any keyword
-    TOKEN match (exact or bounded Levenshtein, same fix as target_brand_for
-    -- raw substring would match "pay" inside "paypercall.com" or "support"
-    inside "supporthost.net") across any of `hosts`; "generic" if none match."""
+    TOKEN match (exact, or bounded Levenshtein for keywords long enough to
+    have a nonzero budget -- see _brand_match_distance_budget) across any of
+    `hosts`; "generic" if none match. Raw substring would match "pay" inside
+    "paypercall.com" or "support" inside "supporthost.net"."""
     all_toks = [tok for h in hosts for tok in _tokens((h or "").lower())]
     for category in _WORKFLOW_PRIORITY:
-        kw_list = keywords.get(category, [])
-        if any(
-            tok and kw and len(tok) >= max(4, len(kw) - max_dist) and levenshtein(tok, kw) <= max_dist
-            for kw in kw_list for tok in all_toks
-        ):
-            return category
+        for kw in keywords.get(category, []):
+            if not kw:
+                continue
+            budget = _brand_match_distance_budget(kw)
+            for tok in all_toks:
+                if tok == kw:
+                    return category
+                if budget > 0 and len(tok) >= 4 and tok[0] == kw[0] and levenshtein(tok, kw) <= budget:
+                    return category
     return "generic"
 
 
@@ -107,8 +117,7 @@ def load_brands(session) -> list[tuple[str, list[str], int]]:
     return brands
 
 
-def target_brand_for(host: str, brands, self_domains: dict | None = None,
-                     max_dist: int = 2) -> str | None:
+def target_brand_for(host: str, brands, self_domains: dict | None = None) -> str | None:
     """Attribute a host to the highest-priority watchlist brand whose name/alias
     matches one of its TOKENS (exact or bounded Levenshtein) -- not a raw
     substring of the whole host, EXCEPT when the host is that brand's own
@@ -131,10 +140,20 @@ def target_brand_for(host: str, brands, self_domains: dict | None = None,
     self_domains = self_domains or {}
     toks = _tokens(h)
     for name, tokens, _prio in brands:
-        matched = any(
-            tok and t and len(tok) >= max(4, len(t) - max_dist) and levenshtein(tok, t) <= max_dist
-            for t in tokens for tok in toks
-        )
+        matched = False
+        for t in tokens:
+            if not t:
+                continue
+            budget = _brand_match_distance_budget(t)
+            for tok in toks:
+                if tok == t:
+                    matched = True
+                    break
+                if budget > 0 and len(tok) >= 4 and tok[0] == t[0] and levenshtein(tok, t) <= budget:
+                    matched = True
+                    break
+            if matched:
+                break
         if matched:
             own = self_domains.get(name)
             if own and _domain_under(h, own):
