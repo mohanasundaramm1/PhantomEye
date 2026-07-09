@@ -125,15 +125,36 @@ def load_all_labels():
     pattern_main = os.path.join(SILVER_LABELS_DIR, "ingest_date=*/labels_union.parquet")
     print("[info] loading labels from pattern:", pattern_main)
     labels = df_from_parquets([pattern_main])
-    
+
+    if not labels.empty:
+        # Label: benign=0 if source==benign_seed else 1 (same convention as week5)
+        # The label column may exist but contain string values (e.g., "malware_download")
+        # We need to convert to binary: benign=0, phishing/malware=1. This
+        # derivation is only valid for THIS source (silver/labels_union has
+        # exactly two source families: benign_seed and openphish/urlhaus) --
+        # it must run before concatenating with feedback below, not after.
+        labels["label"] = np.where(labels["source"] == "benign_seed", 0, 1)
+
     # 2) Active Learning feedback
     FEEDBACK_DIR = os.path.join(REPO_ROOT, "ml", "data", "feedback")
     pattern_fb = os.path.join(FEEDBACK_DIR, "feedback_labels_*.parquet")
     print("[info] loading feedback from pattern:", pattern_fb)
     fb = df_from_parquets([pattern_fb])
-    
+
     if not fb.empty:
         print(f"[info] found {len(fb)} active learning feedback rows")
+        # Feedback files carry their own trustworthy binary label (0/1) --
+        # e.g. ml/core/seed_benign_feedback.py's benign_tranco (label=0) or
+        # product/export_analyst_labels.py's analyst_disposition (label=0
+        # or 1 per verdict). Found live: applying the source=="benign_seed"
+        # heuristic to the CONCATENATED frame (the previous ordering) forced
+        # every non-benign_seed feedback row to label=1 regardless of its
+        # real label -- silently flipping ~16k confirmed-benign Tranco
+        # domains (and every analyst-suppressed false positive) into
+        # "malicious" training signal, which is what a broken retrain
+        # (ROC-AUC 0.43, benign-holdout FPR 1.0) surfaced. Feedback's label
+        # is trusted as-is; only dtype is normalized here.
+        fb["label"] = fb["label"].astype(int)
         labels = pd.concat([labels, fb], ignore_index=True)
 
     if labels.empty:
@@ -147,18 +168,33 @@ def load_all_labels():
     labels["registered_domain"] = labels["domain"].map(reg_domain)
     labels = labels[labels["registered_domain"].astype(bool)].copy()
 
-    # Label: benign=0 if source==benign_seed else 1 (same convention as week5)
-    # The label column may exist but contain string values (e.g., "malware_download")
-    # We need to convert to binary: benign=0, phishing/malware=1
-    labels["label"] = np.where(labels["source"] == "benign_seed", 0, 1)
-
     # only benign + phishing
     labels = labels[labels["label"].isin([0, 1])].copy()
     labels["label"] = labels["label"].astype(int)
 
-    # ensure ingest_date is string for grouping / temporal split
+    # ensure ingest_date is string for grouping / temporal split.
+    #
+    # silver/labels_union's own parquet files carry NO ingest_date column at
+    # all (it only lives in the Hive-style partition folder name, which
+    # df_from_parquets doesn't parse out) -- so before any feedback existed,
+    # "ingest_date" not in labels.columns was always True and this uniformly
+    # backfilled every row to NOW_UTC. Once ml/data/feedback/*.parquet files
+    # exist (they DO carry a real ingest_date), pd.concat gives the merged
+    # frame an ingest_date column sourced from feedback rows only -- the
+    # column now "exists" so the branch below is skipped, and the base
+    # labels' real gaps become NaN, then get stringified to the literal text
+    # "nan" by .astype(str). "nan" sorts lexicographically AFTER every real
+    # "YYYY-MM-DD" string, so the temporal-split cutoff (sorted(...)[-1])
+    # locks onto exactly the base-vs-feedback boundary instead of a genuine
+    # recent-vs-old date boundary -- silently splitting almost the entire
+    # base label set into "test" and almost only feedback rows into "train"
+    # (found live: train ended up with 1 positive example total). Filling
+    # missing values (whether or not the column pre-existed) restores the
+    # original, intended fallback for every row that lacks a real date.
     if "ingest_date" not in labels.columns:
-         labels["ingest_date"] = NOW_UTC.strftime("%Y-%m-%d")
+        labels["ingest_date"] = NOW_UTC.strftime("%Y-%m-%d")
+    else:
+        labels["ingest_date"] = labels["ingest_date"].fillna(NOW_UTC.strftime("%Y-%m-%d"))
     labels["ingest_date"] = labels["ingest_date"].astype(str)
 
     print(
@@ -407,8 +443,17 @@ print(
 
 # ---------------- temporal / random split ----------------
 
-def has_two_classes(arr):
-    return len(np.unique(arr)) >= 2
+def has_two_classes(arr, min_count: int = 30):
+    """Not just "both labels present" -- both labels must appear at least
+    min_count times. A bare >=2-unique-values check still passes on a
+    1-example minority class, which is statistically meaningless and, found
+    live, let a temporal cutoff that landed on a data-source boundary
+    (nearly all undated openphish/urlhaus rows default-filled to "today",
+    coinciding with a same-day feedback batch) silently produce a "valid"
+    split with exactly 1 positive in the entire training set. min_count=30
+    is a rough floor for "enough to say anything," not a tuned threshold."""
+    vals, counts = np.unique(arr, return_counts=True)
+    return len(vals) >= 2 and counts.min() >= min_count
 
 Xtr_lex = Xte_lex = Xtr_full = Xte_full = None
 y_train = y_test = None
@@ -569,6 +614,39 @@ if lgb is not None:
 else:
     print("[info] LightGBM not installed; skipping")
 
+# ---------------- benign false-positive rate (held-out, never trained on) ----------------
+#
+# ROC-AUC/PR-AUC above are computed on the same kind of distribution as
+# training (openphish/urlhaus positives vs whatever negatives got sampled
+# into this run) -- they don't answer "how often does this model cry wolf
+# on a domain we KNOW is legitimate". ml/data/eval/benign_holdout.parquet
+# (see ml/core/seed_benign_feedback.py) is deliberately held OUT of
+# training and skewed toward the long/complex domains that were the actual
+# false-positive failure mode found live (nzapplesandpears.com,
+# bergstromvolkswagenappleton.com, ... scoring 0.94-0.99+).
+#
+# Uses the fitted LGBMClassifier's .booster_, not the sklearn wrapper
+# itself -- wrapper.predict(X) returns class labels, not probabilities;
+# api/main.py's production scoring path loads a raw lgb.Booster from disk,
+# so eval_benign_fpr.py's "lgbm_full" branch expects that same interface.
+from ml.core.eval_benign_fpr import compute_benign_fpr, HOLDOUT_PATH_DEFAULT
+
+benign_holdout_fpr = None
+if os.path.exists(HOLDOUT_PATH_DEFAULT):
+    try:
+        holdout_df = pd.read_parquet(HOLDOUT_PATH_DEFAULT)
+        if lgb is not None and "lgbm_full" in locals() and lgbm_full is not None:
+            benign_holdout_fpr = compute_benign_fpr(lgbm_full.booster_, "lgbm_full", holdout_df)
+        else:
+            benign_holdout_fpr = compute_benign_fpr(logreg_full, "logreg_full", holdout_df)
+        print(f"[info] benign holdout FPR ({benign_holdout_fpr['n_holdout']} domains): "
+              f"{benign_holdout_fpr['fpr']}")
+    except Exception as e:
+        print("[warn] benign FPR evaluation failed:", e)
+else:
+    print(f"[info] no benign holdout file at {HOLDOUT_PATH_DEFAULT}; skipping FPR eval "
+          f"(run `python -m ml.core.seed_benign_feedback` to generate one)")
+
 # ---------------- save models + metadata ----------------
 
 ts_stamp = NOW_UTC.strftime("%Y%m%dT%H%M%SZ")
@@ -597,6 +675,7 @@ meta = {
         "X_lex":  X_lex.shape,
         "X_full": X_full.shape,
     },
+    "benign_holdout_fpr": benign_holdout_fpr,
 }
 
 meta_path = os.path.join(MODEL_DIR, f"ct_risk_meta_{ts_stamp}.json")

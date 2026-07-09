@@ -1,0 +1,13 @@
+{
+  "_doc": "Content/lifecycle probe for top-ranked campaigns (Track C). DISABLED BY DEFAULT ON PURPOSE: this fetches suspected-malicious infrastructure directly from this machine, which reveals reconnaissance activity to attackers and risks hitting actively hostile content. Set enabled=true only with informed opt-in (see product/content_probe.py's module docstring).",
+  "enabled": false,
+  "max_targets_per_cluster": 2,
+  "min_confidence": 0.5,
+  "rate_limit_rps": 0.5,
+  "timeout_seconds": 8,
+  "user_agent": "threat-intel-lab/content-probe/0.1",
+  "circuit_breaker": {
+    "failure_threshold": 5,
+    "cooldown_seconds": 300
+  }
+}

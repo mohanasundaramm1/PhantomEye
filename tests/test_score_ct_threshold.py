@@ -1,6 +1,6 @@
 import json
 
-from ct.score.score_ct_with_latest import choose_threshold
+from ct.score.score_ct_with_latest import choose_threshold, model_version_tag
 
 
 # ---------- new-format lookup: metrics[<primary_name>].threshold_at_1pct_fpr ----------
@@ -167,3 +167,34 @@ def test_legacy_top_level_key_still_honoured_for_forward_compat():
 
     meta2 = {"fpr_1pct_threshold": 0.66}
     assert choose_threshold(meta2, primary_name="lgbm_full") == 0.66
+
+
+# ---------- model_version_tag: distinguishing scores by which training run made them ----------
+
+def test_model_version_tag_combines_name_and_created_utc():
+    meta = {"created_utc": "2026-07-08T03:50:42.434713+00:00"}
+    assert model_version_tag("lgbm_full", meta) == "lgbm_full@20260708T035042Z"
+
+
+def test_model_version_tag_handles_z_suffix_iso_format():
+    meta = {"created_utc": "2026-07-08T03:50:42Z"}
+    assert model_version_tag("lgbm_full", meta) == "lgbm_full@20260708T035042Z"
+
+
+def test_model_version_tag_fits_ctobservation_model_used_column():
+    # CtObservation.model_used is String(32); the longest primary_name
+    # ("logreg_full", 11 chars) + "@" + 16-char timestamp = 28 chars, must
+    # never exceed 32 regardless of which model produced it.
+    meta = {"created_utc": "2026-07-08T03:50:42.434713+00:00"}
+    tag = model_version_tag("logreg_full", meta)
+    assert len(tag) <= 32
+
+
+def test_model_version_tag_falls_back_to_bare_name_when_meta_missing():
+    assert model_version_tag("lgbm_full", None) == "lgbm_full"
+    assert model_version_tag("lgbm_full", {}) == "lgbm_full"
+
+
+def test_model_version_tag_falls_back_to_bare_name_when_created_utc_malformed():
+    meta = {"created_utc": "not-a-real-timestamp"}
+    assert model_version_tag("lgbm_full", meta) == "lgbm_full"

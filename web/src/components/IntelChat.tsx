@@ -14,7 +14,7 @@ export default function IntelChat() {
   const [isOpen, setIsOpen] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
   const [messages, setMessages] = useState<Message[]>([
-    { role: 'assistant', content: "SYSTEM ONLINE. I am the PHANTOM_EYE Neural Agent. How can I assist with your threat hunting today?" }
+    { role: 'assistant', content: "SYSTEM ONLINE. I can answer a fixed set of queries against the live database: \"show campaigns for `<brand>`\", \"status of `<domain>`\", or \"top risk domains\"." }
   ]);
   const [input, setInput] = useState('');
   const [isTyping, setIsTyping] = useState(false);
@@ -51,7 +51,7 @@ export default function IntelChat() {
       
       setMessages(prev => [...prev, { role: 'assistant', content: data.answer || "No response received." }]);
     } catch (error) {
-      setMessages(prev => [...prev, { role: 'assistant', content: "UPLINK ERROR: Failed to reach Sonar Agent API." }]);
+      setMessages(prev => [...prev, { role: 'assistant', content: "UPLINK ERROR: Failed to reach the query agent." }]);
     } finally {
       setIsTyping(false);
     }
@@ -82,7 +82,7 @@ export default function IntelChat() {
           </div>
           <div>
             <h3 className="text-[12px] font-black italic tracking-widest uppercase text-white">Neural Intel Agent</h3>
-            <p className="text-[9px] font-bold text-cyan-400 tracking-[0.2em] uppercase">Powered by Perplexity Sonar</p>
+            <p className="text-[9px] font-bold text-cyan-400 tracking-[0.2em] uppercase">Live query agent — campaigns, domains, risk</p>
           </div>
         </div>
         <div className="flex items-center gap-2">
@@ -144,7 +144,7 @@ export default function IntelChat() {
             type="text"
             value={input}
             onChange={e => setInput(e.target.value)}
-            placeholder="Query Live OSINT or Ask for Mitigation Context..."
+            placeholder="e.g. status of example.com, top risk domains..."
             className="flex-1 bg-white/5 border border-white/10 px-4 py-3 text-[12px] font-bold text-white placeholder:text-white/20 focus:outline-none focus:border-cyan-400 transition-colors"
           />
           <button 
