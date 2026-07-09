@@ -58,6 +58,12 @@ services:
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__DEFAULT_TIMEZONE: "UTC"
       AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+      # campaign_radar_dag's tasks import product.* -- this is a SEPARATE
+      # docker-compose project from app-db (root docker-compose.yml), so
+      # "localhost" inside this container is not app-db's container; Docker
+      # Desktop's host.docker.internal reaches the same host-published port
+      # (5433) the venv on the Mac itself uses.
+      APP_DATABASE_URL: "postgresql+psycopg2://app:app@host.docker.internal:5433/campaigns"
     volumes:
       - ./dags:/opt/airflow/dags
       - ./logs:/opt/airflow/logs
@@ -70,6 +76,7 @@ services:
       - ../gold:/opt/airflow/gold
       - ../config:/opt/airflow/config
       - ../scripts:/opt/airflow/scripts
+      - ../product:/opt/airflow/product
     ports:
       - "8080:8080"
     command: webserver
@@ -93,6 +100,9 @@ services:
       # Airflow and was silently ignored, the same trap as the zombie-threshold
       # var name above. The real knob, job_heartbeat_sec, defaults to 5s which
       # is already what we want.)
+      # See the webserver block above for why this points at host.docker.internal
+      # rather than localhost: app-db lives in a different compose project.
+      APP_DATABASE_URL: "postgresql+psycopg2://app:app@host.docker.internal:5433/campaigns"
     volumes:
       - ./dags:/opt/airflow/dags
       - ./logs:/opt/airflow/logs
@@ -105,6 +115,7 @@ services:
       - ../gold:/opt/airflow/gold
       - ../config:/opt/airflow/config
       - ../scripts:/opt/airflow/scripts
+      - ../product:/opt/airflow/product
     command: scheduler
 
   airflow-triggerer:
@@ -121,6 +132,7 @@ services:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
       AIRFLOW__CORE__DEFAULT_TIMEZONE: "UTC"
+      APP_DATABASE_URL: "postgresql+psycopg2://app:app@host.docker.internal:5433/campaigns"
     volumes:
       - ./dags:/opt/airflow/dags
       - ./logs:/opt/airflow/logs
@@ -130,6 +142,7 @@ services:
       - ../gold:/opt/airflow/gold
       - ../config:/opt/airflow/config
       - ../scripts:/opt/airflow/scripts
+      - ../product:/opt/airflow/product
     command: triggerer
 
 volumes:

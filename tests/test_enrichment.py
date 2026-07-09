@@ -16,8 +16,8 @@ from ct.enrich.circuit import CLOSED, OPEN, CircuitBreaker
 from ct.enrich.config import load_config
 from ct.enrich.queue import FileQueue
 from ct.enrich.ratelimit import TokenBucket
-from ct.enrich.tiers import EnrichFailure, enrich_item, needs_tier2
-from ct.enrich.enrich_worker import _write_enriched_output, run_worker
+from ct.enrich.tiers import EnrichFailure, default_whois_fetch, enrich_item, needs_tier2, _tld_bucket
+from ct.enrich.enrich_worker import _write_enriched_output, build_breakers, run_worker
 
 
 # ---------------- helpers ----------------
@@ -58,7 +58,8 @@ def fast_limiters():
 
 
 def breakers():
-    return {"whois": CircuitBreaker("whois"), "dns": CircuitBreaker("dns")}
+    return {"whois": CircuitBreaker("whois"), "whois_other": CircuitBreaker("whois_other"),
+            "dns": CircuitBreaker("dns")}
 
 
 # ---------------- token bucket ----------------
@@ -363,6 +364,131 @@ def test_circuit_open_requeues_without_calling(tmp_path):
         )
 
 
+# ---------------- reliable vs. other TLD breaker isolation ----------------
+#
+# Regression coverage for the actual bug found live: a single shared WHOIS
+# breaker meant a run of failures on a handful of flaky-registry domains (they
+# cluster together in a batch -- a CT burst tends to share a TLD) tripped the
+# ONE breaker and then blocked WHOIS for every domain, including .com/.net/.org
+# lookups that work fine on their own. 96% of a day's WHOIS failures were
+# "circuit_open" rejections, not real failures, and over a third of those
+# rejected were .com domains.
+
+def test_tld_bucket_classifies_reliable_vs_other():
+    reliable = ("com", "net", "org")
+    assert _tld_bucket("apple.com", reliable) == "reliable"
+    assert _tld_bucket("example.net", reliable) == "reliable"
+    assert _tld_bucket("example.org", reliable) == "reliable"
+    assert _tld_bucket("secure-apple-id.tk", reliable) == "other"
+    assert _tld_bucket("phish.xyz", reliable) == "other"
+    assert _tld_bucket("foo.co.uk", reliable) == "other"  # last-segment bucketing, not PSL-aware
+    assert _tld_bucket(None, reliable) == "other"
+    assert _tld_bucket("", reliable) == "other"
+
+
+def test_build_breakers_returns_independent_whois_and_whois_other():
+    cfg = load_config(path="/nonexistent")
+    cfg["circuit_breaker"] = {"failure_threshold": 5, "cooldown_seconds": 300}
+    cfg["circuit_breaker_other"] = {"failure_threshold": 2, "cooldown_seconds": 30}
+    brks = build_breakers(cfg)
+    assert set(brks) == {"whois", "whois_other", "dns"}
+    assert brks["whois"].failure_threshold == 5
+    assert brks["whois_other"].failure_threshold == 2  # independently tunable
+    assert brks["whois_other"].cooldown_seconds == 30
+
+
+def test_other_tld_failures_never_open_reliable_breaker(tmp_path):
+    """The core fix: 5 consecutive failures on flaky-TLD domains must not
+    block a .com lookup that would otherwise succeed."""
+    cfg = make_cfg(tmp_path)
+    caches = make_caches(tmp_path)
+    brk = breakers()
+
+    def flaky_whois_fetch(domain, timeout=10.0):
+        raise Exception("registry unreachable")
+
+    for i in range(5):
+        with pytest.raises(EnrichFailure):
+            enrich_item(
+                {"registered_domain": f"bad{i}.xyz", "domain": f"bad{i}.xyz", "triage_score": 0.9},
+                whois_cache=caches["whois"], dns_cache=caches["dns"], geo_cache=caches["geo"],
+                rate_limiters=fast_limiters(), breakers=brk, cfg=cfg,
+                dns_fetch=lambda d: ["1.2.3.4"], whois_fetch=flaky_whois_fetch,
+            )
+    assert brk["whois_other"].state == OPEN
+    assert brk["whois"].state == CLOSED  # untouched by the "other" bucket's trouble
+
+    def good_whois_fetch(domain, timeout=10.0):
+        return {"domain": domain, "registrar": "GoDaddy"}
+
+    row = enrich_item(
+        {"registered_domain": "apple.com", "domain": "apple.com", "triage_score": 0.9},
+        whois_cache=caches["whois"], dns_cache=caches["dns"], geo_cache=caches["geo"],
+        rate_limiters=fast_limiters(), breakers=brk, cfg=cfg,
+        dns_fetch=lambda d: ["1.2.3.4"], whois_fetch=good_whois_fetch,
+    )
+    assert row["enrichment_level"] == "tier2"  # succeeds despite "other" being wide open
+    assert row["registrar"] == "GoDaddy"
+
+
+def test_reliable_tld_failures_never_open_other_breaker(tmp_path):
+    """Symmetric case: trouble on .com/.net/.org must not throttle flaky-TLD
+    domains either -- each bucket's health is independent."""
+    cfg = make_cfg(tmp_path)
+    caches = make_caches(tmp_path)
+    brk = breakers()
+
+    def flaky_whois_fetch(domain, timeout=10.0):
+        raise Exception("registry unreachable")
+
+    for i in range(5):
+        with pytest.raises(EnrichFailure):
+            enrich_item(
+                {"registered_domain": f"bad{i}.com", "domain": f"bad{i}.com", "triage_score": 0.9},
+                whois_cache=caches["whois"], dns_cache=caches["dns"], geo_cache=caches["geo"],
+                rate_limiters=fast_limiters(), breakers=brk, cfg=cfg,
+                dns_fetch=lambda d: ["1.2.3.4"], whois_fetch=flaky_whois_fetch,
+            )
+    assert brk["whois"].state == OPEN
+    assert brk["whois_other"].state == CLOSED
+
+
+def test_other_tld_circuit_open_reason_is_distinguishable_in_ledger(tmp_path):
+    from ct.enrich.tiers import CircuitOpen
+    cfg = make_cfg(tmp_path)
+    caches = make_caches(tmp_path)
+    brk = breakers()
+    for _ in range(5):
+        brk["whois_other"].record_failure()
+
+    with pytest.raises(CircuitOpen) as ei:
+        enrich_item(
+            {"registered_domain": "phish.xyz", "domain": "phish.xyz", "triage_score": 0.9},
+            whois_cache=caches["whois"], dns_cache=caches["dns"], geo_cache=caches["geo"],
+            rate_limiters=fast_limiters(), breakers=brk, cfg=cfg,
+            dns_fetch=lambda d: [], whois_fetch=lambda *a, **k: (_ for _ in ()).throw(AssertionError()),
+        )
+    assert str(ei.value) == "whois_other: circuit_open"  # not the old bare "whois: circuit_open"
+
+
+def test_other_tld_gets_longer_whois_timeout_budget(tmp_path):
+    cfg = make_cfg(tmp_path, timeouts={"whois_seconds": 10.0, "whois_seconds_other_tld": 25.0})
+    caches = make_caches(tmp_path)
+    received = {}
+
+    def whois_fetch(domain, timeout=10.0):
+        received["timeout"] = timeout
+        return {"domain": domain, "registrar": "R"}
+
+    enrich_item(
+        {"registered_domain": "phish.xyz", "domain": "phish.xyz", "triage_score": 0.9},
+        whois_cache=caches["whois"], dns_cache=caches["dns"], geo_cache=caches["geo"],
+        rate_limiters=fast_limiters(), breakers=breakers(), cfg=cfg,
+        dns_fetch=lambda d: ["1.2.3.4"], whois_fetch=whois_fetch,
+    )
+    assert received["timeout"] == 25.0  # the "other" budget, not reliable_tlds' 10.0
+
+
 # ---------------- end-to-end worker (mocked network) ----------------
 
 def test_worker_end_to_end_writes_output_and_ledgers(tmp_path):
@@ -554,3 +680,86 @@ def test_run_worker_no_pointer_mode_drains_without_moving_pointer(tmp_path):
 
     ptr = json.loads(ptr_path.read_text())
     assert ptr["path"] == "/fake/hot/output.parquet"  # untouched by the backfill drain
+
+
+# ---------------- default_whois_fetch: timeout budget split ----------------
+#
+# Regression tests for a real incident: the outer call_with_timeout()
+# supervisor enforced cfg["timeouts"]["whois_seconds"] (6.0) while this
+# function's own internal requests.get() timeout stayed at its unreachable
+# default of 10.0 -- the caller never passed timeout= through at all. Any
+# WHOIS call taking 6-10s (well within what this function was configured
+# to wait for) got killed by the outer wrapper first. Found live: the
+# majority of a real ~15-minute backfill task's items requeued with
+# "reason=whois: timeout>6.0s" despite the RDAP endpoint and this exact
+# function succeeding in under 2s when called directly, in isolation.
+
+def test_default_whois_fetch_splits_timeout_into_connect_and_read(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        def json(self):
+            return {"events": [], "entities": []}
+        def raise_for_status(self):
+            pass
+
+    def fake_get(url, timeout=None, headers=None):
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    import requests
+    monkeypatch.setattr(requests, "get", fake_get)
+
+    default_whois_fetch("example.com", timeout=10.0)
+    connect, read = captured["timeout"]
+    assert connect == 3
+    assert read == 7.0  # 10.0 - 3 (connect budget)
+    assert connect + read == 10.0  # total never exceeds what the caller asked for
+
+
+def test_default_whois_fetch_read_timeout_never_goes_below_one_second(monkeypatch):
+    # a caller passing a very small total budget must not produce a
+    # negative or zero read timeout for requests.get.
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        def json(self):
+            return {"events": [], "entities": []}
+        def raise_for_status(self):
+            pass
+
+    def fake_get(url, timeout=None, headers=None):
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    import requests
+    monkeypatch.setattr(requests, "get", fake_get)
+
+    default_whois_fetch("example.com", timeout=2.0)
+    _connect, read = captured["timeout"]
+    assert read == 1.0  # floored, not max(1.0, 2.0-3.0) == -1.0
+
+
+def test_enrich_item_passes_configured_timeout_through_to_whois_fetch(tmp_path):
+    # Regression guard for the actual bug: call_with_timeout() must pass
+    # timeout= to whois_fetch, not silently rely on whois_fetch's own
+    # default -- otherwise the outer supervisor and the inner HTTP client
+    # are governed by two independently-configured numbers that can drift
+    # out of alignment exactly like the real incident.
+    cfg = make_cfg(tmp_path, timeouts={"whois_seconds": 7.5})
+    caches = make_caches(tmp_path)
+
+    received = {}
+    def whois_fetch(domain, timeout=10.0):
+        received["timeout"] = timeout
+        return {"domain": domain, "registrar": "R"}
+
+    enrich_item(
+        {"registered_domain": "example.com", "domain": "example.com", "triage_score": 0.9},
+        whois_cache=caches["whois"], dns_cache=caches["dns"], geo_cache=caches["geo"],
+        rate_limiters=fast_limiters(), breakers=breakers(), cfg=cfg,
+        dns_fetch=lambda d: ["1.2.3.4"], whois_fetch=whois_fetch,
+    )
+    assert received["timeout"] == 7.5  # matches cfg, not whois_fetch's own unrelated default
