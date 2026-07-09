@@ -1,0 +1,6 @@
+{
+  "_doc": "Bootstrap analyst directory -- NOT auth, just populates the assignee dropdown and 'my queue' filter. Edit this and run `make seed-analysts`.",
+  "analysts": [
+    {"username": "mohan", "display_name": "Mohan"}
+  ]
+}

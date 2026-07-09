@@ -7,8 +7,14 @@ import datetime as dt
 import pytest
 
 from product.assemble_campaigns import (
+    _burst_proximity,
+    _lexical_similarity,
+    _overlap_fraction,
+    classify_workflow,
     cluster_key_for,
+    compute_membership_score,
     lexical_family_root,
+    load_workflow_keywords,
     target_brand_for,
 )
 from product.db import ping
@@ -48,6 +54,151 @@ def test_target_brand_excludes_brands_own_infra():
     assert target_brand_for("microsoft365-pentesting.com", brands, self_domains) == "microsoft"
     # lookalike trick under a fake apex is still attributed
     assert target_brand_for("login.microsoft.com.evil.tk", brands, self_domains) == "microsoft"
+
+
+def test_target_brand_rejects_coincidental_substrings_found_live():
+    """Regression test for a real incident: raw-substring matching on "apple"
+    clustered a produce association, a Wisconsin VW dealer, and a Costa Rica
+    pineapple company under a fabricated "APPLE" impersonation campaign in the
+    live product. Token-boundary + bounded Levenshtein matching must reject
+    all of these while still catching genuine impersonation patterns."""
+    # ["apple", "appleid"] mirrors real config/watchlist_brands.json, where
+    # "appleid" is a curated alias (not caught via fuzzy distance on "apple"
+    # itself -- "appleid" is distance 2 from "apple", the same collision
+    # class as "apps"/"able"/"maple" below, so it can only be matched safely
+    # as its own exact token, same as production).
+    brands = [("apple", ["apple", "appleid"], 150)]
+    false_positives = [
+        "nzapplesandpears.com",              # produce industry association
+        "rappleyplumbingandheating.com",     # r + APPLE + y
+        "bergstromvolkswagenappleton.com",   # VW dealer in Appleton, WI
+        "test.pineapplecostarica.com",       # pineapple company
+        "www.applecell.com",                 # concatenated compound, no separator
+        "gs2526888andapple.com",             # digits strip out, tokens glue together
+    ]
+    for host in false_positives:
+        assert target_brand_for(host, brands) is None, f"{host} should NOT match 'apple'"
+
+    genuine_matches = [
+        "secure-apple-id.tk",
+        "appleid-login.com",
+        "www.gravity-apple.com",
+    ]
+    for host in genuine_matches:
+        assert target_brand_for(host, brands) == "apple", f"{host} SHOULD match 'apple'"
+
+
+def test_target_brand_rejects_short_name_fuzzy_collisions_found_live():
+    """Regression test: fixing the raw-substring bug wasn't enough -- the
+    remaining bounded-Levenshtein fuzzy match (distance<=2, uniform across
+    all keyword lengths) still let ordinary English words within distance 2
+    of "apple" through. Live re-audit after the substring fix found 42 of 51
+    queue-visible clusters (confidence>=0.75) were majority fuzzy-match
+    noise -- e.g. a 100%-confidence "apple" campaign whose members included
+    apps.curdil.com, box.wappl.com, applied-pedagogy.com."""
+    brands = [("apple", ["apple", "appleid"], 150)]
+    for host in ["apps.curdil.com", "box.wappl.com", "applied-pedagogy.com",
+                 "corp.n-able.com", "www.example-ample.com"]:
+        assert target_brand_for(host, brands) is None, f"{host} should NOT match 'apple'"
+
+
+def test_target_brand_long_names_still_catch_single_edit_typosquats():
+    """Names >=6 chars keep their distance-1 fuzzy budget (with a first-char
+    anchor) -- the length-based tightening only removes matching where
+    collisions were actually observed, not everywhere. Note: standard
+    Levenshtein (no transposition op) scores a swapped-letter typo like
+    "binance"->"binnace" as distance 2, not 1 -- this uses a plain
+    single-character substitution instead, which is genuinely distance 1."""
+    brands = [("binance", ["binance"], 200), ("microsoft", ["microsoft"], 150)]
+    assert target_brand_for("binanse-exchange-login.com", brands) == "binance"
+    assert target_brand_for("micros0ft-support.tk", brands) == "microsoft"
+
+
+# ---------- weighted membership scoring (Track B, no DB) ----------
+
+def test_lexical_similarity_no_others_is_zero():
+    assert _lexical_similarity("a.com", []) == 0.0
+
+
+def test_lexical_similarity_identical_hosts_is_one():
+    assert _lexical_similarity("paypal-login.tk", ["paypal-login.tk"]) == 1.0
+
+
+def test_lexical_similarity_closer_host_scores_higher():
+    close = _lexical_similarity("paypal-login-a.tk", ["paypal-login-b.tk"])
+    far = _lexical_similarity("paypal-login-a.tk", ["totally-different-xyz.tk"])
+    assert close > far
+
+
+def test_overlap_fraction_empty_or_missing_is_zero():
+    assert _overlap_fraction(None, ["AS123"]) == 0.0
+    assert _overlap_fraction("AS123", []) == 0.0
+
+
+def test_overlap_fraction_case_insensitive_partial_match():
+    assert _overlap_fraction("AS123", ["as123", "AS999"]) == 0.5
+
+
+def test_burst_proximity_neutral_with_nothing_to_compare():
+    assert _burst_proximity(dt.datetime(2026, 7, 3, tzinfo=dt.timezone.utc), []) == 0.5
+
+
+def test_burst_proximity_decays_with_distance():
+    base = dt.datetime(2026, 7, 3, 12, 0, tzinfo=dt.timezone.utc)
+    close = _burst_proximity(base + dt.timedelta(hours=1), [base])
+    far = _burst_proximity(base + dt.timedelta(hours=23), [base])
+    assert close > far
+    assert close == pytest.approx(1.0 - 1 / 24, abs=1e-6)
+
+
+def test_compute_membership_score_first_member_gets_baseline_score():
+    from product.models import CtObservation
+    o = CtObservation(raw_host="a.tk", event_ts=dt.datetime(2026, 7, 3, tzinfo=dt.timezone.utc))
+    # brand(0.30 fixed) + burst(0.25*0.5 neutral) + lexical(0) + asn(0) + registrar(0)
+    assert compute_membership_score(o, []) == pytest.approx(0.30 + 0.125, abs=1e-4)
+
+
+def test_compute_membership_score_strong_overlap_scores_higher_than_none():
+    from product.models import CtObservation
+    ts = dt.datetime(2026, 7, 3, 12, 0, tzinfo=dt.timezone.utc)
+    existing = [CtObservation(raw_host="paypal-login-a.tk", event_ts=ts,
+                              sample_asn="AS111", registrar="NameCheap")]
+    strong = CtObservation(raw_host="paypal-login-b.tk", event_ts=ts,
+                           sample_asn="AS111", registrar="NameCheap")
+    weak = CtObservation(raw_host="zzz-unrelated.xyz", event_ts=ts + dt.timedelta(hours=20),
+                         sample_asn="AS999", registrar="GoDaddy")
+    assert compute_membership_score(strong, existing) > compute_membership_score(weak, existing)
+
+
+# ---------- target_workflow intent classification (Track C, no DB) ----------
+
+_WF_KEYWORDS = {
+    "login": ["login", "signin"],
+    "billing": ["billing", "invoice"],
+    "wallet": ["wallet", "crypto"],
+}
+
+
+def test_classify_workflow_matches_by_priority_order():
+    # both "login" and "billing" keywords present -- login comes first in
+    # _WORKFLOW_PRIORITY, so it wins regardless of dict iteration order
+    assert classify_workflow(["billing-login-portal.tk"], _WF_KEYWORDS) == "login"
+
+
+def test_classify_workflow_checks_all_hosts_not_just_first():
+    hosts = ["random-noise.tk", "secure-wallet-access.tk"]
+    assert classify_workflow(hosts, _WF_KEYWORDS) == "wallet"
+
+
+def test_classify_workflow_defaults_to_generic():
+    assert classify_workflow(["totally-unrelated-domain.tk"], _WF_KEYWORDS) == "generic"
+    assert classify_workflow([], _WF_KEYWORDS) == "generic"
+
+
+def test_workflow_intent_config_loads_and_strips_doc_key():
+    keywords = load_workflow_keywords()
+    assert "_doc" not in keywords
+    assert "login" in keywords and isinstance(keywords["login"], list)
 
 
 # ---------- live merge-not-split (W3) ----------
@@ -105,5 +256,92 @@ def test_burst_forms_one_cluster_and_second_batch_merges():
                 s.execute(delete(ClusterMember).where(ClusterMember.cluster_id.in_(ids)))
                 s.execute(delete(CampaignCluster).where(CampaignCluster.id.in_(ids)))
             s.execute(delete(CtObservation).where(CtObservation.raw_host.like(f"{BRAND}-%")))
+            s.execute(delete(WatchlistBrand).where(WatchlistBrand.brand_name == BRAND))
+            s.commit()
+
+
+# ---------- live suppression integration (Track B) ----------
+
+@pytest.mark.skipif(not ping(), reason="app-db not reachable (docker compose up -d app-db)")
+def test_suppressed_observation_never_forms_a_new_cluster():
+    """An observation matching an active suppression rule must be excluded at
+    candidate-selection time -- it should never form (or join) a cluster."""
+    from sqlalchemy import delete, select
+
+    from product.assemble_campaigns import assemble
+    from product.db import SessionLocal
+    from product.models import CampaignCluster, CtObservation, SuppressionRule, WatchlistBrand
+
+    BRAND = "zzsupprbrand"
+    day = dt.datetime(2026, 7, 4, 10, 0, 0, tzinfo=dt.timezone.utc)
+    host = f"{BRAND}-login-a-b.tk"
+
+    with SessionLocal() as s:
+        try:
+            s.add(WatchlistBrand(brand_name=BRAND, priority=999, active=True))
+            s.add(SuppressionRule(rule_type="domain", match_value=host, created_by="test", active=True))
+            s.add(CtObservation(raw_host=host, registered_domain=host, event_ts=day, risk_score=0.9))
+            s.commit()
+
+            result = assemble(min_risk=0.5)
+            assert result["suppressed_candidates"] >= 1
+            clusters = s.execute(
+                select(CampaignCluster).where(CampaignCluster.target_brand == BRAND)
+            ).scalars().all()
+            assert clusters == []  # never formed -- excluded before grouping
+        finally:
+            s.execute(delete(CtObservation).where(CtObservation.raw_host == host))
+            s.execute(delete(SuppressionRule).where(SuppressionRule.match_value == host))
+            s.execute(delete(WatchlistBrand).where(WatchlistBrand.brand_name == BRAND))
+            s.commit()
+
+
+@pytest.mark.skipif(not ping(), reason="app-db not reachable (docker compose up -d app-db)")
+def test_existing_cluster_transitions_to_suppressed_when_rule_added_later():
+    """A cluster formed BEFORE a suppression rule existed must still get
+    pushed to stage=suppressed once all its members match a newly-added rule
+    -- this is reevaluate_suppressed_clusters(), separate from candidate-time
+    exclusion (which alone would never touch an already-formed cluster again)."""
+    from sqlalchemy import delete, select
+
+    from product.assemble_campaigns import assemble
+    from product.db import SessionLocal
+    from product.models import CampaignCluster, ClusterMember, CtObservation, SuppressionRule, WatchlistBrand
+
+    BRAND = "zzsupprexisting"
+    day = dt.datetime(2026, 7, 4, 11, 0, 0, tzinfo=dt.timezone.utc)
+    host = f"{BRAND}-secure-a-b.tk"
+
+    with SessionLocal() as s:
+        try:
+            s.add(WatchlistBrand(brand_name=BRAND, priority=999, active=True))
+            s.add(CtObservation(raw_host=host, registered_domain=host, event_ts=day, risk_score=0.9))
+            s.commit()
+
+            assemble(min_risk=0.5)  # forms the cluster, no suppression rule yet
+            cluster = s.execute(
+                select(CampaignCluster).where(CampaignCluster.target_brand == BRAND)
+            ).scalar_one()
+            assert cluster.stage != "suppressed"
+
+            # NOW add a suppression rule matching the (only) member, and re-run
+            s.add(SuppressionRule(rule_type="domain", match_value=host, created_by="test", active=True))
+            s.commit()
+            assemble(min_risk=0.5)
+
+            s.expire_all()
+            cluster = s.execute(
+                select(CampaignCluster).where(CampaignCluster.target_brand == BRAND)
+            ).scalar_one()
+            assert cluster.stage == "suppressed"
+        finally:
+            ids = s.execute(
+                select(CampaignCluster.id).where(CampaignCluster.target_brand == BRAND)
+            ).scalars().all()
+            if ids:
+                s.execute(delete(ClusterMember).where(ClusterMember.cluster_id.in_(ids)))
+                s.execute(delete(CampaignCluster).where(CampaignCluster.id.in_(ids)))
+            s.execute(delete(CtObservation).where(CtObservation.raw_host == host))
+            s.execute(delete(SuppressionRule).where(SuppressionRule.match_value == host))
             s.execute(delete(WatchlistBrand).where(WatchlistBrand.brand_name == BRAND))
             s.commit()

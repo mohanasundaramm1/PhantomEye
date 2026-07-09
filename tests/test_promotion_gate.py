@@ -10,18 +10,24 @@ from ml.core.promotion_gate import (
     append_promotion_log,
     decide_promotion,
     load_champion_meta,
+    primary_benign_fpr,
     primary_metric,
     verify_latest_decision,
 )
 
 
-def _meta(roc_auc_lgbm=None, roc_auc_logreg=None, n_pos=100, n_neg=100, used_temporal=True):
+def _meta(roc_auc_lgbm=None, roc_auc_logreg=None, n_pos=100, n_neg=100, used_temporal=True,
+         benign_fpr=None):
     metrics = {}
     if roc_auc_lgbm is not None:
         metrics["lgbm_full"] = {"roc_auc": roc_auc_lgbm}
     if roc_auc_logreg is not None:
         metrics["logreg_full"] = {"roc_auc": roc_auc_logreg}
-    return {"metrics": metrics, "n_pos": n_pos, "n_neg": n_neg, "used_temporal_split": used_temporal}
+    meta = {"metrics": metrics, "n_pos": n_pos, "n_neg": n_neg, "used_temporal_split": used_temporal}
+    if benign_fpr is not None:
+        meta["benign_holdout_fpr"] = {"fpr": benign_fpr, "n_holdout": 1000,
+                                      "n_false_positive": int(round(benign_fpr * 1000))}
+    return meta
 
 
 def test_primary_metric_prefers_lgbm_over_logreg():
@@ -98,6 +104,79 @@ def test_no_warning_when_temporal_split_was_used():
     challenger = _meta(roc_auc_lgbm=0.95, used_temporal=True)
     d = decide_promotion(champion_meta=None, challenger_meta=challenger)
     assert d["warnings"] == []
+
+
+# ---------------- benign-holdout FPR regression rule ----------------
+
+def test_primary_benign_fpr_extracts_fpr_when_present():
+    m = _meta(roc_auc_lgbm=0.95, benign_fpr=0.12)
+    assert primary_benign_fpr(m) == 0.12
+
+
+def test_primary_benign_fpr_none_for_missing_or_malformed_meta():
+    assert primary_benign_fpr(None) is None
+    assert primary_benign_fpr({}) is None
+    assert primary_benign_fpr(_meta(roc_auc_lgbm=0.95)) is None  # no benign_fpr set
+    assert primary_benign_fpr({"benign_holdout_fpr": {"fpr": "not_a_number"}}) is None
+    assert primary_benign_fpr({"benign_holdout_fpr": None}) is None  # eval skipped at train time
+
+
+def test_rejects_benign_fpr_regression_beyond_tolerance():
+    champion = _meta(roc_auc_lgbm=0.95, benign_fpr=0.05)
+    challenger = _meta(roc_auc_lgbm=0.95, benign_fpr=0.15)  # 0.10 worse, well beyond 0.02 tolerance
+    d = decide_promotion(champion, challenger, max_benign_fpr_regression_tolerance=0.02)
+    assert d["promote"] is False
+    assert "benign-holdout FPR" in d["reason"]
+    assert "regresses" in d["reason"]
+
+
+def test_promotes_within_benign_fpr_regression_tolerance():
+    champion = _meta(roc_auc_lgbm=0.95, benign_fpr=0.05)
+    challenger = _meta(roc_auc_lgbm=0.95, benign_fpr=0.06)  # 0.01 worse, within 0.02 tolerance
+    d = decide_promotion(champion, challenger, max_benign_fpr_regression_tolerance=0.02)
+    assert d["promote"] is True
+    assert d["warnings"] == []
+
+
+def test_promotes_when_challenger_improves_benign_fpr():
+    champion = _meta(roc_auc_lgbm=0.95, benign_fpr=0.20)
+    challenger = _meta(roc_auc_lgbm=0.95, benign_fpr=0.03)  # the actual fix working
+    d = decide_promotion(champion, challenger)
+    assert d["promote"] is True
+
+
+def test_warns_but_does_not_block_when_champion_missing_benign_fpr():
+    # the expected shape of the FIRST run after this feature ships: an old
+    # champion with no benign_holdout_fpr at all.
+    champion = _meta(roc_auc_lgbm=0.95)  # no benign_fpr
+    challenger = _meta(roc_auc_lgbm=0.95, benign_fpr=0.30)  # even a bad FPR must not block
+    d = decide_promotion(champion, challenger)
+    assert d["promote"] is True
+    assert any("champion metadata has no benign_holdout_fpr" in w for w in d["warnings"])
+
+
+def test_warns_but_does_not_block_when_challenger_missing_benign_fpr():
+    # e.g. the holdout file was absent/empty at train time (compute_benign_fpr's fpr=None case)
+    champion = _meta(roc_auc_lgbm=0.95, benign_fpr=0.05)
+    challenger = _meta(roc_auc_lgbm=0.95)  # no benign_fpr
+    d = decide_promotion(champion, challenger)
+    assert d["promote"] is True
+    assert any("challenger metadata has no benign_holdout_fpr" in w for w in d["warnings"])
+
+
+def test_warns_but_does_not_block_when_neither_side_has_benign_fpr():
+    champion = _meta(roc_auc_lgbm=0.95)
+    challenger = _meta(roc_auc_lgbm=0.95)
+    d = decide_promotion(champion, challenger)
+    assert d["promote"] is True
+    assert any("neither challenger nor champion" in w for w in d["warnings"])
+
+
+def test_benign_fpr_regression_does_not_block_first_ever_run():
+    # no champion at all -- nothing to regress against, same precedent as the ROC-AUC rule
+    challenger = _meta(roc_auc_lgbm=0.95, benign_fpr=0.99)  # would be a rejection if there were a champion
+    d = decide_promotion(champion_meta=None, challenger_meta=challenger)
+    assert d["promote"] is True
 
 
 def test_load_champion_meta_missing_file_returns_none(tmp_path):
