@@ -225,6 +225,24 @@ def load_models():
     return logreg, booster, meta
 
 
+def model_version_tag(primary_name: str, meta: dict | None) -> str:
+    """e.g. "lgbm_full@20260708T035042Z" -- created_utc from meta.json,
+    ISO-8601-basic timestamp suffix. Fits CtObservation.model_used's
+    String(32) column (27 chars for the longest primary_name, "logreg_full").
+    Falls back to the bare primary_name (the old behavior) if meta.json is
+    missing/malformed, so every CtObservation row can be told apart by
+    which specific training run scored it -- before this, model_used was
+    just the literal string "lgbm_full" for every row ever scored,
+    indistinguishable across retrains."""
+    if meta and meta.get("created_utc"):
+        try:
+            ts = datetime.fromisoformat(meta["created_utc"].replace("Z", "+00:00"))
+            return f"{primary_name}@{ts.strftime('%Y%m%dT%H%M%SZ')}"
+        except (ValueError, TypeError):
+            pass
+    return primary_name
+
+
 def choose_threshold(meta, primary_name=None):
     """
     Pick the risk-classification cutoff dynamically from measured model
@@ -372,7 +390,7 @@ def main():
     thr = choose_threshold(meta, primary_name=primary_name)
     print(f"[info] using threshold={thr:.3f} for risk_label (model={primary_name})")
     out["risk_label"] = (out["risk_score"] >= thr).astype(int)
-    out["model_used"] = primary_name
+    out["model_used"] = model_version_tag(primary_name, meta)
 
     # 5) Fuse with MISP silver
     misp_set = load_recent_misp_domains(days_back=30)

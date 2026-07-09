@@ -16,7 +16,7 @@ from ct.enrich.circuit import CLOSED, OPEN, CircuitBreaker
 from ct.enrich.config import load_config
 from ct.enrich.queue import FileQueue
 from ct.enrich.ratelimit import TokenBucket
-from ct.enrich.tiers import EnrichFailure, enrich_item, needs_tier2
+from ct.enrich.tiers import EnrichFailure, default_whois_fetch, enrich_item, needs_tier2
 from ct.enrich.enrich_worker import _write_enriched_output, run_worker
 
 
@@ -554,3 +554,86 @@ def test_run_worker_no_pointer_mode_drains_without_moving_pointer(tmp_path):
 
     ptr = json.loads(ptr_path.read_text())
     assert ptr["path"] == "/fake/hot/output.parquet"  # untouched by the backfill drain
+
+
+# ---------------- default_whois_fetch: timeout budget split ----------------
+#
+# Regression tests for a real incident: the outer call_with_timeout()
+# supervisor enforced cfg["timeouts"]["whois_seconds"] (6.0) while this
+# function's own internal requests.get() timeout stayed at its unreachable
+# default of 10.0 -- the caller never passed timeout= through at all. Any
+# WHOIS call taking 6-10s (well within what this function was configured
+# to wait for) got killed by the outer wrapper first. Found live: the
+# majority of a real ~15-minute backfill task's items requeued with
+# "reason=whois: timeout>6.0s" despite the RDAP endpoint and this exact
+# function succeeding in under 2s when called directly, in isolation.
+
+def test_default_whois_fetch_splits_timeout_into_connect_and_read(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        def json(self):
+            return {"events": [], "entities": []}
+        def raise_for_status(self):
+            pass
+
+    def fake_get(url, timeout=None, headers=None):
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    import requests
+    monkeypatch.setattr(requests, "get", fake_get)
+
+    default_whois_fetch("example.com", timeout=10.0)
+    connect, read = captured["timeout"]
+    assert connect == 3
+    assert read == 7.0  # 10.0 - 3 (connect budget)
+    assert connect + read == 10.0  # total never exceeds what the caller asked for
+
+
+def test_default_whois_fetch_read_timeout_never_goes_below_one_second(monkeypatch):
+    # a caller passing a very small total budget must not produce a
+    # negative or zero read timeout for requests.get.
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        def json(self):
+            return {"events": [], "entities": []}
+        def raise_for_status(self):
+            pass
+
+    def fake_get(url, timeout=None, headers=None):
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    import requests
+    monkeypatch.setattr(requests, "get", fake_get)
+
+    default_whois_fetch("example.com", timeout=2.0)
+    _connect, read = captured["timeout"]
+    assert read == 1.0  # floored, not max(1.0, 2.0-3.0) == -1.0
+
+
+def test_enrich_item_passes_configured_timeout_through_to_whois_fetch(tmp_path):
+    # Regression guard for the actual bug: call_with_timeout() must pass
+    # timeout= to whois_fetch, not silently rely on whois_fetch's own
+    # default -- otherwise the outer supervisor and the inner HTTP client
+    # are governed by two independently-configured numbers that can drift
+    # out of alignment exactly like the real incident.
+    cfg = make_cfg(tmp_path, timeouts={"whois_seconds": 7.5})
+    caches = make_caches(tmp_path)
+
+    received = {}
+    def whois_fetch(domain, timeout=10.0):
+        received["timeout"] = timeout
+        return {"domain": domain, "registrar": "R"}
+
+    enrich_item(
+        {"registered_domain": "example.com", "domain": "example.com", "triage_score": 0.9},
+        whois_cache=caches["whois"], dns_cache=caches["dns"], geo_cache=caches["geo"],
+        rate_limiters=fast_limiters(), breakers=breakers(), cfg=cfg,
+        dns_fetch=lambda d: ["1.2.3.4"], whois_fetch=whois_fetch,
+    )
+    assert received["timeout"] == 7.5  # matches cfg, not whois_fetch's own unrelated default

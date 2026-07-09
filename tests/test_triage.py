@@ -71,6 +71,31 @@ def test_brand_rejects_coincidental_substrings_found_live():
     assert "apple" in brand_matches("secure-apple-id.tk", CFG)
 
 
+def test_brand_rejects_short_name_fuzzy_collisions_found_live():
+    """Regression test: fixing the raw-substring bug above wasn't enough --
+    the remaining bounded-Levenshtein fuzzy match (distance<=2, uniform
+    across all keyword lengths) still let ordinary English words within
+    distance 2 of "apple" through: apps.curdil.com, box.wappl.com, and
+    applied-pedagogy.com were all live 100%-confidence "apple" campaign
+    members. "apple" is 5 chars -> exact-token-only budget now (see
+    _brand_match_distance_budget); none of these tokenize to "apple"
+    exactly, so none should match."""
+    for host in ["apps.curdil.com", "box.wappl.com", "applied-pedagogy.com",
+                 "corp.n-able.com", "www.mapleleafplumbing.com", "www.example-ample.com"]:
+        assert "apple" not in brand_matches(host, CFG), f"{host} should NOT brand_match apple"
+
+
+def test_brand_matches_long_names_still_catch_single_edit_typosquats():
+    """Names >=6 chars keep their distance-1 fuzzy budget (with a first-char
+    anchor) -- confirms the length-based tightening didn't collapse to
+    exact-only matching everywhere, only where collisions were observed.
+    Note: standard Levenshtein (no transposition op) scores a swapped-letter
+    typo like "binance"->"binnace" as distance 2, not 1 -- these use plain
+    single-character substitutions instead, which are genuinely distance 1."""
+    assert "binance" in brand_matches("binanse-exchange-login.com", CFG)  # c->s substitution
+    assert "microsoft" in brand_matches("micros0ft-support.tk", CFG)      # digit strips to a 1-char deletion
+
+
 # ---------- provider-context suppression (legit-infra false positives) ----------
 
 def test_provider_own_infra_not_brand_matched():
@@ -91,7 +116,13 @@ def test_impersonation_still_flags_off_provider_infra():
     # A brand keyword on a domain that is NOT the brand's own infra must still flag.
     assert "paypal" in brand_matches("secure-paypal.example.com", CFG)
     assert "paypal" in brand_matches("paypal-secure-login.tk", CFG)
-    assert "apple" in brand_matches("appleid-account-update.xyz", CFG)
+    # "appleid" is its own curated keyword (config/triage.json), not a fuzzy
+    # match on "apple" -- "appleid" is distance 2 from "apple", the same
+    # collision class as "apps"/"able"/"maple" (see
+    # test_brand_rejects_coincidental_substrings_found_live), so it can't be
+    # caught safely via fuzzy distance on the shorter root without
+    # reintroducing that exact bug.
+    assert "appleid" in brand_matches("appleid-account-update.xyz", CFG)
 
 def test_phish_hosted_on_legit_cloud_still_flags_other_brand():
     # A phish for brand X HOSTED on provider Y's infra: X still flags, only Y is

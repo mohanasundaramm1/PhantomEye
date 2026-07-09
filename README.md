@@ -50,7 +50,7 @@ Bronze (raw ingest) → Silver (normalized/enriched) → Gold (scored, Parquet) 
 *   **Data Processing**: Python (Pandas, PyArrow)
 *   **Storage**: Partitioned Parquet (Medallion Layers)
 *   **Machine Learning**: LightGBM, Scikit-Learn
-*   **API / Dashboard**: FastAPI (`api/`) + Next.js "Cyber Sentinel" console (`web/`), with a PHANTOM_EYE chat agent backed by Perplexity's Sonar models (`api/agent/`)
+*   **API / Dashboard**: FastAPI (`api/`) + Next.js "Cyber Sentinel" console (`web/`), with a PHANTOM_EYE chat agent backed by a fixed, intent-matched query router over the live DB -- no external LLM dependency (`api/agent/`)
 *   **Environment**: Docker Compose (Kafka stack + Airflow stack, brought up together via `make up-all`)
 
 > A legacy Streamlit dashboard (`ct/dashboard/ct_dashboard.py`) also exists in the repo and can still be run standalone (`streamlit run ct/dashboard/ct_dashboard.py`), but the Next.js/FastAPI console under `web/` + `api/` is the actively-developed one.
@@ -93,7 +93,7 @@ This project is built with **Privacy-by-Design** principles:
 ```bash
 git clone https://github.com/mohanasundaramm1/Threat-Intel.git
 cd Threat-Intel
-cp .env.example .env   # then fill in PERPLEXITY_API_KEY if you want the chat agent
+cp .env.example .env
 python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
 ```
 

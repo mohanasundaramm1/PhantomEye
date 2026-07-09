@@ -62,7 +62,12 @@ def test_target_brand_rejects_coincidental_substrings_found_live():
     pineapple company under a fabricated "APPLE" impersonation campaign in the
     live product. Token-boundary + bounded Levenshtein matching must reject
     all of these while still catching genuine impersonation patterns."""
-    brands = [("apple", ["apple"], 150)]
+    # ["apple", "appleid"] mirrors real config/watchlist_brands.json, where
+    # "appleid" is a curated alias (not caught via fuzzy distance on "apple"
+    # itself -- "appleid" is distance 2 from "apple", the same collision
+    # class as "apps"/"able"/"maple" below, so it can only be matched safely
+    # as its own exact token, same as production).
+    brands = [("apple", ["apple", "appleid"], 150)]
     false_positives = [
         "nzapplesandpears.com",              # produce industry association
         "rappleyplumbingandheating.com",     # r + APPLE + y
@@ -81,6 +86,32 @@ def test_target_brand_rejects_coincidental_substrings_found_live():
     ]
     for host in genuine_matches:
         assert target_brand_for(host, brands) == "apple", f"{host} SHOULD match 'apple'"
+
+
+def test_target_brand_rejects_short_name_fuzzy_collisions_found_live():
+    """Regression test: fixing the raw-substring bug wasn't enough -- the
+    remaining bounded-Levenshtein fuzzy match (distance<=2, uniform across
+    all keyword lengths) still let ordinary English words within distance 2
+    of "apple" through. Live re-audit after the substring fix found 42 of 51
+    queue-visible clusters (confidence>=0.75) were majority fuzzy-match
+    noise -- e.g. a 100%-confidence "apple" campaign whose members included
+    apps.curdil.com, box.wappl.com, applied-pedagogy.com."""
+    brands = [("apple", ["apple", "appleid"], 150)]
+    for host in ["apps.curdil.com", "box.wappl.com", "applied-pedagogy.com",
+                 "corp.n-able.com", "www.example-ample.com"]:
+        assert target_brand_for(host, brands) is None, f"{host} should NOT match 'apple'"
+
+
+def test_target_brand_long_names_still_catch_single_edit_typosquats():
+    """Names >=6 chars keep their distance-1 fuzzy budget (with a first-char
+    anchor) -- the length-based tightening only removes matching where
+    collisions were actually observed, not everywhere. Note: standard
+    Levenshtein (no transposition op) scores a swapped-letter typo like
+    "binance"->"binnace" as distance 2, not 1 -- this uses a plain
+    single-character substitution instead, which is genuinely distance 1."""
+    brands = [("binance", ["binance"], 200), ("microsoft", ["microsoft"], 150)]
+    assert target_brand_for("binanse-exchange-login.com", brands) == "binance"
+    assert target_brand_for("micros0ft-support.tk", brands) == "microsoft"
 
 
 # ---------- weighted membership scoring (Track B, no DB) ----------
