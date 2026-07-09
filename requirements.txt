@@ -32,7 +32,6 @@ uvicorn
 python-multipart
 lightgbm==4.6.0
 tldextract==5.3.0
-openai==2.31.0
 dnspython==2.8.0
 great_expectations==0.18.22
 websocket-client==1.9.0

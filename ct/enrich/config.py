@@ -26,6 +26,11 @@ DEFAULTS = {
     },
     "timeouts": {
         "whois_seconds": 10.0,
+        # Non-reliable_tlds domains are federated to a per-TLD registry of
+        # variable latency -- a longer budget here means a registry that's
+        # just slower (not broken) doesn't get miscounted as a failure and
+        # doesn't trip circuit_breaker_other. See reliable_tlds below.
+        "whois_seconds_other_tld": 20.0,
         "dns_seconds": 5.0,
     },
     "tiers": {
@@ -41,6 +46,25 @@ DEFAULTS = {
         "failure_threshold": 5,
         "cooldown_seconds": 300,
     },
+    # Separate, independently-tunable breaker for WHOIS/RDAP calls to
+    # non-reliable_tlds domains. Without this split, a run of failures on a
+    # handful of flaky-registry domains (common: they cluster together in a
+    # batch, since a CT burst tends to share a TLD) trips ONE shared breaker
+    # and then blocks WHOIS for every domain -- including perfectly healthy
+    # .com/.net/.org lookups -- for the full cooldown. Found live: 96% of a
+    # day's WHOIS failures were "circuit_open" rejections, not real failures,
+    # and over a third of those rejected were .com domains that work fine
+    # when tested directly. See ct/enrich/tiers.py::_tld_bucket().
+    "circuit_breaker_other": {
+        "failure_threshold": 5,
+        "cooldown_seconds": 300,
+    },
+    # TLDs whose RDAP is well-established and fast (Verisign .com/.net, PIR
+    # .org) -- everything else is federated to a per-TLD registry of much
+    # more variable reliability/latency and gets its own breaker + a longer
+    # timeout budget (see timeouts.whois_seconds_other_tld) so a registry
+    # that's merely slow, not broken, doesn't get miscounted as a failure.
+    "reliable_tlds": ["com", "net", "org"],
     "paths": {
         "lookups_dir": "lookups",
         "enriched_dir": "ct/data/enriched",

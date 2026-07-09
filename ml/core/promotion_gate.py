@@ -31,6 +31,17 @@ Gating rules, deliberately minimal and conservative rather than exhaustive:
      hidden -- but doesn't block promotion by itself, since a temporal
      split can legitimately be degenerate for benign reasons (sparse recent
      label data). See ml/core/train_model.py's temporal-split fallback.
+  5. No-regression on benign false-positive rate: if BOTH champion and
+     challenger have a benign_holdout_fpr.fpr (see
+     ml/core/eval_benign_fpr.py / ml/core/train_model.py's hook), the
+     challenger's FPR must not be more than MAX_BENIGN_FPR_REGRESSION_TOLERANCE
+     worse than the champion's. Exists because ROC-AUC alone is a near-
+     saturated aggregate (~0.99) insensitive to the specific failure mode
+     found live (legitimate long/complex business domains scored
+     0.94-0.99+) -- a model could regress on exactly that failure and still
+     clear rule 2. Mirrors rule 2's shape exactly. If either side lacks the
+     metric (e.g. the champion predates this feature), that's a non-
+     blocking warning, not a rejection -- same philosophy as rule 4.
 
 A first-ever run (no existing champion) always passes rules 1 and 3 (no
 regression check possible) -- bootstrapping the registry is expected to
@@ -44,6 +55,7 @@ from datetime import datetime, timezone
 
 MIN_AUC_FLOOR = 0.70
 MAX_REGRESSION_TOLERANCE = 0.02
+MAX_BENIGN_FPR_REGRESSION_TOLERANCE = 0.02
 
 
 def primary_metric(meta: dict | None) -> tuple[str, float] | None:
@@ -62,6 +74,20 @@ def primary_metric(meta: dict | None) -> tuple[str, float] | None:
     return None
 
 
+def primary_benign_fpr(meta: dict | None) -> float | None:
+    """Extracts meta['benign_holdout_fpr']['fpr'] if present and numeric.
+    None if the run predates this metric, the holdout file was missing at
+    train time, or the holdout was empty (fpr itself None) -- any of which
+    means there's nothing to compare, not that something is wrong."""
+    if not meta or not isinstance(meta, dict):
+        return None
+    block = meta.get("benign_holdout_fpr")
+    if not isinstance(block, dict):
+        return None
+    fpr = block.get("fpr")
+    return float(fpr) if isinstance(fpr, (int, float)) else None
+
+
 def load_champion_meta(model_dir: str, filename: str = "ct_risk_meta_latest.json") -> dict | None:
     path = os.path.join(model_dir, filename)
     if not os.path.exists(path):
@@ -78,6 +104,7 @@ def decide_promotion(
     challenger_meta: dict,
     min_auc_floor: float = MIN_AUC_FLOOR,
     max_regression_tolerance: float = MAX_REGRESSION_TOLERANCE,
+    max_benign_fpr_regression_tolerance: float = MAX_BENIGN_FPR_REGRESSION_TOLERANCE,
 ) -> dict:
     """Returns a decision dict: {promote, reason, warnings, challenger_primary,
     champion_primary, checked_utc}. Never raises -- a malformed input is
@@ -153,6 +180,40 @@ def decide_promotion(
             "champion_primary": {"model": champion_name, "roc_auc": champion_auc},
             "checked_utc": checked_utc,
         }
+
+    challenger_fpr = primary_benign_fpr(challenger_meta)
+    champion_fpr = primary_benign_fpr(champion_meta)
+    if challenger_fpr is not None and champion_fpr is not None:
+        fpr_regression = challenger_fpr - champion_fpr
+        if fpr_regression > max_benign_fpr_regression_tolerance:
+            return {
+                "promote": False,
+                "reason": (
+                    f"REJECTED: challenger benign-holdout FPR={challenger_fpr:.4f} regresses "
+                    f"{fpr_regression:.4f} above champion FPR={champion_fpr:.4f} "
+                    f"(tolerance={max_benign_fpr_regression_tolerance}). Keeping existing champion "
+                    f"in production."
+                ),
+                "warnings": warnings,
+                "challenger_primary": {"model": challenger_name, "roc_auc": challenger_auc},
+                "champion_primary": {"model": champion_name, "roc_auc": champion_auc},
+                "checked_utc": checked_utc,
+            }
+    elif challenger_fpr is None and champion_fpr is None:
+        warnings.append(
+            "benign-holdout FPR comparison skipped -- neither challenger nor champion "
+            "metadata has a benign_holdout_fpr.fpr metric (both runs predate "
+            "ml/core/seed_benign_feedback.py, or the holdout file was missing/empty at train "
+            "time). Not blocking promotion on this alone."
+        )
+    else:
+        missing = "challenger" if challenger_fpr is None else "champion"
+        warnings.append(
+            f"benign-holdout FPR comparison skipped -- {missing} metadata has no "
+            "benign_holdout_fpr.fpr metric (that run predates ml/core/seed_benign_feedback.py, "
+            "or the holdout file was missing/empty at train time). Not blocking promotion on "
+            "this alone."
+        )
 
     return {
         "promote": True,

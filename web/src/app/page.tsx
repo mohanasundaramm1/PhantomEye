@@ -11,7 +11,7 @@ import {
 import { motion, AnimatePresence, useScroll, useTransform } from "framer-motion";
 import {
   XAxis, YAxis, CartesianGrid, Tooltip,
-  ResponsiveContainer, AreaChart, Area, LineChart, Line,
+  ResponsiveContainer, AreaChart, Area,
   BarChart as ReBarChart, Bar, Cell,
   PieChart, Pie
 } from 'recharts';
@@ -53,6 +53,7 @@ interface Stats {
   avg_risk: number;
   signal_to_noise: number;
   countries: number;
+  watchlist_brand_count: number | null;
   map_data: MapData[];
   tld_analysis: AnalystMetric[];
   isp_reputation: AnalystMetric[];
@@ -73,6 +74,11 @@ interface Campaign {
   last_seen: string | null;
   freshness_age_minutes: number | null;
   summary_reason: string | null;
+  queue_status: string | null;
+  assignee: string | null;
+  sla_bucket: string | null;
+  stage_locked_by: string | null;
+  stage_locked_at: string | null;
 }
 
 interface CampaignDomain {
@@ -89,6 +95,28 @@ interface CampaignDomain {
 
 interface CampaignDetail extends Campaign {
   domains: CampaignDomain[];
+}
+
+// Mirrors GET /campaigns/{id}/disposition-provenance.
+interface DispositionProvenance {
+  available: boolean;
+  has_disposition: boolean;
+  reason?: string;
+  disposition?: { verdict: string; analyst: string; created_at: string };
+  eligible_training_run?: { created_utc: string; n_pos: number | null; n_neg: number | null; promoted: boolean | null } | null;
+  note?: string;
+}
+
+// Mirrors GET /watchlist -- the "bring your own brand" tracked-brand config.
+interface WatchlistBrandRow {
+  id: number;
+  brand_name: string;
+  aliases: string[];
+  priority: number;
+  customer_scope: string;
+  self_domains: string[];
+  active: boolean;
+  created_at: string | null;
 }
 
 // Mirrors GET /health/pipeline — real freshness/DB/watchdog state, the
@@ -118,11 +146,54 @@ interface ModelStatus {
   };
 }
 
+// Mirrors GET /metrics/operations (product/metrics.py) -- real SQL aggregates
+// over the campaign-radar tables, not simulated.
+interface OperationsMetrics {
+  available: boolean;
+  reason?: string;
+  analyst_confirmation?: { rate: number | null; n_dispositions: number; n_confirmed: number };
+  median_time_to_first_review?: { median_hours: number | null; n: number };
+  suppression?: { rate: number | null; n_total: number; n_suppressed: number };
+  campaigns_created?: { per_day: number | null; window_days: number; n_in_window: number };
+  enrichment_completeness?: { rate: number | null; n_total: number; n_tier2: number };
+}
+
+// Mirrors GET /metrics/lead-time (ct/score/measure_lead_time.py) -- exact-
+// hostname vs. apex-only breakdown already computed server-side.
+interface LeadTimeMetrics {
+  available: boolean;
+  reason?: string;
+  n_matched_exact_hostname?: number;
+  n_matched_registered_domain_only?: number;
+  pct_of_matches_ct_was_ahead?: number;
+  median_lead_time_hours_when_ahead?: number | null;
+  confidence_note?: string;
+}
+
+// Mirrors GET /metrics/precision-at-k (ml/core/eval_precision_at_k.py).
+interface PrecisionAtKMetrics {
+  available: boolean;
+  reason?: string;
+  n_misp_hits_total?: number;
+  confidence_note?: string;
+  precision_at_k?: { k: number; precision: number | null; n_evaluated: number; n_hits: number }[];
+}
+
 // --- Configuration ---
 // Backend base URL — override with NEXT_PUBLIC_API_BASE (e.g. for non-localhost
 // or IPv4-only environments); defaults to localhost:8000 for local dev.
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
 const geoUrl = "https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json";
+
+// Geo/ISP enrichment is structurally at 0% coverage today (tier2 WHOIS/geo
+// lookups never fire on the hot path -- see product plan Phase 3), so these
+// panels are permanently empty rather than occasionally sparse. Hidden until
+// that's fixed, rather than showing a panel that can never have data.
+const SHOW_GEO_PANELS = false;
+// Perplexity backend (no API key configured, errored on every message) was
+// replaced in Phase 6 by api/agent/internal_agent.py -- a fixed, always-on,
+// no-external-dependency intent-matched query agent. Safe to show.
+const SHOW_INTEL_CHAT = true;
 
 // decision_reason values emitted by the MISP-fusion step in
 // ct/score/score_ct_with_latest.py — real detection provenance, not attribution.
@@ -152,6 +223,22 @@ const STAGE_COLORS: Record<string, string> = {
   confirmed: "text-tactical-red bg-tactical-red/10",
   suppressed: "text-white/20 bg-white/5",
 };
+
+// Mirrors product/assemble_campaigns.py::_confidence() exactly:
+//   confidence = min(1.0, max_risk * (0.7 + 0.3 * min(count, 10) / 10.0))
+// Backed out algebraically (no extra API field needed) so the tooltip can
+// show *why* a confidence number is what it is -- risk contributes 70% on
+// its own, corroboration (more independently-observed members) only adds
+// up to another 30%, capped past 10 members. Only exact when confidence
+// isn't clamped at 1.0 (true for every real cluster today -- highest
+// confidence post-rescore is ~0.70 -- clamped clusters just show ">=" on
+// the reconstructed risk instead of claiming false precision.
+function decomposeConfidence(confidence: number | null, memberCount: number): { maxRisk: number; corroboration: number; clamped: boolean } | null {
+  if (confidence == null) return null;
+  const corroboration = 0.7 + (0.3 * Math.min(memberCount, 10)) / 10.0;
+  const maxRisk = Math.min(1.0, confidence / corroboration);
+  return { maxRisk, corroboration, clamped: confidence >= 0.9999 };
+}
 
 function formatFreshness(minutes: number | null): string {
   if (minutes == null) return "unknown";
@@ -204,15 +291,168 @@ export default function PhantomEyeAdvancedDashboard() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [network, setNetwork] = useState<any>(null);
   const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
+  const [operationsMetrics, setOperationsMetrics] = useState<OperationsMetrics | null>(null);
+  const [leadTimeMetrics, setLeadTimeMetrics] = useState<LeadTimeMetrics | null>(null);
+  const [precisionAtK, setPrecisionAtK] = useState<PrecisionAtKMetrics | null>(null);
   const [mounted, setMounted] = useState(false);
 
   // Campaign Queue state — the analyst-grade "bring your own brand" surface.
   const [campaigns, setCampaigns] = useState<Campaign[] | null>(null);
   const [pipelineHealth, setPipelineHealth] = useState<PipelineHealth | null>(null);
   const [brandFilter, setBrandFilter] = useState<string | null>(null);
+  const [myQueueOnly, setMyQueueOnly] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [bulkActionPending, setBulkActionPending] = useState(false);
+  const [focusedIndex, setFocusedIndex] = useState(0);
   const [expandedCampaignId, setExpandedCampaignId] = useState<number | null>(null);
   const [campaignDetail, setCampaignDetail] = useState<CampaignDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+
+  // Analyst workflow state: no auth in this system, so the analyst identity
+  // that goes on every disposition/assignment IS the audit trail — persisted
+  // locally so it's not retyped every action, but always explicit (never a
+  // silent server-side default; see api/main.py's DispositionRequest).
+  const [analystName, setAnalystName] = useState("");
+  const [dispositionNotes, setDispositionNotes] = useState("");
+  const [assigneeInput, setAssigneeInput] = useState("");
+  const [actionLoading, setActionLoading] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [provenance, setProvenance] = useState<DispositionProvenance | null>(null);
+  const [provenanceLoading, setProvenanceLoading] = useState(false);
+
+  // Watchlist ("bring your own brand") management state -- the no-CLI
+  // equivalent of editing config/watchlist_brands.json + `make seed-brands`.
+  const [watchlistBrands, setWatchlistBrands] = useState<WatchlistBrandRow[] | null>(null);
+  const [showInactiveBrands, setShowInactiveBrands] = useState(false);
+  const [newBrandName, setNewBrandName] = useState("");
+  const [newBrandAliases, setNewBrandAliases] = useState("");
+  const [newBrandPriority, setNewBrandPriority] = useState("100");
+  const [newBrandSelfDomains, setNewBrandSelfDomains] = useState("");
+  const [watchlistActionError, setWatchlistActionError] = useState<string | null>(null);
+  const [watchlistActionPending, setWatchlistActionPending] = useState(false);
+  const [editingBrandId, setEditingBrandId] = useState<number | null>(null);
+  const [editAliases, setEditAliases] = useState("");
+  const [editPriority, setEditPriority] = useState("");
+  const [editSelfDomains, setEditSelfDomains] = useState("");
+
+  const fetchWatchlist = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/watchlist`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.available) setWatchlistBrands(data.brands);
+      }
+    } catch (err) {
+      console.error("Watchlist fetch failed:", err);
+    }
+  };
+
+  useEffect(() => {
+    fetchWatchlist();
+  }, []);
+
+  const createWatchlistBrand = async () => {
+    if (!newBrandName.trim()) return;
+    setWatchlistActionPending(true);
+    setWatchlistActionError(null);
+    try {
+      const res = await fetch(`${API_BASE}/watchlist`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          brand_name: newBrandName.trim(),
+          aliases: newBrandAliases.split(",").map(a => a.trim()).filter(Boolean),
+          priority: parseInt(newBrandPriority, 10) || 100,
+          self_domains: newBrandSelfDomains.split(",").map(d => d.trim()).filter(Boolean),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setWatchlistActionError(data?.detail ? JSON.stringify(data.detail) : `Request failed (${res.status})`);
+        return;
+      }
+      setNewBrandName("");
+      setNewBrandAliases("");
+      setNewBrandPriority("100");
+      setNewBrandSelfDomains("");
+      await fetchWatchlist();
+    } catch (err) {
+      setWatchlistActionError("Create request failed — see console.");
+      console.error("Create watchlist brand failed:", err);
+    } finally {
+      setWatchlistActionPending(false);
+    }
+  };
+
+  const startEditingBrand = (b: WatchlistBrandRow) => {
+    setEditingBrandId(b.id);
+    setEditAliases(b.aliases.join(", "));
+    setEditPriority(String(b.priority));
+    setEditSelfDomains(b.self_domains.join(", "));
+    setWatchlistActionError(null);
+  };
+
+  const saveEditingBrand = async (id: number) => {
+    setWatchlistActionPending(true);
+    setWatchlistActionError(null);
+    try {
+      const res = await fetch(`${API_BASE}/watchlist/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          aliases: editAliases.split(",").map(a => a.trim()).filter(Boolean),
+          priority: parseInt(editPriority, 10) || 100,
+          self_domains: editSelfDomains.split(",").map(d => d.trim()).filter(Boolean),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setWatchlistActionError(data?.detail ? JSON.stringify(data.detail) : `Request failed (${res.status})`);
+        return;
+      }
+      setEditingBrandId(null);
+      await fetchWatchlist();
+    } catch (err) {
+      setWatchlistActionError("Update request failed — see console.");
+      console.error("Update watchlist brand failed:", err);
+    } finally {
+      setWatchlistActionPending(false);
+    }
+  };
+
+  const setBrandActive = async (id: number, active: boolean) => {
+    if (!active && !window.confirm("Deactivate this brand? It will stop being tracked as a campaign target.")) return;
+    setWatchlistActionPending(true);
+    setWatchlistActionError(null);
+    try {
+      const res = active
+        ? await fetch(`${API_BASE}/watchlist/${id}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ active: true }),
+          })
+        : await fetch(`${API_BASE}/watchlist/${id}`, { method: "DELETE" });
+      const data = await res.json();
+      if (!res.ok) {
+        setWatchlistActionError(data?.detail ? JSON.stringify(data.detail) : `Request failed (${res.status})`);
+        return;
+      }
+      await fetchWatchlist();
+    } catch (err) {
+      setWatchlistActionError("Request failed — see console.");
+      console.error("Set brand active failed:", err);
+    } finally {
+      setWatchlistActionPending(false);
+    }
+  };
+
+  useEffect(() => {
+    const saved = window.localStorage.getItem("phantomeye_analyst_name");
+    if (saved) setAnalystName(saved);
+  }, []);
+  useEffect(() => {
+    if (analystName) window.localStorage.setItem("phantomeye_analyst_name", analystName);
+  }, [analystName]);
 
   // Real-time Scanner State
   const [scanTarget, setScanTarget] = useState("");
@@ -280,6 +520,24 @@ export default function PhantomEyeAdvancedDashboard() {
     }
     fetchModelStatus();
 
+    // Proof/metrics panel data -- same "fetch once, doesn't need the 10s
+    // poll" reasoning as model status above.
+    async function fetchProofMetrics() {
+      try {
+        const [opsRes, leadRes, precRes] = await Promise.all([
+          fetch(`${API_BASE}/metrics/operations`),
+          fetch(`${API_BASE}/metrics/lead-time`),
+          fetch(`${API_BASE}/metrics/precision-at-k`),
+        ]);
+        if (opsRes.ok) setOperationsMetrics(await opsRes.json());
+        if (leadRes.ok) setLeadTimeMetrics(await leadRes.json());
+        if (precRes.ok) setPrecisionAtK(await precRes.json());
+      } catch (err) {
+        console.error("Proof metrics sync error:", err);
+      }
+    }
+    fetchProofMetrics();
+
     return () => clearInterval(interval);
   }, []);
 
@@ -309,24 +567,50 @@ export default function PhantomEyeAdvancedDashboard() {
 
   const filteredCampaigns = useMemo(() => {
     if (!campaigns) return null;
-    const filtered = brandFilter ? campaigns.filter(c => c.target_brand === brandFilter) : campaigns;
+    let filtered = brandFilter ? campaigns.filter(c => c.target_brand === brandFilter) : campaigns;
+    if (myQueueOnly && analystName.trim()) {
+      filtered = filtered.filter(c => c.assignee === analystName.trim());
+    }
     return [...filtered].sort((a, b) => (b.confidence_score ?? 0) - (a.confidence_score ?? 0));
-  }, [campaigns, brandFilter]);
+  }, [campaigns, brandFilter, myQueueOnly, analystName]);
+
+  const fetchProvenance = async (id: number) => {
+    setProvenanceLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/campaigns/${id}/disposition-provenance`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.available) setProvenance(data);
+      }
+    } catch (err) {
+      console.error("Provenance fetch failed:", err);
+    } finally {
+      setProvenanceLoading(false);
+    }
+  };
 
   const toggleCampaign = async (id: number) => {
     if (expandedCampaignId === id) {
       setExpandedCampaignId(null);
       setCampaignDetail(null);
+      setProvenance(null);
       return;
     }
     setExpandedCampaignId(id);
     setCampaignDetail(null);
+    setDispositionNotes("");
+    setAssigneeInput("");
+    setActionError(null);
+    setProvenance(null);
     setDetailLoading(true);
     try {
       const res = await fetch(`${API_BASE}/campaigns/${id}`);
       if (res.ok) {
         const data = await res.json();
-        if (data?.available) setCampaignDetail(data);
+        if (data?.available) {
+          setCampaignDetail(data);
+          setAssigneeInput(data.assignee ?? "");
+        }
       }
     } catch (err) {
       console.error("Campaign detail fetch failed:", err);
@@ -334,6 +618,159 @@ export default function PhantomEyeAdvancedDashboard() {
       setDetailLoading(false);
     }
   };
+
+  // Shared by disposition/assign: refresh both the open drawer and the
+  // background queue-list row so confidence/stage/queue_status/lock state
+  // stay in sync without waiting for the next 10s poll.
+  const refreshCampaign = async (id: number) => {
+    try {
+      const res = await fetch(`${API_BASE}/campaigns/${id}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      if (!data?.available) return;
+      setCampaignDetail(data);
+      setCampaigns(prev => prev ? prev.map(c => (c.campaign_id === id ? { ...c, ...data } : c)) : prev);
+    } catch (err) {
+      console.error("Campaign refresh failed:", err);
+    }
+  };
+
+  const submitDisposition = async (id: number, verdict: "confirmed" | "suppressed" | "benign") => {
+    if (!analystName.trim()) {
+      setActionError("Enter your analyst name first.");
+      return;
+    }
+    setActionLoading(true);
+    setActionError(null);
+    try {
+      const res = await fetch(`${API_BASE}/campaigns/${id}/disposition`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ verdict, analyst: analystName.trim(), notes: dispositionNotes || undefined }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setActionError(data?.detail ? JSON.stringify(data.detail) : `Request failed (${res.status})`);
+        return;
+      }
+      setDispositionNotes("");
+      await refreshCampaign(id);
+    } catch (err) {
+      setActionError("Disposition request failed — see console.");
+      console.error("Disposition failed:", err);
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  // Bulk disposition: N sequential-in-parallel POSTs (Promise.allSettled),
+  // not a dedicated bulk endpoint — apply_stage_transition() already
+  // row-locks per-cluster, so a "real" bulk endpoint would just loop
+  // server-side instead of client-side for no real gain at today's queue
+  // size. Partial failure is surfaced (not silently swallowed): if 3 of 5
+  // succeed, the analyst sees exactly which 2 didn't and can retry those.
+  const submitBulkDisposition = async (verdict: "confirmed" | "suppressed" | "benign") => {
+    if (!analystName.trim()) {
+      setActionError("Enter your analyst name first.");
+      return;
+    }
+    const ids = [...selectedIds];
+    if (ids.length === 0) return;
+    setBulkActionPending(true);
+    setActionError(null);
+    const results = await Promise.allSettled(
+      ids.map(async id => {
+        const res = await fetch(`${API_BASE}/campaigns/${id}/disposition`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ verdict, analyst: analystName.trim() }),
+        });
+        if (!res.ok) throw new Error(`campaign ${id}: ${res.status}`);
+        return id;
+      })
+    );
+    const failedIds = results
+      .map((r, i) => (r.status === "rejected" ? ids[i] : null))
+      .filter((id): id is number => id !== null);
+    await Promise.all(ids.filter(id => !failedIds.includes(id)).map(refreshCampaign));
+    if (failedIds.length > 0) {
+      setActionError(`${failedIds.length} of ${ids.length} failed (campaign IDs: ${failedIds.join(", ")}) — still selected, retry or investigate.`);
+      setSelectedIds(new Set(failedIds));
+    } else {
+      setSelectedIds(new Set());
+    }
+    setBulkActionPending(false);
+  };
+
+  const toggleSelected = (id: number) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const submitAssign = async (id: number) => {
+    if (!assigneeInput.trim()) return;
+    setActionLoading(true);
+    setActionError(null);
+    try {
+      const res = await fetch(`${API_BASE}/campaigns/${id}/assign`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ assignee: assigneeInput.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setActionError(data?.detail ? JSON.stringify(data.detail) : `Request failed (${res.status})`);
+        return;
+      }
+      await refreshCampaign(id);
+    } catch (err) {
+      setActionError("Assign request failed — see console.");
+      console.error("Assign failed:", err);
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  // Keep the keyboard-focused row in range as the filtered set changes size
+  // (e.g. switching brand filters) so it never points past the end.
+  useEffect(() => {
+    if (!filteredCampaigns) return;
+    setFocusedIndex(prev => Math.min(Math.max(prev, 0), Math.max(filteredCampaigns.length - 1, 0)));
+  }, [filteredCampaigns]);
+
+  // Keyboard shortcuts: j/k walk the queue, c/s confirm/suppress whichever
+  // row is focused. Suppressed while typing in any form field (analyst name,
+  // notes, scanner input, etc.) so shortcut letters can still be typed there.
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || target?.isContentEditable) return;
+      if (!filteredCampaigns || filteredCampaigns.length === 0) return;
+
+      if (e.key === "j" || e.key === "k") {
+        e.preventDefault();
+        setFocusedIndex(prev => {
+          const clamped = Math.min(Math.max(prev, 0), filteredCampaigns.length - 1);
+          const next = e.key === "j" ? Math.min(clamped + 1, filteredCampaigns.length - 1) : Math.max(clamped - 1, 0);
+          const id = filteredCampaigns[next]?.campaign_id;
+          if (id != null) {
+            document.getElementById(`campaign-row-${id}`)?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+          }
+          return next;
+        });
+      } else if (e.key === "c" || e.key === "s") {
+        const idx = Math.min(Math.max(focusedIndex, 0), filteredCampaigns.length - 1);
+        const id = filteredCampaigns[idx]?.campaign_id;
+        if (id != null) submitDisposition(id, e.key === "c" ? "confirmed" : "suppressed");
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [filteredCampaigns, focusedIndex, submitDisposition]);
 
   if (!mounted) return <div className="bg-[#050505] min-h-screen" />;
 
@@ -366,8 +803,6 @@ export default function PhantomEyeAdvancedDashboard() {
         </motion.div>
 
         <div className="absolute top-10 left-10 flex flex-col gap-2 text-[10px] text-white/10 uppercase italic font-black">
-          <span>STATION_ID: MORDOR_ALPHA_01</span>
-          <span>UPLINK_STRENGTH: 98.4%</span>
           <span>VERSION: 2.9.1_PRO_ANALYST</span>
         </div>
       </section>
@@ -376,7 +811,7 @@ export default function PhantomEyeAdvancedDashboard() {
       <section className="max-w-[1600px] mx-auto p-12 mt-20">
         <SectionHeader
           title="Campaign Queue"
-          subtitle="Clustered, brand-attributed infrastructure ranked by confidence — not a flat domain list. Add a brand via `make seed-brands` to bring your own coverage."
+          subtitle={`Clustered, brand-attributed infrastructure ranked by confidence. Tracking ${stats?.watchlist_brand_count ?? "—"} brand${stats?.watchlist_brand_count === 1 ? "" : "s"} today — add more via \`make seed-brands\`.`}
           icon={Target}
         />
 
@@ -396,6 +831,15 @@ export default function PhantomEyeAdvancedDashboard() {
               )}
             </>
           )}
+          <span className="flex items-center gap-2 ml-auto normal-case">
+            <span className="text-white/20">analyst:</span>
+            <input
+              value={analystName}
+              onChange={e => setAnalystName(e.target.value)}
+              placeholder="your name"
+              className="bg-white/5 border border-white/10 px-2 py-1 text-white/70 text-[10px] w-32 focus:outline-none focus:border-tactical-red/50"
+            />
+          </span>
         </div>
 
         {/* Brand filter — derived from campaigns actually in the queue, not hardcoded */}
@@ -417,6 +861,57 @@ export default function PhantomEyeAdvancedDashboard() {
                 {brand} ({campaigns?.filter(c => c.target_brand === brand).length ?? 0})
               </button>
             ))}
+            <button
+              onClick={() => setMyQueueOnly(v => !v)}
+              disabled={!analystName.trim()}
+              title={!analystName.trim() ? "Enter your analyst name above to use this filter" : undefined}
+              className={`px-3 py-1.5 text-[10px] uppercase font-black tracking-widest border transition-colors disabled:opacity-30 disabled:cursor-not-allowed ${myQueueOnly ? "border-cyan-400 text-cyan-400 bg-cyan-400/10" : "border-white/10 text-white/40 hover:text-white/70"}`}
+            >
+              My Queue ({analystName.trim() ? (campaigns?.filter(c => c.assignee === analystName.trim()).length ?? 0) : 0})
+            </button>
+            <span className="ml-auto text-[9px] uppercase font-black tracking-widest text-white/15 normal-case">
+              <kbd className="text-white/30">j</kbd>/<kbd className="text-white/30">k</kbd> navigate · <kbd className="text-white/30">c</kbd> confirm · <kbd className="text-white/30">s</kbd> suppress
+            </span>
+          </div>
+        )}
+
+        {/* Bulk action bar — appears once anything is selected. Sequential
+            client-side POSTs (see submitBulkDisposition), not a bulk
+            endpoint. */}
+        {selectedIds.size > 0 && (
+          <div className="mb-4 p-4 border border-cyan-400/30 bg-cyan-400/5 flex flex-wrap items-center gap-4">
+            <span className="text-[10px] uppercase font-black tracking-widest text-cyan-400">
+              {selectedIds.size} selected
+            </span>
+            <div className="flex gap-3">
+              <button
+                disabled={bulkActionPending}
+                onClick={() => submitBulkDisposition("confirmed")}
+                className="px-4 py-2 text-[10px] uppercase font-black tracking-widest border border-tactical-red/40 text-tactical-red hover:bg-tactical-red/10 transition-colors disabled:opacity-30"
+              >
+                Confirm All
+              </button>
+              <button
+                disabled={bulkActionPending}
+                onClick={() => submitBulkDisposition("suppressed")}
+                className="px-4 py-2 text-[10px] uppercase font-black tracking-widest border border-white/10 text-white/50 hover:bg-white/5 transition-colors disabled:opacity-30"
+              >
+                Suppress All
+              </button>
+              <button
+                disabled={bulkActionPending}
+                onClick={() => submitBulkDisposition("benign")}
+                className="px-4 py-2 text-[10px] uppercase font-black tracking-widest border border-white/10 text-white/50 hover:bg-white/5 transition-colors disabled:opacity-30"
+              >
+                Mark Benign All
+              </button>
+            </div>
+            <button
+              onClick={() => setSelectedIds(new Set())}
+              className="ml-auto text-[10px] uppercase font-black tracking-widest text-white/30 hover:text-white/60"
+            >
+              Clear selection
+            </button>
           </div>
         )}
 
@@ -432,15 +927,36 @@ export default function PhantomEyeAdvancedDashboard() {
           </div>
         ) : (
           <div className="flex flex-col gap-4">
-            {filteredCampaigns?.map(c => (
-              <div key={c.campaign_id} className="tactical-border bg-[#080808]/50 backdrop-blur-xl">
+            {filteredCampaigns?.map((c, i) => (
+              <div
+                key={c.campaign_id}
+                id={`campaign-row-${c.campaign_id}`}
+                className={`tactical-border bg-[#080808]/50 backdrop-blur-xl flex items-stretch ${selectedIds.has(c.campaign_id) ? "ring-1 ring-cyan-400/40" : ""} ${i === focusedIndex ? "outline outline-2 outline-amber-400/60 outline-offset-[-2px]" : ""}`}
+              >
+                <label className="flex items-center px-4 cursor-pointer border-r border-white/5 hover:bg-white/[0.03]">
+                  <input
+                    type="checkbox"
+                    checked={selectedIds.has(c.campaign_id)}
+                    onChange={() => toggleSelected(c.campaign_id)}
+                    onClick={e => e.stopPropagation()}
+                    className="w-4 h-4 accent-cyan-400 cursor-pointer"
+                  />
+                </label>
                 <button
                   onClick={() => toggleCampaign(c.campaign_id)}
-                  className="w-full flex items-center gap-6 p-5 text-left hover:bg-white/[0.03] transition-colors"
+                  className="flex-1 flex items-center gap-6 p-5 text-left hover:bg-white/[0.03] transition-colors min-w-0"
                 >
-                  <div className="flex flex-col items-center justify-center w-20 shrink-0">
+                  <div
+                    className="flex flex-col items-center justify-center w-20 shrink-0"
+                    title={(() => {
+                      const d = decomposeConfidence(c.confidence_score, c.member_count);
+                      if (!d) return undefined;
+                      return `${d.clamped ? "risk >= " : "risk = "}${(d.maxRisk * 100).toFixed(0)}% `
+                        + `x corroboration ${(d.corroboration * 100).toFixed(0)}% (${c.member_count} member${c.member_count === 1 ? "" : "s"})`;
+                    })()}
+                  >
                     <span className="text-2xl font-black text-tactical-red text-glow-red">
-                      {c.confidence_score != null ? `${Math.round(c.confidence_score * 100)}%` : "--"}
+                      {c.confidence_score != null ? `${Math.min(99, Math.round(c.confidence_score * 100))}%` : "--"}
                     </span>
                     <span className="text-[8px] text-white/20 uppercase font-black tracking-widest">confidence</span>
                   </div>
@@ -448,6 +964,14 @@ export default function PhantomEyeAdvancedDashboard() {
                     <div className="flex items-center gap-3 mb-1">
                       <span className="text-lg font-black uppercase tracking-widest italic">{c.target_brand ?? "unattributed"}</span>
                       <span className={`px-2 py-0.5 text-[9px] uppercase font-black tracking-widest ${STAGE_COLORS[c.stage] ?? "text-white/40 bg-white/5"}`}>{c.stage}</span>
+                      {c.stage_locked_by && (
+                        <span className="flex items-center gap-1 text-[9px] uppercase font-black tracking-widest text-white/30">
+                          <Lock className="w-3 h-3" /> {c.stage_locked_by}
+                        </span>
+                      )}
+                      {c.assignee && (
+                        <span className="text-[9px] uppercase font-black tracking-widest text-cyan-400/70">→ {c.assignee}</span>
+                      )}
                     </div>
                     <p className="text-[11px] text-white/40 font-bold uppercase tracking-wide truncate">{c.summary_reason ?? "no summary available"}</p>
                   </div>
@@ -497,12 +1021,296 @@ export default function PhantomEyeAdvancedDashboard() {
                         ) : (
                           <div className="opacity-20 italic text-[10px] uppercase font-black tracking-widest py-8 text-center">EVIDENCE_UNAVAILABLE</div>
                         )}
+
+                        {/* Analyst actions — disposition + assignment. Disabled
+                            once locked by a disposition until a new verdict is
+                            recorded (product/stage_engine.py never auto-clears
+                            a lock; only a fresh disposition call here can). */}
+                        {campaignDetail && campaignDetail.campaign_id === c.campaign_id && (
+                          <div className="mt-6 pt-5 border-t border-white/10 flex flex-col gap-4">
+                            <div className="flex items-center justify-between">
+                              <span className="text-[9px] uppercase font-black tracking-widest text-white/30">Analyst Actions</span>
+                              {c.stage_locked_by && (
+                                <span className="text-[9px] uppercase font-black tracking-widest text-white/30 flex items-center gap-1">
+                                  <Lock className="w-3 h-3" /> locked by {c.stage_locked_by}
+                                  {c.stage_locked_at ? ` · ${new Date(c.stage_locked_at).toISOString().slice(0, 16).replace("T", " ")}Z` : ""}
+                                </span>
+                              )}
+                            </div>
+
+                            {/* Disposition → retrain provenance: does the analyst's
+                                verdict on this campaign show up as training signal
+                                for a later model? Lazily fetched (not every campaign
+                                has a disposition, so no reason to call this on every
+                                expand). */}
+                            {c.stage_locked_by && (
+                              <div className="text-[10px]">
+                                {!provenance && !provenanceLoading && (
+                                  <button
+                                    onClick={() => fetchProvenance(c.campaign_id)}
+                                    className="uppercase font-black tracking-widest text-cyan-400/70 hover:text-cyan-400 transition-colors"
+                                  >
+                                    → Did this disposition retrain the model?
+                                  </button>
+                                )}
+                                {provenanceLoading && (
+                                  <span className="uppercase font-black tracking-widest text-white/20 italic">checking...</span>
+                                )}
+                                {provenance && provenance.has_disposition && (
+                                  <div className="p-3 bg-white/5 border border-white/10 flex flex-col gap-1 text-white/50 not-italic normal-case tracking-normal">
+                                    <span>
+                                      Disposition <span className="text-white/80 font-black">{provenance.disposition!.verdict}</span> by{" "}
+                                      {provenance.disposition!.analyst} on{" "}
+                                      {new Date(provenance.disposition!.created_at).toISOString().slice(0, 10)}
+                                    </span>
+                                    {provenance.eligible_training_run ? (
+                                      <span>
+                                        Earliest eligible retrain:{" "}
+                                        {new Date(provenance.eligible_training_run.created_utc).toISOString().slice(0, 10)}
+                                        {" "}({provenance.eligible_training_run.n_pos ?? "?"} pos / {provenance.eligible_training_run.n_neg ?? "?"} neg,{" "}
+                                        {provenance.eligible_training_run.promoted ? "promoted" : "not promoted"})
+                                      </span>
+                                    ) : (
+                                      <span className="text-white/30">No training run has occurred since this disposition yet.</span>
+                                    )}
+                                    <span className="text-white/20 italic">{provenance.note}</span>
+                                  </div>
+                                )}
+                              </div>
+                            )}
+
+                            <textarea
+                              value={dispositionNotes}
+                              onChange={e => setDispositionNotes(e.target.value)}
+                              placeholder="notes for this disposition (optional)..."
+                              rows={2}
+                              className="w-full bg-white/5 border border-white/10 px-3 py-2 text-[11px] text-white/70 focus:outline-none focus:border-tactical-red/50 resize-none"
+                            />
+
+                            <div className="flex flex-wrap gap-3">
+                              <button
+                                disabled={actionLoading}
+                                onClick={() => submitDisposition(c.campaign_id, "confirmed")}
+                                className="px-4 py-2 text-[10px] uppercase font-black tracking-widest border border-tactical-red/40 text-tactical-red hover:bg-tactical-red/10 transition-colors disabled:opacity-30"
+                              >
+                                Confirm
+                              </button>
+                              <button
+                                disabled={actionLoading}
+                                onClick={() => submitDisposition(c.campaign_id, "suppressed")}
+                                className="px-4 py-2 text-[10px] uppercase font-black tracking-widest border border-white/10 text-white/50 hover:bg-white/5 transition-colors disabled:opacity-30"
+                              >
+                                Suppress
+                              </button>
+                              <button
+                                disabled={actionLoading}
+                                onClick={() => submitDisposition(c.campaign_id, "benign")}
+                                className="px-4 py-2 text-[10px] uppercase font-black tracking-widest border border-white/10 text-white/50 hover:bg-white/5 transition-colors disabled:opacity-30"
+                              >
+                                Mark Benign
+                              </button>
+
+                              <div className="flex items-center gap-2 ml-auto">
+                                <input
+                                  value={assigneeInput}
+                                  onChange={e => setAssigneeInput(e.target.value)}
+                                  placeholder="assignee"
+                                  className="bg-white/5 border border-white/10 px-2 py-2 text-[10px] text-white/70 w-28 focus:outline-none focus:border-tactical-red/50"
+                                />
+                                <button
+                                  disabled={actionLoading}
+                                  onClick={() => submitAssign(c.campaign_id)}
+                                  className="px-3 py-2 text-[10px] uppercase font-black tracking-widest border border-cyan-400/30 text-cyan-400 hover:bg-cyan-400/10 transition-colors disabled:opacity-30"
+                                >
+                                  Assign
+                                </button>
+                              </div>
+                            </div>
+
+                            {actionError && (
+                              <p className="text-[10px] uppercase font-black tracking-widest text-tactical-red">{actionError}</p>
+                            )}
+                          </div>
+                        )}
                       </div>
                     </motion.div>
                   )}
                 </AnimatePresence>
               </div>
             ))}
+          </div>
+        )}
+      </section>
+
+      {/* --- 0.5. WATCHLIST (bring-your-own-brand management) --- */}
+      <section className="max-w-[1600px] mx-auto p-12 mt-20">
+        <SectionHeader
+          title="Watchlist"
+          subtitle="Brands tracked as campaign targets. Add a brand, edit priority/aliases, or manage self-owned domains (false-positive exoneration) — no CLI or JSON editing required."
+          icon={Layers}
+        />
+
+        {watchlistActionError && (
+          <div className="mb-4 p-3 border border-tactical-red/40 bg-tactical-red/5 text-[10px] text-tactical-red uppercase font-bold tracking-widest">
+            {watchlistActionError}
+          </div>
+        )}
+
+        <div className="tactical-border bg-[#080808]/50 backdrop-blur-xl p-5 mb-6">
+          <div className="text-[10px] uppercase font-black tracking-widest text-white/40 mb-3">Add a brand</div>
+          <div className="flex flex-wrap gap-3 items-end">
+            <div className="flex flex-col gap-1">
+              <label className="text-[9px] uppercase font-black tracking-widest text-white/30">Brand name</label>
+              <input
+                value={newBrandName}
+                onChange={e => setNewBrandName(e.target.value)}
+                placeholder="e.g. shopify"
+                className="bg-white/5 border border-white/10 px-2 py-1.5 text-white/70 text-[11px] w-40 focus:outline-none focus:border-tactical-red/50"
+              />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-[9px] uppercase font-black tracking-widest text-white/30">Aliases (comma-sep)</label>
+              <input
+                value={newBrandAliases}
+                onChange={e => setNewBrandAliases(e.target.value)}
+                placeholder="e.g. shopify-support"
+                className="bg-white/5 border border-white/10 px-2 py-1.5 text-white/70 text-[11px] w-52 focus:outline-none focus:border-tactical-red/50"
+              />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-[9px] uppercase font-black tracking-widest text-white/30">Priority</label>
+              <input
+                type="number"
+                value={newBrandPriority}
+                onChange={e => setNewBrandPriority(e.target.value)}
+                className="bg-white/5 border border-white/10 px-2 py-1.5 text-white/70 text-[11px] w-20 focus:outline-none focus:border-tactical-red/50"
+              />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-[9px] uppercase font-black tracking-widest text-white/30">Self-owned domains (comma-sep)</label>
+              <input
+                value={newBrandSelfDomains}
+                onChange={e => setNewBrandSelfDomains(e.target.value)}
+                placeholder="e.g. shopify.com,shopifycdn.com"
+                className="bg-white/5 border border-white/10 px-2 py-1.5 text-white/70 text-[11px] w-64 focus:outline-none focus:border-tactical-red/50"
+              />
+            </div>
+            <button
+              disabled={watchlistActionPending || !newBrandName.trim()}
+              onClick={createWatchlistBrand}
+              className="px-4 py-2 text-[10px] uppercase font-black tracking-widest border border-tactical-red/40 text-tactical-red hover:bg-tactical-red/10 transition-colors disabled:opacity-30"
+            >
+              Add brand
+            </button>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-3 mb-4">
+          <button
+            onClick={() => setShowInactiveBrands(v => !v)}
+            className={`px-3 py-1.5 text-[10px] uppercase font-black tracking-widest border transition-colors ${showInactiveBrands ? "border-cyan-400 text-cyan-400 bg-cyan-400/10" : "border-white/10 text-white/40 hover:text-white/70"}`}
+          >
+            {showInactiveBrands ? "Showing inactive" : "Show inactive"}
+          </button>
+        </div>
+
+        {watchlistBrands === null ? (
+          <div className="h-[100px] flex items-center justify-center opacity-20 italic text-[10px] uppercase font-black tracking-widest border border-white/10">
+            SYNCING_WATCHLIST...
+          </div>
+        ) : (
+          <div className="flex flex-col gap-3">
+            {watchlistBrands.filter(b => showInactiveBrands || b.active).map(b => (
+              <div key={b.id} className={`tactical-border bg-[#080808]/50 backdrop-blur-xl p-5 ${!b.active ? "opacity-40" : ""}`}>
+                {editingBrandId === b.id ? (
+                  <div className="flex flex-col gap-3">
+                    <div className="flex items-center gap-3">
+                      <span className="text-lg font-black uppercase tracking-widest italic">{b.brand_name}</span>
+                      <span className="text-[9px] uppercase font-black tracking-widest text-white/30">editing</span>
+                    </div>
+                    <div className="flex flex-wrap gap-3 items-end">
+                      <div className="flex flex-col gap-1">
+                        <label className="text-[9px] uppercase font-black tracking-widest text-white/30">Aliases</label>
+                        <input
+                          value={editAliases}
+                          onChange={e => setEditAliases(e.target.value)}
+                          className="bg-white/5 border border-white/10 px-2 py-1.5 text-white/70 text-[11px] w-52 focus:outline-none focus:border-tactical-red/50"
+                        />
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <label className="text-[9px] uppercase font-black tracking-widest text-white/30">Priority</label>
+                        <input
+                          type="number"
+                          value={editPriority}
+                          onChange={e => setEditPriority(e.target.value)}
+                          className="bg-white/5 border border-white/10 px-2 py-1.5 text-white/70 text-[11px] w-20 focus:outline-none focus:border-tactical-red/50"
+                        />
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <label className="text-[9px] uppercase font-black tracking-widest text-white/30">Self-owned domains</label>
+                        <input
+                          value={editSelfDomains}
+                          onChange={e => setEditSelfDomains(e.target.value)}
+                          className="bg-white/5 border border-white/10 px-2 py-1.5 text-white/70 text-[11px] w-64 focus:outline-none focus:border-tactical-red/50"
+                        />
+                      </div>
+                      <button
+                        disabled={watchlistActionPending}
+                        onClick={() => saveEditingBrand(b.id)}
+                        className="px-4 py-2 text-[10px] uppercase font-black tracking-widest border border-tactical-red/40 text-tactical-red hover:bg-tactical-red/10 transition-colors disabled:opacity-30"
+                      >
+                        Save
+                      </button>
+                      <button
+                        onClick={() => setEditingBrandId(null)}
+                        className="px-4 py-2 text-[10px] uppercase font-black tracking-widest border border-white/10 text-white/50 hover:bg-white/5 transition-colors"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-6">
+                    <div className="flex flex-col items-center justify-center w-16 shrink-0">
+                      <span className="text-xl font-black text-tactical-red text-glow-red">{b.priority}</span>
+                      <span className="text-[8px] text-white/20 uppercase font-black tracking-widest">priority</span>
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-3 mb-1">
+                        <span className="text-lg font-black uppercase tracking-widest italic">{b.brand_name}</span>
+                        {!b.active && (
+                          <span className="px-2 py-0.5 text-[9px] uppercase font-black tracking-widest text-white/40 bg-white/5">inactive</span>
+                        )}
+                      </div>
+                      <p className="text-[10px] text-white/40 font-bold uppercase tracking-wide truncate">
+                        {b.aliases.length > 0 ? `aliases: ${b.aliases.join(", ")}` : "no aliases"}
+                        {b.self_domains.length > 0 ? ` · self-owned: ${b.self_domains.join(", ")}` : ""}
+                      </p>
+                    </div>
+                    <div className="flex gap-2 shrink-0">
+                      <button
+                        onClick={() => startEditingBrand(b)}
+                        className="px-3 py-1.5 text-[10px] uppercase font-black tracking-widest border border-white/10 text-white/50 hover:bg-white/5 transition-colors"
+                      >
+                        Edit
+                      </button>
+                      <button
+                        disabled={watchlistActionPending}
+                        onClick={() => setBrandActive(b.id, !b.active)}
+                        className="px-3 py-1.5 text-[10px] uppercase font-black tracking-widest border border-white/10 text-white/50 hover:bg-white/5 transition-colors disabled:opacity-30"
+                      >
+                        {b.active ? "Deactivate" : "Reactivate"}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            ))}
+            {watchlistBrands.filter(b => showInactiveBrands || b.active).length === 0 && (
+              <div className="h-[100px] flex items-center justify-center opacity-40 italic text-[10px] uppercase font-black tracking-widest border border-white/10">
+                NO BRANDS TRACKED YET
+              </div>
+            )}
           </div>
         )}
       </section>
@@ -528,13 +1336,19 @@ export default function PhantomEyeAdvancedDashboard() {
               </div>
             </div>
 
-            <div className="absolute inset-x-0 bottom-4 px-8 text-[9px] text-white/30 italic flex justify-between z-20 pointer-events-none">
-              <span>PROJECTION: ORBITAL_HOLOGRAPHY</span>
+            <div className="absolute inset-x-0 bottom-4 px-8 text-[9px] text-white/30 italic flex justify-end z-20 pointer-events-none">
               <span>STREAM_ID: HV_TRIAGE_B1000</span>
             </div>
 
             <div className="w-full h-full p-4 relative">
-              {stats ? (
+              {!SHOW_GEO_PANELS ? (
+                <div className="w-full h-full flex flex-col items-center justify-center gap-4 opacity-30 px-6">
+                  <Globe className="w-16 h-16" />
+                  <span className="text-[10px] tracking-[0.2em] font-black italic text-center break-words">
+                    GEO ENRICHMENT DISABLED PENDING PIPELINE FIX — 0% OF OBSERVATIONS CURRENTLY RESOLVE A COUNTRY
+                  </span>
+                </div>
+              ) : stats ? (
                 <>
                   <TacticalGlobe data={stats.map_data} />
                   {stats.map_data.length === 0 && (
@@ -559,24 +1373,24 @@ export default function PhantomEyeAdvancedDashboard() {
               <div className="grid grid-cols-1 gap-6 pt-4">
                 <div className="flex flex-col gap-2">
                   <span className="text-[11px] font-black text-white/20 tracking-widest">NOISE_REJECTION_RATE</span>
-                  <span className="text-6xl font-black italic text-cyan-400 tabular-nums leading-none tracking-tighter">{(100 - (stats?.signal_to_noise || 0.001)).toFixed(3)}%</span>
+                  <span className="text-6xl font-black italic text-cyan-400 tabular-nums leading-none tracking-tighter">{stats?.signal_to_noise != null ? (100 - stats.signal_to_noise).toFixed(3) : "--"}%</span>
                   <span className="text-[9px] text-white/10 font-bold uppercase italic mt-1 font-mono">Filtered from {stats?.total_parsed != null ? stats.total_parsed.toLocaleString() : "--"} domains in latest scan batch</span>
                 </div>
                 <div className="h-px bg-white/10 w-full" />
                 <div className="grid grid-cols-2 gap-6">
                   <div className="flex flex-col">
-                    <span className="text-[10px] text-white/40 font-bold mb-1">CRITICAL ( {'>'} 0.99)</span>
-                    <span className="text-2xl font-black text-tactical-red italic tabular-nums">{stats?.critical || "---"}</span>
+                    <span className="text-[10px] text-white/40 font-bold mb-1">CRITICAL ( {'>'} 0.98)</span>
+                    <span className="text-2xl font-black text-tactical-red italic tabular-nums">{stats?.critical != null ? stats.critical : "---"}</span>
                   </div>
                   <div className="flex flex-col text-right">
                     <span className="text-[10px] text-white/40 font-bold mb-1">HIGH ( {'>'} 0.90)</span>
-                    <span className="text-2xl font-black text-white italic tabular-nums">{stats?.high_risk || "---"}</span>
+                    <span className="text-2xl font-black text-white italic tabular-nums">{stats?.high_risk != null ? stats.high_risk : "---"}</span>
                   </div>
                 </div>
               </div>
             </TacticalCard>
 
-            <TacticalCard title="Intelligence Stream" className="flex-1 overflow-hidden min-h-0" status="STREAMING">
+            <TacticalCard title="Raw Signal (unclustered)" subTitle="Freshest high-risk hits, before the next cluster-assembly pass" className="flex-1 overflow-hidden min-h-0" status="STREAMING">
               <div className="flex-1 overflow-y-auto pr-4 space-y-3 scrollbar-custom min-h-0">
                 {threats.slice(0, 50).map((t, i) => (
                   <div key={t.registered_domain + i} className="p-3 bg-white/5 border border-white/5 flex justify-between items-center group hover:bg-white/10 transition-all cursor-crosshair">
@@ -633,7 +1447,12 @@ export default function PhantomEyeAdvancedDashboard() {
           <div className="col-span-4">
             <TacticalCard title="Network Origin Reputation" subTitle="High-Correlation mal-hosting" status="SUSPICIOUS">
               <div className="flex flex-col gap-4 mt-4 h-[350px] overflow-y-auto pr-2 scrollbar-custom">
-                {!stats ? (
+                {!SHOW_GEO_PANELS ? (
+                  <div className="h-full flex flex-col items-center justify-center gap-2 opacity-30 italic text-center px-4">
+                    <span className="text-[10px] break-words leading-relaxed">DISABLED PENDING PIPELINE FIX</span>
+                    <span className="text-[9px] not-italic tracking-widest opacity-70 break-words leading-relaxed">sample_isp is unpopulated across the current dataset, not just this batch</span>
+                  </div>
+                ) : !stats ? (
                   <div className="h-full flex items-center justify-center opacity-20 italic">SYNC_ISP_REPUTATION...</div>
                 ) : stats.isp_reputation.length === 0 ? (
                   <div className="h-full flex flex-col items-center justify-center gap-2 opacity-30 italic text-center px-4">
@@ -726,11 +1545,123 @@ export default function PhantomEyeAdvancedDashboard() {
         </div>
       </section>
 
+      {/* --- ANALYST METRICS & PROOF (Track D) --- */}
+      <section className="max-w-[1600px] mx-auto p-12 mt-40 pt-32 border-t border-white/5">
+        <SectionHeader
+          title="Metrics & Proof"
+          subtitle="Real measurements, not marketing claims — precision, lead-time, analyst throughput, and enrichment coverage, each with its own honesty check for small/zero sample sizes."
+          icon={BarChart3}
+        />
+        <div className="grid grid-cols-12 gap-10">
+          <div className="col-span-3">
+            <TacticalCard title="Precision @ K" subTitle="vs. ti_misp_hit (independent ground truth)" status="ML_PROOF">
+              {!precisionAtK ? (
+                <div className="h-[200px] flex items-center justify-center opacity-20 italic text-[10px] uppercase font-black tracking-widest">SYNC_PRECISION...</div>
+              ) : !precisionAtK.available ? (
+                <div className="h-[200px] flex items-center justify-center opacity-30 italic text-center px-4 text-[10px] uppercase font-black tracking-widest break-words">{precisionAtK.reason ?? "NOT YET MEASURED"}</div>
+              ) : (
+                <div className="space-y-3 pt-2">
+                  {precisionAtK.precision_at_k?.map(p => (
+                    <div key={p.k} className="flex items-center justify-between p-2 bg-white/5 border border-white/10">
+                      <span className="text-[10px] uppercase font-black tracking-widest text-white/50">P@{p.k}</span>
+                      <span className="text-sm font-black text-tactical-red">{p.precision != null ? `${(p.precision * 100).toFixed(0)}%` : "--"}</span>
+                    </div>
+                  ))}
+                  {precisionAtK.n_misp_hits_total === 0 && (
+                    <p className="text-[9px] text-white/30 italic leading-relaxed pt-1">{precisionAtK.confidence_note}</p>
+                  )}
+                </div>
+              )}
+            </TacticalCard>
+          </div>
+
+          <div className="col-span-3">
+            <TacticalCard title="Lead-Time Breakdown" subTitle="CT ahead of public blocklists" status="DETECTION">
+              {!leadTimeMetrics ? (
+                <div className="h-[200px] flex items-center justify-center opacity-20 italic text-[10px] uppercase font-black tracking-widest">SYNC_LEAD_TIME...</div>
+              ) : !leadTimeMetrics.available ? (
+                <div className="h-[200px] flex items-center justify-center opacity-30 italic text-center px-4 text-[10px] uppercase font-black tracking-widest break-words">{leadTimeMetrics.reason ?? "NOT YET MEASURED"}</div>
+              ) : (
+                <div className="space-y-3 pt-2 text-[10px]">
+                  <div className="flex justify-between p-2 bg-white/5 border border-white/10">
+                    <span className="uppercase font-black tracking-widest text-white/50">Exact hostname</span>
+                    <span className="font-black text-cyan-400">{leadTimeMetrics.n_matched_exact_hostname ?? 0}</span>
+                  </div>
+                  <div className="flex justify-between p-2 bg-white/5 border border-white/10">
+                    <span className="uppercase font-black tracking-widest text-white/50">Apex-only</span>
+                    <span className="font-black text-white/60">{leadTimeMetrics.n_matched_registered_domain_only ?? 0}</span>
+                  </div>
+                  <div className="flex justify-between p-2 bg-white/5 border border-white/10">
+                    <span className="uppercase font-black tracking-widest text-white/50">Median lead (ahead)</span>
+                    <span className="font-black text-tactical-red">{leadTimeMetrics.median_lead_time_hours_when_ahead != null ? `${leadTimeMetrics.median_lead_time_hours_when_ahead.toFixed(1)}h` : "--"}</span>
+                  </div>
+                  <p className="text-[9px] text-white/30 italic leading-relaxed pt-1">{leadTimeMetrics.confidence_note}</p>
+                </div>
+              )}
+            </TacticalCard>
+          </div>
+
+          <div className="col-span-3">
+            <TacticalCard title="Analyst Throughput" subTitle="Confirmation rate & review speed" status="WORKFLOW">
+              {!operationsMetrics ? (
+                <div className="h-[200px] flex items-center justify-center opacity-20 italic text-[10px] uppercase font-black tracking-widest">SYNC_METRICS...</div>
+              ) : !operationsMetrics.available ? (
+                <div className="h-[200px] flex items-center justify-center opacity-30 italic text-center px-4 text-[10px] uppercase font-black tracking-widest break-words">{operationsMetrics.reason ?? "PRODUCT DB UNAVAILABLE"}</div>
+              ) : (
+                <div className="space-y-3 pt-2 text-[10px]">
+                  <div className="flex justify-between p-2 bg-white/5 border border-white/10">
+                    <span className="uppercase font-black tracking-widest text-white/50">Confirmation rate</span>
+                    <span className="font-black text-cyan-400">
+                      {operationsMetrics.analyst_confirmation?.rate != null ? `${(operationsMetrics.analyst_confirmation.rate * 100).toFixed(0)}%` : "n/a"}
+                      <span className="text-white/30 font-bold"> ({operationsMetrics.analyst_confirmation?.n_dispositions ?? 0})</span>
+                    </span>
+                  </div>
+                  <div className="flex justify-between p-2 bg-white/5 border border-white/10">
+                    <span className="uppercase font-black tracking-widest text-white/50">Median time to review</span>
+                    <span className="font-black text-white/60">{operationsMetrics.median_time_to_first_review?.median_hours != null ? `${operationsMetrics.median_time_to_first_review.median_hours.toFixed(1)}h` : "n/a"}</span>
+                  </div>
+                  <div className="flex justify-between p-2 bg-white/5 border border-white/10">
+                    <span className="uppercase font-black tracking-widest text-white/50">Suppression rate</span>
+                    <span className="font-black text-white/60">{operationsMetrics.suppression?.rate != null ? `${(operationsMetrics.suppression.rate * 100).toFixed(0)}%` : "n/a"}</span>
+                  </div>
+                  <div className="flex justify-between p-2 bg-white/5 border border-white/10">
+                    <span className="uppercase font-black tracking-widest text-white/50">Campaigns/day</span>
+                    <span className="font-black text-white/60">{operationsMetrics.campaigns_created?.per_day ?? "n/a"}</span>
+                  </div>
+                </div>
+              )}
+            </TacticalCard>
+          </div>
+
+          <div className="col-span-3">
+            <TacticalCard title="Enrichment Coverage" subTitle="Pipeline depth, not analyst workflow" status="PIPELINE">
+              {!operationsMetrics ? (
+                <div className="h-[200px] flex items-center justify-center opacity-20 italic text-[10px] uppercase font-black tracking-widest">SYNC_COVERAGE...</div>
+              ) : !operationsMetrics.available ? (
+                <div className="h-[200px] flex items-center justify-center opacity-30 italic text-center px-4 text-[10px] uppercase font-black tracking-widest break-words">{operationsMetrics.reason ?? "PRODUCT DB UNAVAILABLE"}</div>
+              ) : (
+                <div className="pt-4">
+                  <div className="flex flex-col items-center justify-center gap-2 py-6">
+                    <span className="text-4xl font-black text-tactical-red text-glow-red">
+                      {operationsMetrics.enrichment_completeness?.rate != null ? `${(operationsMetrics.enrichment_completeness.rate * 100).toFixed(0)}%` : "--"}
+                    </span>
+                    <span className="text-[9px] uppercase font-black tracking-widest text-white/30">reached full (tier2) enrichment</span>
+                  </div>
+                  <p className="text-[9px] text-white/30 italic text-center leading-relaxed">
+                    {operationsMetrics.enrichment_completeness?.n_tier2 ?? 0} of {operationsMetrics.enrichment_completeness?.n_total ?? 0} observations
+                  </p>
+                </div>
+              )}
+            </TacticalCard>
+          </div>
+        </div>
+      </section>
+
       {/* --- INFRASTRUCTURE TOPOLOGY & ATTRIBUTION --- */}
       <section className="max-w-[1600px] mx-auto p-12 mt-40 pt-32 border-t border-white/5">
         <SectionHeader
           title="Topology & Attribution"
-          subtitle="Advanced Node-Link mapping of highly-scored infrastructure vectors, cross-correlated with known Advanced Persistent Threat (APT) demographics and MITRE ATT&CK probabilistic modeling."
+          subtitle="Node-link mapping of highly-scored infrastructure, with detection-source breakdown (MISP hit vs. ML score) for each."
           icon={Cpu}
         />
 
@@ -744,7 +1675,7 @@ export default function PhantomEyeAdvancedDashboard() {
           </div>
           
           <div className="col-span-4 flex flex-col gap-10 h-[700px]">
-            <TacticalCard title="Detection Source" subTitle="How high-risk domains were flagged" status="MISP + ML FUSION" className="flex-1">
+            <TacticalCard title="Detection Source" subTitle="How flagged domains were detected (risk > 0.5)" status="MISP + ML FUSION" className="flex-1">
               {stats?.detection_source_breakdown && stats.detection_source_breakdown.length > 0 ? (
                 <>
                   <div className="w-full h-[200px] mt-2">
@@ -861,51 +1792,33 @@ export default function PhantomEyeAdvancedDashboard() {
         </div>
       </section>
 
-      {/* --- PREDICTIVE TRENDS --- */}
+      {/* --- SYSTEM STATUS --- */}
       <section className="max-w-[1400px] mx-auto p-12 mt-40 border-t border-white/5 pt-32">
         <SectionHeader
-          title="Predictive Trends"
-          subtitle="Longitudinal analysis of infrastructure creation patterns across localized ISPs and data centers."
+          title="System Status"
+          subtitle="Live pipeline & model telemetry — no simulated events."
           icon={BarChart3}
         />
 
-        <div className="grid grid-cols-2 gap-10">
-          <TacticalCard title="Risk Volatility Index" status="CALCULATED" subTitle="Temporal probability drift">
-            <div className="h-[300px] w-full mt-4">
-              {mounted && threats.length > 0 ? (
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={threats.slice(0, 20).reverse()}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
-                    <XAxis dataKey="registered_domain" hide />
-                    <YAxis domain={[0.92, 1.0]} hide />
-                    <Tooltip contentStyle={{ backgroundColor: "#000", border: "1px solid #ff0000", fontSize: "10px" }} />
-                    <Line type="monotone" dataKey="risk_score" stroke="#ff0000" strokeWidth={3} dot={false} strokeDasharray="5 5" />
-                  </LineChart>
-                </ResponsiveContainer>
-              ) : <div className="h-full flex items-center justify-center opacity-20 italic">ANALYTIC_SYNC...</div>}
+        <TacticalCard title="System Status" status={stats ? "STABLE" : "SYNCING"} subTitle="Live pipeline & model telemetry — no simulated events">
+          <div className="space-y-4 pt-4 flex flex-col">
+            <div className="h-px bg-white/10 w-full mb-4" />
+            <div className="space-y-2 opacity-70 text-[10px] uppercase font-black tracking-widest transition-opacity">
+              <p className="text-cyan-400">[info] GOLD_LAYER_PARSED_ROWS: {stats?.total_parsed != null ? stats.total_parsed.toLocaleString() : "--"}</p>
+              <p>[info] HIGH_RISK_DOMAINS: {stats?.total_domains != null ? stats.total_domains.toLocaleString() : "--"}</p>
+              <p>[info] NETWORK_GRAPH_NODES: {network?.nodes?.length ?? "--"} / LINKS: {network?.links?.length ?? "--"}</p>
+              {stats && stats.countries === 0 && (
+                <p className="text-tactical-red">[warn] GEO_ENRICHMENT: 0 COUNTRIES POPULATED IN CURRENT BATCH</p>
+              )}
+              <p>
+                [info] MODEL_LAST_CHECKED: {modelStatus?.promotion_decision?.checked_utc
+                  ? new Date(modelStatus.promotion_decision.checked_utc).toISOString().replace("T", " ").slice(0, 19) + "Z"
+                  : "unavailable"}
+              </p>
+              <p>[info] HEALTH_ENDPOINT: {stats ? "REACHABLE" : "AWAITING_SYNC"}</p>
             </div>
-          </TacticalCard>
-
-          <TacticalCard title="System Status" status={stats ? "STABLE" : "SYNCING"} subTitle="Live pipeline & model telemetry — no simulated events">
-            <div className="space-y-4 pt-4 h-[300px] overflow-hidden flex flex-col justify-end">
-              <div className="h-px bg-white/10 w-full mb-4" />
-              <div className="space-y-2 opacity-70 text-[10px] uppercase font-black tracking-widest transition-opacity">
-                <p className="text-cyan-400">[info] GOLD_LAYER_PARSED_ROWS: {stats?.total_parsed != null ? stats.total_parsed.toLocaleString() : "--"}</p>
-                <p>[info] HIGH_RISK_DOMAINS: {stats?.total_domains != null ? stats.total_domains.toLocaleString() : "--"}</p>
-                <p>[info] NETWORK_GRAPH_NODES: {network?.nodes?.length ?? "--"} / LINKS: {network?.links?.length ?? "--"}</p>
-                {stats && stats.countries === 0 && (
-                  <p className="text-tactical-red">[warn] GEO_ENRICHMENT: 0 COUNTRIES POPULATED IN CURRENT BATCH</p>
-                )}
-                <p>
-                  [info] MODEL_LAST_CHECKED: {modelStatus?.promotion_decision?.checked_utc
-                    ? new Date(modelStatus.promotion_decision.checked_utc).toISOString().replace("T", " ").slice(0, 19) + "Z"
-                    : "unavailable"}
-                </p>
-                <p>[info] HEALTH_ENDPOINT: {stats ? "REACHABLE" : "AWAITING_SYNC"}</p>
-              </div>
-            </div>
-          </TacticalCard>
-        </div>
+          </div>
+        </TacticalCard>
       </section>
 
       {/* --- FOOTER --- */}
@@ -918,8 +1831,8 @@ export default function PhantomEyeAdvancedDashboard() {
               <h3 className="text-3xl font-black italic tracking-[0.4em] uppercase">PHANTOM_EYE</h3>
             </div>
             <p className="max-w-md text-white/20 text-[10px] font-bold tracking-widest leading-loose uppercase italic mt-4">
-              Advanced reconnaissance platform for the identification and evaluation of global threat infrastructure.
-              Powered by Medallion Gold Layer intelligence clusters and neural-weighted lexical auditing.
+              Reconnaissance platform for identifying and triaging brand-impersonation infrastructure from
+              Certificate Transparency logs, backed by a promotion-gated ML scorer and an analyst feedback loop.
             </p>
           </div>
 
@@ -935,8 +1848,6 @@ export default function PhantomEyeAdvancedDashboard() {
             <div className="flex flex-col gap-4 text-right">
               <span className="text-[12px] font-black text-tactical-red italic tracking-[0.3em]">OPERATIONAL_ID</span>
               <div className="text-[10px] text-white/30 font-bold tracking-widest uppercase italic flex flex-col gap-1">
-                <span>MORDOR_ALPHA_NODE_099</span>
-                <span>LVL_15_ANALYST_CLEARANCE</span>
                 <span>© 2026 CORE_INTEL_SYSTEMS</span>
               </div>
             </div>
@@ -945,7 +1856,7 @@ export default function PhantomEyeAdvancedDashboard() {
       </footer>
       
       {/* Live AI Intel Chat Interface */}
-      <IntelChat />
+      {SHOW_INTEL_CHAT && <IntelChat />}
     </main>
   );
 }

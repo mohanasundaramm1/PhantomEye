@@ -59,16 +59,30 @@ def build_caches(cfg: dict) -> dict:
 
 
 def build_rate_limiters(cfg: dict) -> dict:
+    # whois_rps was 2.0 until a live backfill run showed rdap.org actively
+    # rate-limiting this system with HTTP 429 "Too Many Requests" at that
+    # rate (found live, config/enrichment.json's whois_rps -- see also
+    # ct.enrich.tiers.default_whois_fetch's docstring for the related
+    # timeout-budget incident found in the same investigation). Lowered to
+    # 1.0 to stay under whatever threshold rdap.org enforces.
     rl = cfg["rate_limits"]
     return {"whois": TokenBucket(rl["whois_rps"]), "dns": TokenBucket(rl["dns_rps"])}
 
 
 def build_breakers(cfg: dict) -> dict:
     cb = cfg["circuit_breaker"]
+    # "whois_other" (non-reliable_tlds domains) gets its OWN breaker, not
+    # shared with "whois" -- see ct.enrich.tiers._tld_bucket()'s docstring
+    # for why a shared breaker let a run of flaky-registry failures block
+    # perfectly healthy .com/.net/.org lookups too.
+    cb_other = cfg.get("circuit_breaker_other", cb)
     return {
-        name: CircuitBreaker(name, failure_threshold=cb["failure_threshold"],
-                             cooldown_seconds=cb["cooldown_seconds"])
-        for name in ("whois", "dns")
+        "whois": CircuitBreaker("whois", failure_threshold=cb["failure_threshold"],
+                                cooldown_seconds=cb["cooldown_seconds"]),
+        "whois_other": CircuitBreaker("whois_other", failure_threshold=cb_other["failure_threshold"],
+                                      cooldown_seconds=cb_other["cooldown_seconds"]),
+        "dns": CircuitBreaker("dns", failure_threshold=cb["failure_threshold"],
+                              cooldown_seconds=cb["cooldown_seconds"]),
     }
 
 
