@@ -1,0 +1,137 @@
+name: CI
+
+# Runs on every push (so a feature branch fails fast) and every PR into
+# master (so master itself can't merge something broken). Each job is
+# validated against a genuinely fresh environment, not "works on my
+# machine" -- see the job comments below for what that caught.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["master"]
+
+permissions:
+  contents: read
+
+jobs:
+  backend-tests:
+    name: Backend tests (pytest + alembic)
+    runs-on: ubuntu-latest
+    # A real Postgres, not a mock -- most of this project's tests are
+    # DB-gated (skip cleanly if unreachable) rather than DB-mocked, and a
+    # CI run with no DB service would silently skip ~18% of the suite
+    # (52/291 tests, confirmed by testing this exact scenario) while still
+    # reporting green. The service below makes those tests actually run.
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+          POSTGRES_DB: campaigns
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U app -d campaigns"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      APP_DATABASE_URL: postgresql+psycopg2://app:app@localhost:5432/campaigns
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: System deps for LightGBM (libgomp)
+        run: sudo apt-get update && sudo apt-get install -y libgomp1
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # Against a genuinely EMPTY database, not one that already happens to
+      # have tables/rows from a prior run -- a broken migration (bad
+      # ordering, a duplicate revision id, a column referenced before it
+      # exists) only shows up starting from nothing, exactly like a fresh
+      # deploy would hit.
+      - name: Apply all migrations from a fresh database
+        run: alembic upgrade head
+
+      - name: Run test suite
+        run: python -m pytest -q
+
+  frontend-build:
+    name: Frontend build + lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
+
+      # npm ci (not npm install): fails on any lockfile/dependency
+      # inconsistency instead of silently "fixing" it -- this is what
+      # actually caught react-simple-maps' peer-dependency conflict with
+      # React 19 (an unused import, since removed) when npm install alone
+      # had been masking it locally.
+      - name: Install dependencies (strict)
+        run: npm ci
+
+      # Non-blocking: there's real pre-existing lint debt (13 errors, none
+      # of them new) that predates this workflow. Surfacing it without
+      # making day-one CI red for debt nobody introduced today -- fix it
+      # separately, then flip this to blocking.
+      - name: Lint (informational -- not yet a merge gate)
+        run: npm run lint
+        continue-on-error: true
+
+      - name: Build
+        run: npm run build
+
+  airflow-dag-check:
+    name: Airflow DAG import check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the Airflow image
+        run: docker build -f airflow/Dockerfile -t phantomeye-airflow-ci airflow/
+
+      # A lightweight, SQLite-backed DagBag parse -- not the full
+      # docker-compose stack (postgres + webserver + scheduler +
+      # triggerer), which none of this needs: every DAG file here only
+      # imports stdlib/airflow/third-party packages at parse time (they
+      # shell out to ct/product/ml via BashOperator instead), so parsing
+      # them needs nothing beyond the dags/ folder and the Airflow image
+      # itself. Verified live: this catches a real SyntaxError in a DAG
+      # file with a full traceback, and reports clean ("No data found")
+      # against the actual current DAGs.
+      - name: Check every DAG parses with no import errors
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}/airflow/dags:/opt/airflow/dags:ro" \
+            -e AIRFLOW__CORE__EXECUTOR=LocalExecutor \
+            -e AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=sqlite:////tmp/airflow.db \
+            -e AIRFLOW__CORE__LOAD_EXAMPLES=false \
+            --entrypoint /bin/bash \
+            phantomeye-airflow-ci \
+            -c "airflow db init >/tmp/dbinit.log 2>&1 && \
+                OUT=\$(airflow dags list-import-errors); \
+                echo \"\$OUT\"; \
+                if echo \"\$OUT\" | grep -q 'No data found'; then \
+                  exit 0; \
+                else \
+                  echo '--- DAG import errors found above ---'; \
+                  exit 1; \
+                fi"
