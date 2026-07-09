@@ -24,6 +24,18 @@ def _obs(raw_host, risk_score=0.9):
                          risk_score=risk_score)
 
 
+# Explicit brands=, not assess_corruption()'s default load_brands(session)
+# query against the live watchlist_brands table: on a freshly-migrated DB
+# with nothing seeded (exactly what CI runs against) there's no "apple" row,
+# so every observation -- including the ones meant to be genuine matches --
+# would come back unmatched, and assertions checking the "good" bucket would
+# fail not because of a real bug but because the fixture never seeded its
+# own brand data. Found live: 2 of these tests failed on a fresh CI-style
+# DB while passing against a dev DB that happened to already have brands
+# seeded from earlier manual `make seed-brands` runs.
+_TEST_BRANDS = [("apple", ["apple"], 100)]
+
+
 @pytest.mark.skipif(not ping(), reason="app-db not reachable (docker compose up -d app-db)")
 def test_assess_corruption_identifies_fully_bogus_and_partial_clusters():
     from sqlalchemy import delete
@@ -59,7 +71,7 @@ def test_assess_corruption_identifies_fully_bogus_and_partial_clusters():
             # scoped to just this test's fixtures -- see assess_corruption()'s
             # docstring for why an unscoped call is dangerous against a
             # shared, non-isolated dev database.
-            assessment = assess_corruption(s, cluster_ids=cluster_ids)
+            assessment = assess_corruption(s, brands=_TEST_BRANDS, cluster_ids=cluster_ids)
             assert bogus.id in assessment
             assert assessment[bogus.id]["good_observation_ids"] == []
             assert assessment[bogus.id]["bad_observation_ids"] == [bad_obs_1.id]
@@ -98,7 +110,7 @@ def test_repair_dry_run_makes_no_changes(tmp_path):
         cid, oid = cluster.id, bad_obs.id
 
         try:
-            assessment = assess_corruption(s, cluster_ids=[cid])
+            assessment = assess_corruption(s, brands=_TEST_BRANDS, cluster_ids=[cid])
             assert cid in assessment
             summary = repair(s, assessment, actor="test", dry_run=True,
                              deletion_log_path=str(tmp_path / "deletions.jsonl"))
@@ -139,7 +151,7 @@ def test_repair_deletes_fully_bogus_cluster_and_logs_to_file(tmp_path):
         log_path = str(tmp_path / "deletions.jsonl")
 
         try:
-            assessment = assess_corruption(s, cluster_ids=[cid])
+            assessment = assess_corruption(s, brands=_TEST_BRANDS, cluster_ids=[cid])
             summary = repair(s, assessment, actor="test-actor", dry_run=False, deletion_log_path=log_path)
             assert any(d["cluster_id"] == cid for d in summary["deleted"])
 
@@ -189,7 +201,7 @@ def test_repair_prunes_partial_cluster_and_recomputes_confidence(tmp_path):
         cid, bad_id, good_id = cluster.id, bad_obs.id, good_obs.id
 
         try:
-            assessment = assess_corruption(s, cluster_ids=[cid])
+            assessment = assess_corruption(s, brands=_TEST_BRANDS, cluster_ids=[cid])
             assert set(assessment[cid]["good_observation_ids"]) == {good_id}
             repair(s, assessment, actor="test", dry_run=False,
                   deletion_log_path=str(tmp_path / "deletions.jsonl"))
@@ -240,7 +252,7 @@ def test_repair_never_touches_locked_clusters(tmp_path):
         cid, oid = cluster.id, bad_obs.id
 
         try:
-            assessment = assess_corruption(s, cluster_ids=[cid])
+            assessment = assess_corruption(s, brands=_TEST_BRANDS, cluster_ids=[cid])
             assert cid in assessment  # still flagged as bogus by the assessment itself
             summary = repair(s, assessment, actor="test", dry_run=False,
                              deletion_log_path=str(tmp_path / "deletions.jsonl"))
