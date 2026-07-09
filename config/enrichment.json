@@ -10,6 +10,7 @@
   },
   "timeouts": {
     "whois_seconds": 10.0,
+    "whois_seconds_other_tld": 20.0,
     "dns_seconds": 5.0
   },
   "tiers": {
@@ -29,6 +30,11 @@
     "failure_threshold": 5,
     "cooldown_seconds": 300
   },
+  "circuit_breaker_other": {
+    "failure_threshold": 5,
+    "cooldown_seconds": 300
+  },
+  "reliable_tlds": ["com", "net", "org"],
   "paths": {
     "lookups_dir": "lookups",
     "enriched_dir": "ct/data/enriched"
