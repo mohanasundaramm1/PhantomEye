@@ -14,6 +14,7 @@ the worker requeues the item instead of retrying inline.
 from __future__ import annotations
 
 import concurrent.futures as _fut
+import functools
 import json
 import logging
 import socket
@@ -64,12 +65,25 @@ def default_dns_fetch(domain: str) -> list[str]:
 
 
 def default_whois_fetch(domain: str, timeout: float = 10.0) -> dict:
-    """RDAP lookup via rdap.org, normalized to the whois_cache row shape."""
+    """RDAP lookup via rdap.org, normalized to the whois_cache row shape.
+
+    `timeout` is the TOTAL wall-clock budget for this call, split into a
+    fixed 3s connect allowance and the remainder for the read -- so
+    connect(3) + read(timeout-3) never exceeds `timeout`. This must line up
+    with the outer call_with_timeout() supervisor in enrich_item() (which
+    used to enforce cfg["timeouts"]["whois_seconds"]=6.0 while this
+    function's OWN default stayed at 10.0, unreachable because the caller
+    never passed timeout= through at all -- found live: every WHOIS call
+    that legitimately took 6-10s, well within what this function was always
+    willing to wait for, got killed by the outer wrapper first, showing up
+    as "reason=whois: timeout>6.0s" on the majority of backfill items).
+    """
     import requests  # lazy: not needed for cache-only paths / tests
 
+    read_timeout = max(1.0, timeout - 3.0)
     r = requests.get(
         f"https://rdap.org/domain/{domain}",
-        timeout=(3, timeout),
+        timeout=(3, read_timeout),
         headers={"User-Agent": "threat-intel-lab/rdap/0.2",
                  "Accept": "application/rdap+json, application/json;q=0.8"},
     )
@@ -210,8 +224,19 @@ def enrich_item(item: dict, *, whois_cache, dns_cache, geo_cache,
                 raise CircuitOpen("whois")
             rate_limiters["whois"].acquire()
             try:
-                w = call_with_timeout(
-                    whois_fetch, cfg["timeouts"]["whois_seconds"], "whois", domain)
+                whois_budget = cfg["timeouts"]["whois_seconds"]
+                # Pass the SAME budget to both the outer hard-timeout (below)
+                # and the function's own internal request timeout -- these
+                # used to be two independently-configured numbers (6.0
+                # outer vs. this function's unreachable 10.0 default) that
+                # could silently drift out of alignment; see
+                # default_whois_fetch()'s docstring for the incident this
+                # caused. functools.partial (not a plain kwarg on
+                # call_with_timeout itself) because call_with_timeout's own
+                # `timeout` parameter -- the OUTER budget -- already owns
+                # that name.
+                bound_whois_fetch = functools.partial(whois_fetch, timeout=whois_budget)
+                w = call_with_timeout(bound_whois_fetch, whois_budget, "whois", domain)
             except EnrichFailure:
                 breaker.record_failure()
                 raise

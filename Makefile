@@ -87,10 +87,15 @@ check-freshness:
 
 # Campaign-radar product jobs (need app-db up: docker compose up -d app-db).
 # seed-brands: load config/watchlist_brands.json into watchlist_brands ("bring
-# your own brand"). ingest-observations: scored parquet -> ct_observations.
-# assemble-campaigns: observations -> campaign clusters.
+# your own brand"). seed-analysts: load config/analysts.json into analysts
+# (assignee dropdown / "my queue" filter, not auth). ingest-observations:
+# scored parquet -> ct_observations. assemble-campaigns: observations ->
+# campaign clusters.
 seed-brands:
 	$(VENV_ACT) && python -m product.seed_brands
+
+seed-analysts:
+	$(VENV_ACT) && python -m product.seed_analysts
 
 ingest-observations:
 	$(VENV_ACT) && python -m product.ingest_observations
@@ -124,5 +129,8 @@ supervise-status:
 	echo "  --- last watchdog result ---"; \
 	cat ops/launchd/logs/watchdog_state.json 2>/dev/null || echo "  (no watchdog run yet)"
 
+# python -m pytest (not bare `pytest`) so the repo root -- and with it the
+# product/ct/api top-level packages the test suite imports -- is on sys.path;
+# the bare `pytest` console script anchors sys.path[0] to .venv/bin instead.
 test:
-	$(VENV_ACT) && pytest -q
+	$(VENV_ACT) && python -m pytest -q

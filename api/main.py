@@ -19,6 +19,7 @@ from ct.enrich.circuit import CircuitBreaker
 from ct.enrich.config import abspath, load_config
 from ct.enrich.ratelimit import TokenBucket
 from ct.enrich.tiers import EnrichFailure, enrich_item
+from ct.ingest.triage import CONFIG_PATH_DEFAULT as TRIAGE_CONFIG_PATH_DEFAULT
 
 try:
     import lightgbm as lgb
@@ -48,15 +49,25 @@ LIVE_ENRICH_TIMEOUT_SECONDS = 4.0
 # Global model cache: (model_object, "lgbm_full" | "logreg_full")
 MODEL = None
 MODEL_KIND = None
+MODEL_MTIME = None
 
 def load_model():
     """Load the primary scoring model, preferring the LightGBM booster
     (matches ct/score/score_ct_with_latest.py's precedence) and falling
     back to the LogisticRegression joblib model only if the booster file
-    isn't present."""
-    global MODEL, MODEL_KIND
-    if MODEL is not None:
+    isn't present.
+
+    Reloads automatically when the model file's mtime changes -- before
+    this, MODEL was cached forever once loaded, so a freshly-promoted model
+    (ml/core/train_model.py's promotion gate updating ct_risk_lgbm_full_
+    latest.txt) was never picked up by an already-running API process,
+    only on a full restart. The mtime check is one cheap stat() call per
+    request, not a polling loop."""
+    global MODEL, MODEL_KIND, MODEL_MTIME
+    current_mtime = os.path.getmtime(LGBM_MODEL_PATH) if os.path.exists(LGBM_MODEL_PATH) else None
+    if MODEL is not None and current_mtime == MODEL_MTIME:
         return MODEL, MODEL_KIND
+    MODEL_MTIME = current_mtime
 
     if lgb is not None and os.path.exists(LGBM_MODEL_PATH):
         try:
@@ -248,14 +259,16 @@ def model_status():
 # (product/ package). Guarded import so the rest of the API still loads if the
 # product DB deps/service aren't present.
 try:
-    from sqlalchemy import select
+    from sqlalchemy import func, select
     from product.db import SessionLocal, ping as _app_db_ping
     from product.models import (
+        Analyst,
         AnalystDisposition,
         CampaignCluster,
         ClusterMember,
         CtObservation,
         SuppressionRule,
+        WatchlistBrand,
     )
     from product.stage_engine import apply_stage_transition
     _PRODUCT_DB = True
@@ -361,6 +374,7 @@ def list_campaigns(
     target_brand: str = None,
     min_confidence: float = None,
     stage: str = None,
+    assignee: str = None,
     limit: int = 100,
 ):
     """Ranked campaign queue: brand-attributed clusters above the promotion
@@ -370,7 +384,8 @@ def list_campaigns(
     auto-computed confidence happens to sit below the promotion bar (found
     live: a confirmed cluster at 0.49 confidence vanished from the default
     view entirely, meaning the analyst couldn't find their own disposed
-    campaign again). Filters: target_brand, stage, min_confidence."""
+    campaign again). Filters: target_brand, stage, min_confidence, assignee
+    (the "my queue" filter -- exact match against CampaignCluster.assignee)."""
     if not _PRODUCT_DB:
         return {"available": False, "reason": "product DB not configured", "campaigns": []}
     try:
@@ -383,6 +398,8 @@ def list_campaigns(
                 q = q.where(CampaignCluster.target_brand == target_brand.lower())
             if stage:
                 q = q.where(CampaignCluster.stage == stage)
+            if assignee:
+                q = q.where(CampaignCluster.assignee == assignee)
             q = q.order_by(CampaignCluster.confidence_score.desc()).limit(limit)
             cards = [_campaign_card(c) for c in s.execute(q).scalars().all()]
         return {"available": True, "count": len(cards), "campaigns": cards}
@@ -428,6 +445,45 @@ def get_campaign(campaign_id: int):
         raise
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"query failed: {e}")
+
+
+@app.get("/campaigns/{campaign_id}/export")
+def export_campaign(campaign_id: int, format: str = "json"):
+    """Egress export for a campaign -- format=json (structured summary) or
+    format=stix (a minimal hand-built STIX 2.1 bundle). GET, not the plan's
+    original POST sketch: this reads and formats already-computed data with
+    no side effect, so GET is the correct verb (see
+    product/export.py's module docstring)."""
+    if format not in ("json", "stix"):
+        raise HTTPException(status_code=422, detail="format must be 'json' or 'stix'")
+    if not _PRODUCT_DB:
+        raise HTTPException(status_code=503, detail="product DB not configured")
+    try:
+        from product.export import campaign_to_json, campaign_to_stix
+
+        with SessionLocal() as s:
+            c = s.get(CampaignCluster, campaign_id)
+            if c is None:
+                raise HTTPException(status_code=404, detail="campaign not found")
+            members = s.execute(
+                select(CtObservation)
+                .join(ClusterMember, ClusterMember.observation_id == CtObservation.id)
+                .where(ClusterMember.cluster_id == campaign_id)
+                .order_by(CtObservation.risk_score.desc())
+            ).scalars().all()
+            disposition = s.execute(
+                select(AnalystDisposition)
+                .where(AnalystDisposition.cluster_id == campaign_id)
+                .order_by(AnalystDisposition.created_at.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+            if format == "stix":
+                return campaign_to_stix(c, members, disposition)
+            return campaign_to_json(c, members, disposition)
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"export failed: {e}")
 
 
 class DispositionRequest(BaseModel):
@@ -508,6 +564,79 @@ def assign_campaign(campaign_id: int, request: AssignRequest):
         raise HTTPException(status_code=500, detail=f"assign failed: {e}")
 
 
+@app.get("/campaigns/{campaign_id}/disposition-provenance")
+def disposition_provenance(campaign_id: int):
+    """Did this cluster's most recent analyst disposition make it into a
+    later model retrain? product/export_analyst_labels.py dual-writes
+    dispositions into ml/data/feedback/feedback_labels_analyst.parquet,
+    which ml/core/train_model.py's existing feedback-ingestion hook picks
+    up automatically on its next run -- so the earliest training run whose
+    created_utc is AFTER this disposition is the first run that COULD have
+    included it. This is eligibility, not proof: whether it actually did
+    depends on export_analyst_labels.py having run in between (not
+    separately logged anywhere), so the response says so explicitly rather
+    than overclaiming certainty."""
+    if not _PRODUCT_DB:
+        raise HTTPException(status_code=503, detail="product DB not configured")
+    try:
+        with SessionLocal() as s:
+            c = s.get(CampaignCluster, campaign_id)
+            if c is None:
+                raise HTTPException(status_code=404, detail="campaign not found")
+            disposition = s.execute(
+                select(AnalystDisposition)
+                .where(AnalystDisposition.cluster_id == campaign_id)
+                .order_by(AnalystDisposition.created_at.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+        if disposition is None:
+            return {"available": True, "has_disposition": False,
+                    "reason": "no analyst disposition recorded on this campaign yet"}
+
+        meta_dir = os.path.join("ml", "models", "registry")
+        candidates = []
+        for path in sorted(glob.glob(os.path.join(meta_dir, "ct_risk_meta_*.json"))):
+            if path.endswith("_latest.json"):
+                continue
+            meta = _read_json_safe(path)
+            if not meta or not meta.get("created_utc"):
+                continue
+            try:
+                created = datetime.fromisoformat(meta["created_utc"])
+            except (ValueError, TypeError):
+                continue
+            if created > disposition.created_at:
+                candidates.append((created, meta))
+        candidates.sort(key=lambda x: x[0])
+
+        result = {
+            "available": True, "has_disposition": True,
+            "disposition": {
+                "verdict": disposition.verdict, "analyst": disposition.analyst,
+                "created_at": disposition.created_at.isoformat(),
+            },
+        }
+        if not candidates:
+            result["eligible_training_run"] = None
+            result["note"] = "no training run has occurred since this disposition was recorded yet"
+            return result
+
+        created, meta = candidates[0]
+        result["eligible_training_run"] = {
+            "created_utc": meta.get("created_utc"),
+            "n_pos": meta.get("n_pos"), "n_neg": meta.get("n_neg"),
+            "promoted": (meta.get("promotion_decision") or {}).get("promote"),
+        }
+        result["note"] = ("this is the earliest run AFTER the disposition, so it COULD have "
+                          "included it via the feedback loop -- not confirmed inclusion, since "
+                          "whether the export step ran in between isn't separately logged")
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"provenance lookup failed: {e}")
+
+
 class SuppressionRuleRequest(BaseModel):
     rule_type: str  # domain | registrar | asn
     match_value: str
@@ -584,6 +713,194 @@ def create_suppression(request: SuppressionRuleRequest):
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"create suppression failed: {e}")
 
+
+@app.get("/analysts")
+def list_analysts(active_only: bool = True):
+    """Analyst directory for the assignee dropdown / "my queue" filter --
+    NOT an auth endpoint, see product/models.py::Analyst's docstring."""
+    if not _PRODUCT_DB:
+        return {"available": False, "reason": "product DB not configured", "analysts": []}
+    try:
+        with SessionLocal() as s:
+            q = select(Analyst)
+            if active_only:
+                q = q.where(Analyst.active.is_(True))
+            q = q.order_by(Analyst.display_name)
+            rows = s.execute(q).scalars().all()
+        return {"available": True, "analysts": [
+            {"username": a.username, "display_name": a.display_name, "active": a.active}
+            for a in rows
+        ]}
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "reason": f"query failed: {e}", "analysts": []}
+
+
+class WatchlistBrandRequest(BaseModel):
+    brand_name: str
+    aliases: list[str] = []
+    priority: int = 100
+    customer_scope: str = "default"
+    self_domains: list[str] = []
+
+
+class WatchlistBrandUpdateRequest(BaseModel):
+    # All optional -- PUT only touches fields actually present in the body.
+    aliases: list[str] | None = None
+    priority: int | None = None
+    customer_scope: str | None = None
+    self_domains: list[str] | None = None
+    active: bool | None = None
+
+
+def _watchlist_brand_dict(b) -> dict:
+    return {
+        "id": b.id,
+        "brand_name": b.brand_name,
+        "aliases": [a for a in (b.aliases or "").split(",") if a],
+        "priority": b.priority,
+        "customer_scope": b.customer_scope,
+        "self_domains": [d for d in (b.self_domains or "").split(",") if d],
+        "active": b.active,
+        "created_at": b.created_at.isoformat() if b.created_at else None,
+    }
+
+
+def _write_through_self_domains(brand_name: str, domains: list[str]) -> None:
+    """Mirror self_domains into config/triage.json -- the file the matcher
+    (ct/ingest/triage.py, product/assemble_campaigns.py) actually reads.
+    watchlist_brands.self_domains is a convenience view for the API/UI, not a
+    second copy the matcher consults. Both consumers only ever read the
+    config file from a fresh process (Airflow task or a `make
+    assemble-campaigns` CLI run), so triage.py's load_config() cache -- which
+    is per-process -- never serves a stale copy across runs."""
+    path = os.getenv("CT_TRIAGE_CONFIG", TRIAGE_CONFIG_PATH_DEFAULT)
+    with open(path) as f:
+        cfg = json.load(f)
+    self_domains_map = cfg.setdefault("brand_self_domains", {})
+    if domains:
+        self_domains_map[brand_name] = domains
+    else:
+        self_domains_map.pop(brand_name, None)
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+
+
+@app.get("/watchlist")
+def list_watchlist(active_only: bool = False):
+    """List watchlist brands -- the "bring your own brand" tracked-brand
+    config, editable here instead of only via config/watchlist_brands.json +
+    `make seed-brands`."""
+    if not _PRODUCT_DB:
+        return {"available": False, "reason": "product DB not configured", "brands": []}
+    try:
+        with SessionLocal() as s:
+            q = select(WatchlistBrand)
+            if active_only:
+                q = q.where(WatchlistBrand.active.is_(True))
+            q = q.order_by(WatchlistBrand.priority.desc(), WatchlistBrand.brand_name)
+            rows = s.execute(q).scalars().all()
+        return {"available": True, "count": len(rows), "brands": [_watchlist_brand_dict(b) for b in rows]}
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "reason": f"query failed: {e}", "brands": []}
+
+
+@app.post("/watchlist")
+def create_watchlist_brand(request: WatchlistBrandRequest):
+    """Add a brand to the tracked watchlist. Takes effect on the NEXT
+    assemble-campaigns pass (Airflow campaign_radar_dag, or `make
+    assemble-campaigns` for an immediate pass) -- the no-CLI equivalent of
+    editing config/watchlist_brands.json + `make seed-brands`."""
+    if not _PRODUCT_DB:
+        raise HTTPException(status_code=503, detail="product DB not configured")
+    name = request.brand_name.strip().lower()
+    if not name:
+        raise HTTPException(status_code=422, detail="brand_name is required")
+    aliases = [a.strip().lower() for a in request.aliases if a and a.strip()]
+    self_domains = [d.strip().lower() for d in request.self_domains if d and d.strip()]
+    try:
+        with SessionLocal() as s:
+            existing = s.execute(
+                select(WatchlistBrand).where(WatchlistBrand.brand_name == name)
+            ).scalar_one_or_none()
+            if existing is not None:
+                raise HTTPException(status_code=409, detail=f"brand '{name}' already exists (id={existing.id})")
+            brand = WatchlistBrand(
+                brand_name=name,
+                aliases=",".join(aliases) or None,
+                priority=request.priority,
+                customer_scope=request.customer_scope,
+                self_domains=",".join(self_domains) or None,
+                active=True,
+            )
+            s.add(brand)
+            s.commit()
+            if self_domains:
+                _write_through_self_domains(name, self_domains)
+            return {"available": True, **_watchlist_brand_dict(brand)}
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"create watchlist brand failed: {e}")
+
+
+@app.put("/watchlist/{brand_id}")
+def update_watchlist_brand(brand_id: int, request: WatchlistBrandUpdateRequest):
+    """Update an existing tracked brand. Only fields present in the request
+    body are touched -- omit a field to leave it as-is."""
+    if not _PRODUCT_DB:
+        raise HTTPException(status_code=503, detail="product DB not configured")
+    try:
+        with SessionLocal() as s:
+            brand = s.get(WatchlistBrand, brand_id)
+            if brand is None:
+                raise HTTPException(status_code=404, detail="watchlist brand not found")
+            if request.aliases is not None:
+                aliases = [a.strip().lower() for a in request.aliases if a and a.strip()]
+                brand.aliases = ",".join(aliases) or None
+            if request.priority is not None:
+                brand.priority = request.priority
+            if request.customer_scope is not None:
+                brand.customer_scope = request.customer_scope
+            if request.active is not None:
+                brand.active = request.active
+            write_domains = None
+            if request.self_domains is not None:
+                write_domains = [d.strip().lower() for d in request.self_domains if d and d.strip()]
+                brand.self_domains = ",".join(write_domains) or None
+            s.commit()
+            if write_domains is not None:
+                _write_through_self_domains(brand.brand_name, write_domains)
+            return {"available": True, **_watchlist_brand_dict(brand)}
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"update watchlist brand failed: {e}")
+
+
+@app.delete("/watchlist/{brand_id}")
+def deactivate_watchlist_brand(brand_id: int):
+    """Soft-deactivate (active=False) -- matches this schema's established
+    convention of gating on `active` rather than hard-deleting (see
+    SuppressionRule, Analyst). Does NOT touch the brand's config/triage.json
+    self_domains entry: that false-positive exoneration list is still valid
+    even for a brand no longer actively tracked as a campaign target."""
+    if not _PRODUCT_DB:
+        raise HTTPException(status_code=503, detail="product DB not configured")
+    try:
+        with SessionLocal() as s:
+            brand = s.get(WatchlistBrand, brand_id)
+            if brand is None:
+                raise HTTPException(status_code=404, detail="watchlist brand not found")
+            brand.active = False
+            s.commit()
+            return {"available": True, **_watchlist_brand_dict(brand)}
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"deactivate watchlist brand failed: {e}")
+
+
 @app.get("/threats/latest")
 def get_latest_threats(limit: int = 50):
     path = get_latest_parquet()
@@ -596,6 +913,21 @@ def get_latest_threats(limit: int = 50):
     out = df.head(limit).replace([np.inf, -np.inf], None)
     out = out.astype(object).where(pd.notnull(out), None)
     return {"data": out.to_dict(orient="records")}
+
+def _watchlist_brand_count() -> int | None:
+    """Live count of active tracked brands, for honest "Tracking N brands"
+    UI copy -- sourced from the DB (not config/watchlist_brands.json) so a
+    future in-UI brand CRUD doesn't have to revisit this. None (not 0) when
+    the product DB isn't configured, so the frontend can distinguish
+    "genuinely zero brands" from "count unavailable"."""
+    if not _PRODUCT_DB:
+        return None
+    try:
+        with SessionLocal() as s:
+            return s.scalar(select(func.count(WatchlistBrand.id)).where(WatchlistBrand.active.is_(True)))
+    except Exception:  # noqa: BLE001
+        return None
+
 
 @app.get("/threats/stats")
 def get_stats():
@@ -625,7 +957,8 @@ def get_stats():
         "critical": critical_count,
         "avg_risk": float(avg_risk) if pd.notnull(avg_risk) else 0.0,
         "signal_to_noise": round((critical_count / max(1, total_parsed)) * 100, 4),
-        "countries": df["sample_country"].nunique() if "sample_country" in df.columns else 0
+        "countries": df["sample_country"].nunique() if "sample_country" in df.columns else 0,
+        "watchlist_brand_count": _watchlist_brand_count(),
     }
 
     def _clean_records(frame: pd.DataFrame) -> list:
@@ -788,26 +1121,17 @@ class AskRequest(BaseModel):
 
 @app.post("/threats/ask")
 def ask_intel(request: AskRequest):
-    # Retrieve top domains from latest parquet for context
-    path = get_latest_parquet()
-    dashboard_context = ""
-    if path:
-        try:
-            df = pd.read_parquet(path)
-            top_domains = df.sort_values("risk_score", ascending=False).head(5)
-            context_list = []
-            for _, row in top_domains.iterrows():
-                domain = row.get("registered_domain", "")
-                score = row.get("risk_score", 0)
-                asn = row.get("sample_asn", "")
-                context_list.append(f"- {domain} (Risk: {score:.2f}, ASN: {asn})")
-            dashboard_context = "\n".join(context_list)
-        except:
-            pass
-
+    """Fixed-intent query agent over the live product DB -- see
+    api/agent/internal_agent.py's module docstring for why this is a small
+    reviewable set of regex-matched queries, not general LLM tool-calling.
+    `history` is accepted (the frontend still sends it) but unused: there's
+    no LLM in the loop for conversational context to matter to."""
+    if not _PRODUCT_DB:
+        return {"answer": "Query agent unavailable: product DB not configured."}
     try:
-        from api.agent.perplexity_client import ask_intel_agent
-        answer = ask_intel_agent(request.query, dashboard_context, request.history)
-        return {"answer": answer}
-    except Exception as e:
-        return {"answer": f"Backend Error: {str(e)}"}
+        from api.agent.internal_agent import route_query
+        with SessionLocal() as s:
+            result = route_query(s, request.query)
+        return {"answer": result["text"]}
+    except Exception as e:  # noqa: BLE001
+        return {"answer": f"Query agent error: {e}"}
