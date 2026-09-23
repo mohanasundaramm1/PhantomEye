@@ -15,7 +15,7 @@
 #       ct_risk_meta_latest.json
 #
 
-import os, glob, math, json, shutil
+import os, re, glob, math, json, shutil
 from datetime import datetime, timezone
 from collections import Counter
 
@@ -120,11 +120,57 @@ def df_from_parquets(patterns):
 
 # ---------------- load labels (dynamic + feedback) ----------------
 
+_INGEST_DATE_RE = re.compile(r"ingest_date=(\d{4}-\d{2}-\d{2})")
+
+
+def load_labels_union_with_real_dates(pattern):
+    """Read silver/labels_union/ingest_date=YYYY-MM-DD/*.parquet file-by-file
+    and attach the REAL per-row date, instead of df_from_parquets' generic
+    concat which drops the Hive partition value entirely (pd.read_parquet on
+    a single file has no partition column to carry).
+
+    Found live: every row in this source was silently defaulting to
+    NOW_UTC's date downstream (see load_all_labels' ingest_date fallback),
+    which made every temporal-split cutoff degenerate (test_mask covered
+    ~100% of rows because "the latest date" was every row's date) and
+    training silently fell back to a random split -- so used_temporal_split
+    was False on every run despite ~11 months of real partitions existing
+    on disk (2025-10-28 .. today). Two real date signals exist per row:
+      - the ingest_date partition the file lives under (coarse, batch-level)
+      - the row's own `first_seen` column (fine-grained, ~96% parseable)
+    We prefer first_seen (it's the domain's actual observed date, not the
+    date some batch job happened to run) and fall back to the partition
+    date for the ~4% of rows where first_seen doesn't parse.
+    """
+    files = sorted(glob.glob(pattern))
+    dfs = []
+    for f in files:
+        m = _INGEST_DATE_RE.search(f)
+        partition_date = m.group(1) if m else None
+        try:
+            df = pd.read_parquet(f)
+        except Exception as e:
+            print(f"[warn] failed {f}: {e}")
+            continue
+        df["ingest_date"] = partition_date
+        dfs.append(df)
+    if not dfs:
+        return pd.DataFrame()
+    out = pd.concat(dfs, ignore_index=True)
+
+    if "first_seen" in out.columns:
+        fseen = pd.to_datetime(out["first_seen"], errors="coerce", utc=True)
+        fseen_date = fseen.dt.strftime("%Y-%m-%d")
+        out["ingest_date"] = fseen_date.fillna(out["ingest_date"])
+    return out
+
+
 def load_all_labels():
-    # 1) Main labels
+    # 1) Main labels -- see load_labels_union_with_real_dates for why this
+    # can't just be df_from_parquets(pattern) like every other source here.
     pattern_main = os.path.join(SILVER_LABELS_DIR, "ingest_date=*/labels_union.parquet")
     print("[info] loading labels from pattern:", pattern_main)
-    labels = df_from_parquets([pattern_main])
+    labels = load_labels_union_with_real_dates(pattern_main)
 
     if not labels.empty:
         # Label: benign=0 if source==benign_seed else 1 (same convention as week5)
@@ -457,8 +503,13 @@ def has_two_classes(arr, min_count: int = 30):
 
 Xtr_lex = Xte_lex = Xtr_full = Xte_full = None
 y_train = y_test = None
+train_idx = test_idx = None  # row positions into Xdf, so the heuristic
+                              # baseline below can score the SAME test rows
+                              # the ML models are scored on, regardless of
+                              # which split path was taken.
 used_temporal = False
 temporal_cutoff = None
+_all_idx = np.arange(len(y))
 
 if "last_ingest_date" in Xdf.columns and Xdf["last_ingest_date"].notna().any():
     # Use last couple of days as "test" if possible
@@ -482,6 +533,7 @@ if "last_ingest_date" in Xdf.columns and Xdf["last_ingest_date"].notna().any():
         Xtr_lex, Xte_lex = X_lex[~test_mask], X_lex[test_mask]
         Xtr_full, Xte_full = X_full[~test_mask], X_full[test_mask]
         y_train, y_test = y_train_temp, y_test_temp
+        train_idx, test_idx = _all_idx[~test_mask], _all_idx[test_mask]
         used_temporal = True
         print(
             "[info] temporal split OK:",
@@ -491,13 +543,32 @@ if "last_ingest_date" in Xdf.columns and Xdf["last_ingest_date"].notna().any():
             Xte_lex.shape[0],
         )
     else:
-        print("[warn] temporal split degenerate; falling back to random split")
+        # Name the actual reason, not just "degenerate" -- found live: this
+        # fires because silver/labels_union's only negative (benign_seed)
+        # rows are frozen to a handful of one-time snapshot dates
+        # (2025-10-28..31, plus one feedback run on 2026-07-08), while
+        # openphish/urlhaus positives refresh daily across ~11 months. Any
+        # cutoff that isn't one of those exact snapshot dates yields a test
+        # window with 0 negatives -- this is a label-source gap (benign
+        # needs to be resampled on the same cadence as malicious, e.g. by
+        # re-running seed_benign_feedback.py periodically with dated
+        # outputs), not something a different cutoff choice fixes.
+        print(
+            "[warn] temporal split degenerate -- "
+            f"train(pos={int((y_train_temp==1).sum())},neg={int((y_train_temp==0).sum())}) "
+            f"test(pos={int((y_test_temp==1).sum())},neg={int((y_test_temp==0).sum())}) "
+            "-- likely cause: benign_seed/benign_tranco labels are frozen to a "
+            "few one-time dates while malicious labels refresh daily, so any "
+            "cutoff outside those exact dates has 0 negatives in test. "
+            "Falling back to random split."
+        )
         temporal_cutoff = None  # attempted but not actually used -- don't report a cutoff that wasn't applied
 
 if not used_temporal:
-    Xtr_lex, Xte_lex, y_train, y_test = train_test_split(
+    Xtr_lex, Xte_lex, y_train, y_test, train_idx, test_idx = train_test_split(
         X_lex,
         y,
+        _all_idx,
         test_size=0.25,
         stratify=y,
         random_state=42,
@@ -528,6 +599,56 @@ print(
     int((y_test == 1).sum()),
     "negatives=",
     int((y_test == 0).sum()),
+)
+
+# ---------------- trivial heuristic baseline ----------------
+#
+# Answers a question every reviewer will ask and the repo previously had no
+# answer for: is the ML actually earning its keep over a one-line rule? A
+# real ROC-AUC/PR-AUC number is meaningless in isolation -- it needs a floor
+# to be compared against. This is NOT tuned or trained; it's a fixed,
+# domain-knowledge rule (suspicious TLD OR long digit run OR high hyphen
+# count), scored on the exact same test rows (test_idx) as LogReg/LightGBM
+# above, so the comparison is apples-to-apples on identical held-out data.
+
+_HIGH_RISK_TLDS = {
+    "top", "xyz", "cn", "cyou", "sbs", "icu", "click", "cfd", "gq", "tk",
+    "ml", "cc", "buzz", "rest", "beauty", "bar", "lol",
+}
+
+
+def heuristic_baseline_score(reg_domains: pd.Series) -> np.ndarray:
+    d = reg_domains.fillna("").astype(str)
+    tld = d.str.rsplit(".", n=1).str[-1].str.lower()
+    digit_run = d.str.contains(r"\d{4,}", regex=True)
+    many_hyphens = d.str.count("-") >= 2
+    score = (
+        tld.isin(_HIGH_RISK_TLDS).astype(float) * 0.5
+        + digit_run.astype(float) * 0.3
+        + many_hyphens.astype(float) * 0.2
+    )
+    return score.to_numpy()
+
+
+baseline_domains_test = Xdf["registered_domain"].to_numpy()[test_idx]
+baseline_score_test = heuristic_baseline_score(pd.Series(baseline_domains_test))
+baseline_roc = roc_auc_score(y_test, baseline_score_test)
+baseline_pr = average_precision_score(y_test, baseline_score_test)
+_bfpr, _btpr, _ = roc_curve(y_test, baseline_score_test)
+if (_bfpr >= 0.01).any():
+    _bidx = max(np.searchsorted(_bfpr, 0.01, side="right") - 1, 0)
+    baseline_recall_at_1pct = float(_btpr[_bidx])
+else:
+    baseline_recall_at_1pct = float(_btpr[-1])
+metrics_heuristic_baseline = {
+    "roc_auc": float(baseline_roc),
+    "pr_auc": float(baseline_pr),
+    "recall_at_1pct": baseline_recall_at_1pct,
+    "rule": "0.5*(high_risk_tld) + 0.3*(4+ digit run) + 0.2*(2+ hyphens), untrained, fixed",
+}
+print(
+    f"[HeuristicBaseline] ROC-AUC={baseline_roc:.4f}  PR-AUC={baseline_pr:.4f}  "
+    f"Recall@FPR=1%={baseline_recall_at_1pct:.3f}  (floor to beat -- see metrics_heuristic_baseline)"
 )
 
 # ---------------- models ----------------
@@ -666,6 +787,7 @@ meta = {
     "n_train": int(len(y_train)),
     "n_test": int(len(y_test)),
     "metrics": {
+        "heuristic_baseline": metrics_heuristic_baseline,
         "logreg_lex": metrics_logreg_lex,
         "logreg_full": metrics_logreg_full,
         "lgbm_lex": metrics_lgbm_lex,
