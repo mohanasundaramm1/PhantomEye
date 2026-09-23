@@ -42,3 +42,4 @@ ops/launchd/logs/
 # a local record of what a run did, not source, same category as the
 # runtime logs above.
 product/logs/
+AUDIT.md
