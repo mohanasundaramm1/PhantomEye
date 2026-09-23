@@ -25,6 +25,22 @@ def _latest_disposition_ids(session):
     )
 
 
+# Same low-sample threshold ml/core/eval_precision_at_k.py uses for
+# precision@K, applied here too -- the Metrics & Proof page promises an
+# "honesty check for small/zero sample sizes" on every panel, but this one
+# never actually computed one: a 67% confirmation rate reads as a real
+# signal even at n=3, which is noise, not a rate.
+_LOW_SAMPLE_THRESHOLD = 10
+
+
+def _small_sample_note(n: int, what: str) -> str | None:
+    if n == 0:
+        return f"NOT MEANINGFUL: 0 {what} yet."
+    if n < _LOW_SAMPLE_THRESHOLD:
+        return f"LOW CONFIDENCE: only {n} {what} -- this rate is noisy at this sample size."
+    return None
+
+
 def analyst_confirmation_rate(session) -> dict:
     """Fraction of clusters an analyst has reviewed (their latest verdict)
     that were confirmed as real, vs. suppressed/benign."""
@@ -34,9 +50,11 @@ def analyst_confirmation_rate(session) -> dict:
     ).scalars().all()
     total = len(verdicts)
     if total == 0:
-        return {"rate": None, "n_dispositions": 0, "n_confirmed": 0}
+        return {"rate": None, "n_dispositions": 0, "n_confirmed": 0,
+                "confidence_note": _small_sample_note(0, "dispositions")}
     confirmed = sum(1 for v in verdicts if v == "confirmed")
-    return {"rate": round(confirmed / total, 4), "n_dispositions": total, "n_confirmed": confirmed}
+    return {"rate": round(confirmed / total, 4), "n_dispositions": total, "n_confirmed": confirmed,
+            "confidence_note": _small_sample_note(total, "dispositions")}
 
 
 def median_time_to_first_review_hours(session) -> dict:
@@ -89,17 +107,30 @@ def campaigns_created_per_day(session, window_days: int = 7) -> dict:
 
 
 def enrichment_completeness_rate(session) -> dict:
-    """Fraction of candidate ct_observations that reached full (tier2, WHOIS-
-    backed) enrichment -- a pipeline-health signal, not an analyst one, but
-    lands here since it's served by the same operations endpoint."""
+    """Fraction of ct_observations that actually carry WHOIS data -- a
+    pipeline-health signal, not an analyst one, served by the operations
+    endpoint.
+
+    Counts rows with WHOIS fields POPULATED, not rows labeled
+    enrichment_level == "tier2". That label only means "a live WHOIS network
+    call was made"; the hot path runs whois_mode="cache_only", so rows whose
+    WHOIS came from cache never get it. Counting the label reported 0 of
+    15,048 while ~1,100 rows genuinely had registrar/creation data.
+    n_tier2 (the old label count) is kept for backward compatibility."""
+    from sqlalchemy import or_
     from product.models import CtObservation
     total = session.execute(select(func.count()).select_from(CtObservation)).scalar_one()
     if total == 0:
-        return {"rate": None, "n_total": 0, "n_tier2": 0}
+        return {"rate": None, "n_total": 0, "n_whois": 0, "n_tier2": 0}
+    n_whois = session.execute(
+        select(func.count()).select_from(CtObservation).where(
+            or_(CtObservation.registrar.isnot(None), CtObservation.whois_created.isnot(None))
+        )
+    ).scalar_one()
     tier2 = session.execute(
         select(func.count()).select_from(CtObservation).where(CtObservation.enrichment_level == "tier2")
     ).scalar_one()
-    return {"rate": round(tier2 / total, 4), "n_total": total, "n_tier2": tier2}
+    return {"rate": round(n_whois / total, 4), "n_total": total, "n_whois": n_whois, "n_tier2": tier2}
 
 
 def operations_summary() -> dict:

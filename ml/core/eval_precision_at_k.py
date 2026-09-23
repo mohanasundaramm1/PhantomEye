@@ -59,11 +59,31 @@ def precision_at_k(df: pd.DataFrame, k: int, score_col: str = "risk_score",
     return {"k": k, "precision": round(hits / len(top_k), 4), "n_evaluated": len(top_k), "n_hits": hits}
 
 
-def evaluate(gold_dir: str = GOLD_DIR_DEFAULT, ks: tuple = DEFAULT_KS) -> dict:
+def recompute_misp_ground_truth(df: pd.DataFrame, misp_hosts: set) -> pd.Series:
+    """Hostname-granularity MISP match, computed NOW rather than trusted from
+    the stored ti_misp_hit. Batches scored before the matcher fix carry
+    registered-domain-collapsed labels (every *.pages.dev / *.workers.dev /
+    *.amazonaws.com host counted as a hit); evaluating on those would report
+    precision against platform artifacts, not real MISP confirmations."""
+    from ct.score.score_ct_with_latest import misp_host_hit
+    if not misp_hosts:
+        return pd.Series(0, index=df.index)
+    col = "domain_sample" if "domain_sample" in df.columns else "registered_domain"
+    hosts = df[col].where(df[col].notna(), df.get("registered_domain"))
+    return hosts.map(lambda h: int(misp_host_hit(h, misp_hosts)))
+
+
+def evaluate(gold_dir: str = GOLD_DIR_DEFAULT, ks: tuple = DEFAULT_KS,
+             misp_hosts: set | None = None) -> dict:
     path = get_latest_scored_parquet(gold_dir)
     if not path:
         return {"available": False, "reason": f"no scored parquet found under {gold_dir}"}
     df = pd.read_parquet(path)
+    if misp_hosts is None:
+        from ct.score.score_ct_with_latest import load_recent_misp_domains
+        misp_hosts = load_recent_misp_domains(days_back=30)
+    stored_hits = int((df["ti_misp_hit"].fillna(0).astype(float) > 0).sum()) if "ti_misp_hit" in df.columns else 0
+    df["ti_misp_hit"] = recompute_misp_ground_truth(df, misp_hosts)
     n_misp_hits_total = int((df["ti_misp_hit"].fillna(0).astype(float) > 0).sum()) if "ti_misp_hit" in df.columns else 0
 
     if n_misp_hits_total == 0:
@@ -83,7 +103,8 @@ def evaluate(gold_dir: str = GOLD_DIR_DEFAULT, ks: tuple = DEFAULT_KS) -> dict:
         "scored_file": os.path.basename(path),
         "n_rows": len(df),
         "n_misp_hits_total": n_misp_hits_total,
-        "ground_truth": "ti_misp_hit (independent external confirmation, not the model's own fused decision)",
+        "ground_truth": "MISP hostname match recomputed at eval time (independent external confirmation, not the model's own fused decision)",
+        "n_misp_hits_stored_at_scoring": stored_hits,
         "confidence_note": confidence_note,
         "precision_at_k": [precision_at_k(df, k) for k in ks],
     }
