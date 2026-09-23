@@ -154,6 +154,12 @@
     "binance": [
       "binance.com",
       "binance.org"
+    ],
+    "deloitte": [
+      "deloitte.com",
+      "deloitte.co.uk",
+      "deloitte.ca",
+      "deloitte.de"
     ]
   },
   "infra_suffixes": [

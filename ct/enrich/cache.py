@@ -47,6 +47,7 @@ class ParquetTTLCache:
         self.misses = 0
         self.expired = 0
         self._df = self._load()
+        self._index = self._build_index()
 
     def _load(self) -> pd.DataFrame:
         if os.path.exists(self.path):
@@ -65,9 +66,29 @@ class ParquetTTLCache:
         df["fetched_at"] = pd.to_datetime(df["fetched_at"], utc=True, errors="coerce")
         return df
 
+    def _build_index(self) -> dict:
+        """key -> positional row indices.
+
+        get() previously did `self._df[self._df[key_col] == key]`, a full linear
+        scan per lookup. That is fine for a few hundred rows and pathological once
+        a cache grows: the geo cache is consulted once per resolved IP per domain,
+        so an O(n) probe against a ~58k-row frame turns a hot-path pass into
+        minutes. Indexing once per load makes each probe O(1).
+        """
+        if self._df.empty:
+            return {}
+        idx: dict = {}
+        for pos, key in enumerate(self._df[self.key_col].to_numpy()):
+            idx.setdefault(key, []).append(pos)
+        return idx
+
     def get(self, key: str) -> pd.DataFrame | None:
         """Fresh rows for key, or None on miss (absent OR expired)."""
-        rows = self._df[self._df[self.key_col] == str(key)]
+        positions = self._index.get(str(key))
+        if not positions:
+            self.misses += 1
+            return None
+        rows = self._df.iloc[positions]
         if rows.empty:
             self.misses += 1
             return None
@@ -92,6 +113,9 @@ class ParquetTTLCache:
         keys = set(new_df[self.key_col])
         kept = self._df[~self._df[self.key_col].isin(keys)]
         self._df = pd.concat([kept, new_df], ignore_index=True)
+        # Positions shift on every concat, so the index is rebuilt rather than
+        # patched -- correctness over cleverness; upserts are far rarer than gets.
+        self._index = self._build_index()
 
     def flush(self):
         atomic_to_parquet(self._df, self.path)

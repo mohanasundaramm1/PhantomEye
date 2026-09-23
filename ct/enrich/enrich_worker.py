@@ -52,7 +52,16 @@ def build_caches(cfg: dict) -> dict:
         "dns": ParquetTTLCache("dns_geo", os.path.join(lookups, "dns_geo_cache.parquet"),
                                key_col="puny_domain",
                                ttl_seconds=ttls["dns_hours"] * 3600),
-        "geo": ParquetTTLCache("ip_geo", os.path.join(lookups, "ip_geo_cache.parquet"),
+        # Indexed by "ip" over the SAME parquet the dns cache uses (which is keyed
+        # there by puny_domain). ct/enrich/geo_backfill.py fills the geo columns on
+        # those rows out-of-band, so a hot-path lookup for a just-resolved IP hits
+        # a row that already carries country/asn.
+        #
+        # Previously this pointed at ip_geo_cache.parquet, which had no writer
+        # anywhere in the repo -- it sat at ~400 stale IPs while dns_geo_cache held
+        # ~38k. That was why sample_country was NULL on 100% of scored rows even
+        # though DNS resolution was working normally.
+        "geo": ParquetTTLCache("ip_geo", os.path.join(lookups, "dns_geo_cache.parquet"),
                                key_col="ip",
                                ttl_seconds=ttls["geo_hours"] * 3600),
     }

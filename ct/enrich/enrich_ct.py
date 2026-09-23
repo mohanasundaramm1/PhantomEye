@@ -110,7 +110,7 @@ def read_bronze() -> pd.DataFrame:
     for p in paths:
         try:
             dfp = pd.read_parquet(p)
-            keep = [c for c in ("domain", "event_ts", "source", "ingest_ts") if c in dfp.columns]
+            keep = [c for c in ("domain", "event_ts", "source", "ingest_ts", "triage_score") if c in dfp.columns]
             if keep:
                 dfp = dfp[keep]
             dfs.append(dfp)

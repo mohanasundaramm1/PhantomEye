@@ -71,5 +71,22 @@ with DAG(
         execution_timeout=timedelta(minutes=20),
     )
 
+    # 5) COLD GEO BACKFILL (best-effort): fill country/ASN for IPs the CT lane
+    #    resolved but the geo cache could not answer. Tier 1 geo is cache-only
+    #    by design (never a network call on the hot path), and nothing else
+    #    populates geo for CT-discovered IPs -- dns_ip_geo_ingest only covers the
+    #    OSINT/labels lane -- so without this, sample_country stays NULL forever.
+    #    Bounded per run and rate-limited inside the module; the queue drains
+    #    across runs the same way the WHOIS backfill does.
+    geo_backfill = BashOperator(
+        task_id="geo_backfill",
+        bash_command=(
+            f"cd {REPO_ROOT} && export PYTHONPATH=$PYTHONPATH:{REPO_ROOT} && "
+            f"timeout 600 python -m ct.enrich.geo_backfill --max-ips 500 || true"
+        ),
+        execution_timeout=timedelta(minutes=15),
+    )
+
     enrich_hot >> score_ct >> freshness_gate
     score_ct >> enrich_backfill
+    enrich_backfill >> geo_backfill
