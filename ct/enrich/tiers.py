@@ -166,6 +166,21 @@ def _tld_bucket(domain: str, reliable_tlds) -> str:
 
 # ---------------- per-item enrichment ----------------
 
+def _country_code(geo: dict) -> str | None:
+    """ISO-ish country code for a geo cache row, or None.
+
+    Accepts either an explicit country_code or a `country` value that is already
+    a code. Anything longer than a code (i.e. a display name like "United
+    States") returns None rather than being sliced to fit VARCHAR(8).
+    """
+    code = geo.get("country_code")
+    if code and str(code).strip():
+        return str(code).strip()[:8]
+    name = geo.get("country")
+    if name and len(str(name).strip()) <= 3:
+        return str(name).strip()
+    return None
+
 def enrich_item(item: dict, *, whois_cache, dns_cache, geo_cache,
                 rate_limiters: dict, breakers: dict, cfg: dict,
                 dns_fetch=default_dns_fetch, whois_fetch=default_whois_fetch,
@@ -233,7 +248,13 @@ def enrich_item(item: dict, *, whois_cache, dns_cache, geo_cache,
         "has_ipv6": int(any(":" in ip for ip in ips)),
         "num_countries": len(countries),
         "num_asns": len(asns),
-        "sample_country": sample.get("country"),
+        # ct_observations.sample_country is VARCHAR(8) -- sized for an ISO code,
+        # not a display name. Prefer country_code; accept the legacy `country`
+        # field only when it already *is* a code (some writers, and the cache
+        # fixtures, store "CH" there). Never truncate a long name to fit:
+        # "United States"[:8] is "United S", which is not a country -- it is
+        # corruption that renders like data. A null honestly says "unknown".
+        "sample_country": _country_code(sample),
         "sample_asn": sample.get("asn"),
         "sample_isp": sample.get("asn_name") or sample.get("isp"),
     })
@@ -289,13 +310,18 @@ def enrich_item(item: dict, *, whois_cache, dns_cache, geo_cache,
                 "whois_status": w.get("status"),
                 "whois_created": w.get("created"),
                 "whois_expires": w.get("expires"),
+                # train_model.py's has_error = error.notna(); without this the
+                # serving side could never reproduce that feature.
+                "whois_error": w.get("error"),
             })
         else:
             row.update({"registrar": None, "whois_status": None,
-                        "whois_created": None, "whois_expires": None})
+                        "whois_created": None, "whois_expires": None,
+                        "whois_error": None})
     else:
         row.update({"registrar": None, "whois_status": None,
-                    "whois_created": None, "whois_expires": None})
+                    "whois_created": None, "whois_expires": None,
+                    "whois_error": None})
 
     row["enrichment_level"] = f"tier{level}"
     return row

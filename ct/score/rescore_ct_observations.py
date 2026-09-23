@@ -47,6 +47,7 @@ import pandas as pd
 from sqlalchemy import select
 
 from ct.score.score_ct_with_latest import build_features, choose_threshold, load_models, model_version_tag
+from ml.core.features import derive_whois_numeric
 from product.db import SessionLocal
 from product.models import CtObservation
 
@@ -62,8 +63,10 @@ def observations_to_feature_df(rows) -> pd.DataFrame:
     now = datetime.now(timezone.utc)
     records = []
     for r in rows:
-        age_days = (now - r.whois_created).total_seconds() / 86400.0 if r.whois_created else 0.0
-        days_to_expiry = (r.whois_expires - now).total_seconds() / 86400.0 if r.whois_expires else 0.0
+        wn = derive_whois_numeric({
+            "registrar": r.registrar, "whois_status": r.whois_status,
+            "whois_created": r.whois_created, "whois_expires": r.whois_expires,
+        }, now)
         records.append({
             "id": r.id,
             "registered_domain": r.registered_domain or "",
@@ -76,11 +79,16 @@ def observations_to_feature_df(rows) -> pd.DataFrame:
             "sample_country": r.sample_country,
             "registrar": r.registrar,
             "status": r.whois_status,
-            "age_days": age_days,
-            "days_to_expiry": days_to_expiry,
-            "created_isnull": 0 if r.whois_created else 1,
-            "expires_isnull": 0 if r.whois_expires else 1,
-            "has_error": 0,
+            # Raw dates too: build_features() re-derives WHOIS numerics from
+            # raw fields (prepare_whois_columns), and without these it would
+            # overwrite the values below with "no creation date".
+            "whois_created": r.whois_created,
+            "whois_expires": r.whois_expires,
+            "age_days": wn["age_days"],
+            "days_to_expiry": wn["days_to_expiry"],
+            "created_isnull": wn["created_isnull"],
+            "expires_isnull": wn["expires_isnull"],
+            "has_error": wn["has_error"],
             "ti_misp_hit": r.ti_misp_hit or 0,
         })
     return pd.DataFrame.from_records(records)

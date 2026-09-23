@@ -5,6 +5,7 @@
 # and fuse with external threat intel from MISP (silver/misp_osint).
 
 import os, glob, json
+from ml.core.features import prepare_whois_columns
 from datetime import datetime, timezone, timedelta
 
 import numpy as np
@@ -143,6 +144,11 @@ def cat_row(r):
 
 
 def build_features(df: pd.DataFrame):
+    # Derive the 5 WHOIS numerics from raw whois_created/expires/error the way
+    # train_model.py does, and alias whois_status -> status for cat_row().
+    # Before this, every scored row had age_days=0 / created_isnull=0 ("brand
+    # new, date known") and the status categorical was silently dropped.
+    prepare_whois_columns(df)
     domains = df["registered_domain"].fillna("")
 
     # char-level n-gram hashing
@@ -320,30 +326,93 @@ def load_recent_misp_domains(days_back: int = 30) -> set:
             print(f"[warn] failed to read MISP silver {p}: {e}")
             continue
 
-        # Try multiple possible domain columns
+        # Try multiple possible domain columns. "indicator" is what both
+        # misp_ingest.py (authenticated restSearch) and misp_osint_ingest.py
+        # (CIRCL public feed) actually write -- it was missing from this list
+        # entirely, so ti_misp_hit has been 0 on every scored row since this
+        # loader was built, regardless of how much data landed in silver.
+        # Checked "indicator" last only for backward compat with any other
+        # future writer that might use a more specific column name.
         col = None
-        for cand in ("registered_domain", "domain", "host", "value"):
+        for cand in ("registered_domain", "domain", "host", "value", "indicator"):
             if cand in df_misp.columns:
                 col = cand
                 break
         if not col:
             continue
 
-        doms = (
-            df_misp[col]
-            .astype(str)
-            .str.lower()
-            .str.strip()
-            .str.rstrip(".")
-        )
-        regs.extend([reg_domain(d) for d in doms if d])
+        # "indicator" mixes domains, URLs, IPs and hashes (MISP attribute
+        # types). Restrict to indicator types that can plausibly contain a
+        # domain -- the same type filter the authenticated path already
+        # applies via its restSearch query (type=["domain","hostname","url"]).
+        # reg_domain() is tldextract-based and already returns "" for a bare
+        # IP, so this restriction is a precision/performance choice, not a
+        # correctness requirement.
+        rows_df = df_misp
+        if col == "indicator" and "type" in df_misp.columns:
+            rows_df = df_misp[df_misp["type"].isin(["domain", "hostname", "url"])]
+
+        # Keep the HOSTNAME MISP actually reported, not its registered domain.
+        # Collapsing to reg_domain() turned "867633801.pages.dev" into
+        # "pages.dev", and CT rows were collapsed the same way -- so every
+        # Cloudflare Pages / Workers / S3 / Azure host became a "MISP hit".
+        # All 14 hits in the 2026-09-23 batch were that artifact (e.g. a
+        # MongoDB cluster on cosmos.azure.com counted as confirmed malicious).
+        regs.extend(_misp_indicator_host(v) for v in rows_df[col].tolist())
 
     misp_set = {r for r in regs if r}
     print(
-        f"[info] loaded {len(misp_set)} unique registered domains from "
+        f"[info] loaded {len(misp_set)} unique indicator hostnames from "
         f"MISP silver (last {days_back} days) from {root}"
     )
     return misp_set
+
+
+# PSL *including* private suffixes (pages.dev, workers.dev, github.io, ...):
+# used only to stop the MISP match from climbing to a platform-level suffix.
+_PSL_WITH_PRIVATE = tldextract.TLDExtract(include_psl_private_domains=True)
+
+
+def _misp_indicator_host(value) -> str:
+    """Normalize a MISP domain/hostname/url indicator to a bare hostname."""
+    s = str(value or "").strip().lower()
+    if not s or s == "nan":
+        return ""
+    if "://" in s:
+        from urllib.parse import urlparse
+        s = urlparse(s).hostname or ""
+    else:
+        s = s.split("/", 1)[0].split(":", 1)[0]
+    s = s.rstrip(".")
+    for pre in ("*.", "www."):
+        if s.startswith(pre):
+            s = s[len(pre):]
+    return s if "." in s else ""
+
+
+def _is_public_suffix(host: str) -> bool:
+    t = _PSL_WITH_PRIVATE(host)
+    return not t.domain and bool(t.suffix)
+
+
+def misp_host_hit(host, misp_hosts: set) -> bool:
+    """True if `host` is a MISP-reported hostname or a subdomain of one.
+
+    Walks from the full host up toward the registrable domain and stops
+    before any public suffix (PSL incl. private), so "x.pages.dev" can match
+    an indicator "x.pages.dev" but never a bare "pages.dev", while
+    "login.evil.com" still matches an indicator "evil.com"."""
+    h = _misp_indicator_host(host)
+    if not h:
+        return False
+    labels = h.split(".")
+    for i in range(len(labels) - 1):
+        cand = ".".join(labels[i:])
+        if _is_public_suffix(cand):
+            break
+        if cand in misp_hosts:
+            return True
+    return False
 
 
 # ---------- main ----------
@@ -395,7 +464,9 @@ def main():
     # 5) Fuse with MISP silver
     misp_set = load_recent_misp_domains(days_back=30)
     if misp_set:
-        out["ti_misp_hit"] = out["registered_domain"].isin(misp_set).astype(int)
+        host_col = "domain_sample" if "domain_sample" in out.columns else "registered_domain"
+        hosts = out[host_col].where(out[host_col].notna(), out["registered_domain"])
+        out["ti_misp_hit"] = hosts.map(lambda h: int(misp_host_hit(h, misp_set)))
         n_hits = int(out["ti_misp_hit"].sum())
         print(
             f"[info] MISP overlap: {n_hits} / {len(out)} domains "

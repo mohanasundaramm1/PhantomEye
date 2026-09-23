@@ -1076,9 +1076,17 @@ def score_domain(domain: str):
     try:
         # Actually enrich the submitted domain (cache -> DNS/geo -> WHOIS/RDAP),
         # bounded by a short timeout since this is a live user-facing request.
-        enrichment, enrichment_status = enrich_domain_live(domain)
+        # Score the REGISTERED domain, same basis as training and the batch
+        # scorer (both featurize registered_domain). Scoring the raw input
+        # meant "www.google.com" got char n-grams/labels the model never saw
+        # for that site, and a WHOIS lookup on a hostname returns not_found.
+        _ext = tldextract.extract(domain.strip().lower())
+        scored_as = (getattr(_ext, "top_domain_under_public_suffix", None)
+                     or getattr(_ext, "registered_domain", None)
+                     or domain.strip().lower())
+        enrichment, enrichment_status = enrich_domain_live(scored_as)
 
-        X = build_features(domain, enrichment)
+        X = build_features(scored_as, enrichment)
         score = predict_risk(model, model_kind, X)
 
         # Simple heuristic analysis
@@ -1097,10 +1105,17 @@ def score_domain(domain: str):
         else: verdict = "BASELINE_NORMAL"
 
         if len(analysis) == 0 and score < 0.5:
-            analysis = ["Zero-anomaly lexical construction", "Alignment with benign top 1M heuristics"]
+            # Previously also claimed "Alignment with benign top 1M heuristics".
+            # A Tranco top-1M list does exist (airflow/benign/top-1m.csv), but
+            # only as a source of benign TRAINING labels via
+            # ml/core/seed_benign_feedback.py -- this endpoint never checks the
+            # scored domain against it, so the line asserted a per-domain check
+            # that didn't happen. It was shown for any score < 0.5.
+            analysis = ["No lexical anomaly flags triggered"]
 
         return {
             "domain": domain,
+            "scored_as": scored_as,
             "risk_score": float(score),
             "verdict": verdict,
             "level": "CRITICAL" if score > 0.90 else "HIGH" if score > 0.70 else "CLEAN",

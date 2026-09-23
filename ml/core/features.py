@@ -105,6 +105,102 @@ def cat_row(r: dict) -> dict:
     return d
 
 
+# ---------------- WHOIS numeric derivation (serving side of train_model.py) ----------------
+#
+# train_model.py derives the five WHOIS_NUM_COLS from the raw WHOIS record
+# (created / expires / error). ct.enrich.tiers.enrich_item() only emits the
+# RAW fields (whois_created / whois_expires / whois_error / whois_status), and
+# until this helper existed nothing on the serving side derived them: every
+# caller zero-filled all five. age_days=0 with created_isnull=0 reads to the
+# model as "registered today, date known" -- the most phishing-like WHOIS
+# profile possible -- so google.com scored ~0.49 and amazon.com ~0.76 live,
+# and every batch-scored row carried the same garbage.
+#
+# Semantics mirror train_model.py exactly, including its left-merge:
+#   * WHOIS record present -> age/expiry from dates (NaN -> 0 when a date is
+#     missing), created_isnull/expires_isnull = 1 for a missing date,
+#     has_error = 1 if the lookup recorded an error.
+#   * No WHOIS record at all (never looked up / cache miss) -> all five 0,
+#     because training's left-merge leaves them NaN and then fillna(0)s them.
+
+_WHOIS_PRESENCE_KEYS = ("registrar", "whois_status", "status", "whois_created",
+                        "created", "whois_expires", "expires", "whois_error", "error")
+
+
+def _is_missing(v) -> bool:
+    if v is None:
+        return True
+    try:
+        return bool(pd.isna(v))
+    except (TypeError, ValueError):
+        return False
+
+
+def _to_utc(v):
+    if _is_missing(v):
+        return None
+    ts = pd.to_datetime(v, utc=True, errors="coerce")
+    return None if pd.isna(ts) else ts
+
+
+def derive_whois_numeric(rec: dict, now=None) -> dict:
+    """Return the five WHOIS_NUM_COLS for one enriched record, derived the
+    way train_model.py derives them.
+
+    Raw WHOIS fields are the source of truth: if any are present, derive
+    from them even when WHOIS_NUM_COLS already exist on the record -- several
+    upstream steps zero-fill those columns, and trusting a pre-existing 0
+    would silently preserve the exact bug this fixes. Pre-computed values
+    are used only when no raw WHOIS field is present at all."""
+    has_record = any(not _is_missing(rec.get(k)) for k in _WHOIS_PRESENCE_KEYS)
+    if not has_record:
+        if all(not _is_missing(rec.get(c)) for c in WHOIS_NUM_COLS):
+            return {c: float(rec[c]) for c in WHOIS_NUM_COLS}
+        return {c: 0.0 for c in WHOIS_NUM_COLS}
+
+    def _first(*keys):
+        # enrich_item() always writes whois_* keys (often as None), so a
+        # plain .get(a, .get(b)) would never reach the fallback key.
+        for k in keys:
+            if not _is_missing(rec.get(k)):
+                return rec.get(k)
+        return None
+
+    now = now or pd.Timestamp.now(tz="UTC")
+    created = _to_utc(_first("whois_created", "created"))
+    expires = _to_utc(_first("whois_expires", "expires"))
+    err = _first("whois_error", "error")
+    return {
+        "age_days": (now - created).total_seconds() / 86400.0 if created is not None else 0.0,
+        "days_to_expiry": (expires - now).total_seconds() / 86400.0 if expires is not None else 0.0,
+        "created_isnull": 0.0 if created is not None else 1.0,
+        "expires_isnull": 0.0 if expires is not None else 1.0,
+        "has_error": 0.0 if _is_missing(err) else 1.0,
+    }
+
+
+def prepare_whois_columns(df: pd.DataFrame, now=None) -> pd.DataFrame:
+    """In-place: fill WHOIS_NUM_COLS from raw WHOIS fields (see
+    derive_whois_numeric) and alias whois_status -> status for cat_row(),
+    which reads "status" -- the batch path lost that categorical because
+    enrich_item() writes it as whois_status. Returns df for chaining."""
+    if df.empty:
+        return df
+    now = now or pd.Timestamp.now(tz="UTC")
+    derived = pd.DataFrame(
+        [derive_whois_numeric(r, now) for r in df.to_dict(orient="records")],
+        index=df.index,
+    )
+    for c in WHOIS_NUM_COLS:
+        df[c] = derived[c]
+    if "whois_status" in df.columns:
+        if "status" not in df.columns:
+            df["status"] = df["whois_status"]
+        else:
+            df["status"] = df["status"].where(df["status"].notna(), df["whois_status"])
+    return df
+
+
 # ---------------- DataFrame-level builder (batch, matches score_ct_with_latest.py) ----------------
 
 def build_features_from_df(df: pd.DataFrame):
@@ -115,6 +211,8 @@ def build_features_from_df(df: pd.DataFrame):
     `df` is mutated in place to fill missing DNS/WHOIS numeric columns with 0,
     same as the reference implementations.
     """
+    # Derive WHOIS numerics + status alias BEFORE cats/whois blocks read them.
+    prepare_whois_columns(df)
     domains = df["registered_domain"].fillna("")
 
     char_vect = _char_vectorizer()
@@ -163,6 +261,7 @@ def build_features(domain: str, enrichment: dict | None = None):
     the enrichment was complete (see api/main.py's enrichment_status).
     """
     e = dict(enrichment or {})
+    e.update(derive_whois_numeric(e))
     d = (domain or "").lower().strip()
 
     char_vect = _char_vectorizer()
