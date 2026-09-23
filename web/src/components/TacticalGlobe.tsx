@@ -63,27 +63,13 @@ export default function TacticalGlobe({ data }: TacticalGlobeProps) {
         }).filter(d => Number.isFinite(d.lat) && Number.isFinite(d.lng));
     }, [data]);
 
-    // Generate Attack Arcs (Simulated for Visual Impact based on high risk nodes)
-    const arcData = useMemo(() => {
-        const arcs: any[] = [];
-        const highRisk = hexData.filter(d => d.weight > 0.8);
-        // Create arcs from high risk nations to random targets (simulating outbound attacks)
-        highRisk.forEach(source => {
-            // Find a random target that isn't itself
-            const target = hexData[Math.floor(Math.random() * hexData.length)];
-            if (target && target.country !== source.country) {
-                arcs.push({
-                    startLat: source.lat,
-                    startLng: source.lng,
-                    endLat: target.lat,
-                    endLng: target.lng,
-                    color: source.color === "#ff0000" ? ["#ff0000", "#500000"] : ["#00bcd4", "#004d40"],
-                    name: `${source.country} -> ${target.country}`
-                });
-            }
-        });
-        return arcs;
-    }, [hexData]);
+    // NOTE: an earlier version drew animated 'attack arcs' between random
+    // country pairs (Math.random() target selection) purely for visual effect.
+    // They represented no real observed relationship between infrastructure,
+    // which directly contradicted this dashboard's own 'no simulated events'
+    // claim, so they were removed. Do not reintroduce decorative geometry here:
+    // if arcs come back, they must encode a real edge (e.g. shared ASN, shared
+    // registrar, or same-campaign cluster membership) sourced from the API.
 
     useEffect(() => {
         if (globeRef.current) {
@@ -119,14 +105,6 @@ export default function TacticalGlobe({ data }: TacticalGlobeProps) {
                 hexSideColor={() => "rgba(0, 50, 50, 0.6)"}
                 hexBinMerge={true}
 
-                // Arcs
-                arcsData={arcData}
-                arcColor="color"
-                arcDashLength={0.4}
-                arcDashGap={0.2}
-                arcDashInitialGap={() => Math.random()}
-                arcDashAnimateTime={2000}
-                arcStroke={0.5}
 
                 width={800} // Fixed width to match container logic (will be responsive via container hidden overflow)
                 height={600}
