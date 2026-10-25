@@ -22,13 +22,14 @@ quietly wrong.
 
 ## What gets installed
 
-Three launchd **user agents** (they run as you, on login — no root, no `sudo`):
+Four launchd **user agents** (they run as you, on login — no root, no `sudo`):
 
 | Agent | Type | What it does |
 |---|---|---|
 | `com.phantomeye.forwarder` | `KeepAlive` | Keeps `forwarder.py` alive; restarts on crash, starts on login/boot/wake. |
 | `com.phantomeye.stream-ct` | `KeepAlive` | Same for the Spark `stream_ct.py` consumer. Runs with `SPARK_LOCAL_IP=127.0.0.1` and `CT_RESET_CHK_ON_START=0` so restarts **resume** from the last Kafka offset instead of dropping data. |
 | `com.phantomeye.freshness-watchdog` | `StartInterval` (5 min) | Runs `scripts/ct_freshness_watchdog.py`. If no fresh CT data has landed in >60 min, it fires a macOS notification. This is the safety net for a process that is *alive but not producing output* — the one thing `KeepAlive` cannot detect. |
+| `com.phantomeye.log-rotate` | `StartInterval` (15 min) | Runs `rotate_logs.sh`, capping each of the two `KeepAlive` agents' stdout/stderr logs at 50 MB (5 gzipped backups kept per file, `LOG_ROTATE_KEEP`). Found live: `forwarder.err.log` grew to **178 GB** with nothing rotating it, down to 5.3 GB free on disk. Uses copytruncate (truncates the same inode in place), not rename-and-recreate — both agents hold their log fd open for their whole lifetime, so a rename would leave them writing into a detached, invisible file forever. |
 
 The `*.plist.template` files are portable (they contain `__PLACEHOLDERS__`).
 `install.sh` renders them with this machine's real repo path, venv Python,
@@ -38,9 +39,9 @@ loads them.
 ## Usage
 
 ```bash
-make supervise-install     # render + load all three agents (idempotent)
+make supervise-install     # render + load all four agents (idempotent)
 make supervise-status      # show state/pid of each agent + last watchdog result
-make supervise-uninstall   # stop + remove all three agents
+make supervise-uninstall   # stop + remove all four agents
 ```
 
 Logs land in `ops/launchd/logs/` (gitignored):

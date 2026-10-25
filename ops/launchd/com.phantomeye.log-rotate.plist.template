@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Runs rotate_logs.sh every 15 minutes so forwarder.py's and stream_ct.py's
+  launchd-redirected stdout/stderr can never again grow unbounded (found
+  live: forwarder.err.log reached 178 GB with no rotation in place, down to
+  5.3 GB free on disk). See rotate_logs.sh for why this uses copytruncate
+  instead of the rename-and-recreate rotation style.
+
+  Placeholders (__NAME__) are substituted by ops/launchd/install.sh at install
+  time. Do not hand-edit the rendered copy; re-run `make supervise-install`.
+
+  StartInterval (not KeepAlive): this is a periodic one-shot task, not a
+  long-running daemon -- it runs, exits, and launchd relaunches it 15 minutes
+  later. StandardOutPath/StandardErrorPath are intentionally NOT redirected
+  into ops/launchd/logs/ -- a log-rotation task that logged into the
+  directory it rotates would eventually need to rotate itself.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.phantomeye.log-rotate</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__REPO_ROOT__/ops/launchd/rotate_logs.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__REPO_ROOT__</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__PATH__</string>
+  </dict>
+
+  <key>StartInterval</key>
+  <integer>900</integer>
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>StandardOutPath</key>
+  <string>/dev/null</string>
+  <key>StandardErrorPath</key>
+  <string>/dev/null</string>
+</dict>
+</plist>
