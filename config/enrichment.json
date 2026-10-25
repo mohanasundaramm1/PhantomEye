@@ -14,7 +14,7 @@
     "dns_seconds": 5.0
   },
   "tiers": {
-    "triage_threshold": 0.5,
+    "triage_threshold": 0.2948,
     "missing_triage_is_high_priority": true
   },
   "hot_path": {

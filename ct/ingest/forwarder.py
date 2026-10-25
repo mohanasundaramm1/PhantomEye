@@ -13,11 +13,11 @@
 #   CT_LOW_PRIORITY_DIR       (override low-priority spool directory)
 #   CT_METRICS_LOG_EVERY_SEC  (default "30" seconds between counter log lines)
 #
-# Intake flow per domain (see config/triage.json for knobs):
-#   1. deterministic sampling (triage.should_sample) -> drop or keep
-#   2. local triage score (triage.triage_score):
-#        score >= pass_threshold -> forward to Kafka with score+reasons
-#        score <  pass_threshold -> append to low-priority jsonl spool
+# Intake flow per domain (triage.route_domain; see config/triage.json):
+#   score >= pass_threshold            -> forward to Kafka with score+reasons
+#   score <  pass_threshold, sampled   -> append to low-priority jsonl spool
+#   score <  pass_threshold, unsampled -> drop
+# Scoring runs before sampling so a high scorer is never sampled away.
 
 import os
 import json
@@ -31,8 +31,9 @@ from kafka import KafkaProducer
 from kafka.errors import KafkaTimeoutError, KafkaError
 
 try:
-    from ct.ingest import triage
+    from ct.ingest import backoff, triage
 except ImportError:  # running as a plain script from ct/ingest/
+    import backoff
     import triage
 
 # ---------- config ----------
@@ -53,7 +54,6 @@ os.makedirs(LOW_PRIORITY_DIR, exist_ok=True)
 METRICS_LOG_EVERY_SEC = float(os.getenv("CT_METRICS_LOG_EVERY_SEC", "30"))
 
 TRIAGE_CFG = triage.load_config()
-TRIAGE_PASS_THRESHOLD = float(TRIAGE_CFG["triage"]["pass_threshold"])
 
 logging.basicConfig(
     level=logging.INFO,
@@ -158,7 +158,7 @@ def _maybe_flush():
         log.warning("Kafka flush timeout after %.1fs (will retry later): %r", FLUSH_TIMEOUT_SEC, e)
 
 
-def on_message(_ws, msg: str):
+def on_message(_ws, msg):  # str or bytes (see skip_utf8_validation in the main loop)
     global _sent_since_flush
     try:
         data = json.loads(msg)
@@ -177,18 +177,17 @@ def on_message(_ws, msg: str):
 
             _counters["ingested"] += 1
 
-            # deterministic sampling (brand/suspicious-TLD hits bypass it)
-            if not triage.should_sample(d, TRIAGE_CFG):
+            # cheap local triage first, then sampling for low scorers only
+            decision, score, reasons = triage.route_domain(d, TRIAGE_CFG)
+            if decision == triage.DROP:
                 _counters["sampled_out"] += 1
                 continue
 
-            # cheap local triage before anything hits downstream enrichment
-            score, reasons = triage.triage_score(d, TRIAGE_CFG)
             event = evt(d, i)
             event["triage_score"] = round(score, 4)
             event["triage_reasons"] = reasons
 
-            if score < TRIAGE_PASS_THRESHOLD:
+            if decision == triage.SPOOL:
                 _counters["triage_deferred"] += 1
                 _spool_low_priority(event)
                 continue
@@ -232,7 +231,9 @@ def on_close(*_):
 
 if __name__ == "__main__":
     try:
+        delay = 0.0
         while True:
+            started = time.monotonic()
             try:
                 ws = WebSocketApp(
                     WS_URL,
@@ -241,13 +242,30 @@ if __name__ == "__main__":
                     on_close=on_close,
                 )
                 ws.on_open = on_open
-                ws.run_forever(ping_interval=30, ping_timeout=20)
+                # skip_utf8_validation: without the optional `wsaccel` C extension,
+                # websocket-client validates every text frame's UTF-8 in pure
+                # Python (_validate_utf8 + _decode). Profiled live: that was ~67%
+                # of this process's CPU -- more than triage, JSON and Kafka
+                # combined -- which is what made the forwarder fall behind and
+                # CertStream skip ~1,000+ certs/s. on_message receives raw bytes
+                # when this is set; json.loads() decodes them in C (and a
+                # malformed message just raises inside on_message, which already
+                # logs and carries on).
+                ws.run_forever(ping_interval=30, ping_timeout=20, skip_utf8_validation=True)
             except KeyboardInterrupt:
                 log.info("KeyboardInterrupt, shutting down...")
                 break
             except Exception as e:
-                log.error("[ct] websocket crashed, retrying in 5s: %r", e)
-                time.sleep(5)
+                log.error("[ct] websocket crashed: %r", e)
+            # run_forever() returns (it does not raise) when the connection is
+            # refused or drops, so this must pace EVERY pass -- sleeping only in
+            # the except branch left a down CertStream being retried ~850x/sec.
+            # See ct/ingest/backoff.py.
+            ran_for = time.monotonic() - started
+            delay = backoff.next_delay(delay, ran_for)
+            if delay > 0:
+                log.warning("[ct] connection lasted %.1fs; reconnecting in %.0fs", ran_for, delay)
+                time.sleep(delay)
     finally:
         try:
             _maybe_flush()

@@ -29,6 +29,7 @@ LABELS=(
   com.phantomeye.forwarder
   com.phantomeye.stream-ct
   com.phantomeye.freshness-watchdog
+  com.phantomeye.log-rotate
 )
 
 echo "==> PhantomEye supervisor install"

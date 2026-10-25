@@ -117,7 +117,7 @@ supervise-uninstall:
 # Show each agent's state/pid and the watchdog's last recorded result.
 supervise-status:
 	@UID_NUM=$$(id -u); \
-	for label in com.phantomeye.forwarder com.phantomeye.stream-ct com.phantomeye.freshness-watchdog; do \
+	for label in com.phantomeye.forwarder com.phantomeye.stream-ct com.phantomeye.freshness-watchdog com.phantomeye.log-rotate; do \
 	  if launchctl print gui/$$UID_NUM/$$label >/dev/null 2>&1; then \
 	    state=$$(launchctl print gui/$$UID_NUM/$$label 2>/dev/null | awk -F'= ' '/state = /{print $$2; exit}'); \
 	    pid=$$(launchctl print gui/$$UID_NUM/$$label 2>/dev/null | awk -F'= ' '/pid = /{print $$2; exit}'); \

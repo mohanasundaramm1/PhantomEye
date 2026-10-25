@@ -19,7 +19,7 @@ from ct.enrich.circuit import CircuitBreaker
 from ct.enrich.config import abspath, load_config
 from ct.enrich.ratelimit import TokenBucket
 from ct.enrich.tiers import EnrichFailure, enrich_item
-from ct.ingest.triage import CONFIG_PATH_DEFAULT as TRIAGE_CONFIG_PATH_DEFAULT
+from ct.ingest.triage import CONFIG_PATH_DEFAULT as TRIAGE_CONFIG_PATH_DEFAULT, brand_matches
 
 try:
     import lightgbm as lgb
@@ -1097,11 +1097,25 @@ def score_domain(domain: str):
         if any(c.isdigit() for c in domain) and sum(c.isalpha() for c in domain) < 4:
             analysis.append("Anomaly: High numeric-to-alpha ratio detected")
 
+        # Brand impersonation check -- this endpoint previously ran ONLY the
+        # ML model plus the four generic heuristics above, never the actual
+        # brand/triage matcher the real CT-stream pipeline uses. A domain
+        # could exact-match a watchlisted brand (paypal-secure-login-verify.xyz)
+        # or a known homoglyph trick (rnicrosoft.com) and this drilldown would
+        # never surface it; only the model's own learned pattern would, and
+        # if that pattern wasn't well represented in training, it silently
+        # scored clean. brand_matches() runs the same watchlist + homoglyph +
+        # provider-context-suppression logic as the live stream.
+        brand_hits = brand_matches(scored_as)
+        if brand_hits:
+            analysis.append(f"Brand match: impersonates {', '.join(brand_hits)}")
+
         # Analyst verdict
         if score > 0.99: verdict = "CONFIRMED_MALICIOUS_INFRA"
         elif score > 0.90: verdict = "IMMINENT_PHISHING_THREAT"
         elif score > 0.70: verdict = "HIGH_PROBABILITY_STAGING"
         elif score > 0.40: verdict = "SUSPICIOUS_PATTERN"
+        elif brand_hits: verdict = "SUSPICIOUS_PATTERN"
         else: verdict = "BASELINE_NORMAL"
 
         if len(analysis) == 0 and score < 0.5:
@@ -1118,7 +1132,7 @@ def score_domain(domain: str):
             "scored_as": scored_as,
             "risk_score": float(score),
             "verdict": verdict,
-            "level": "CRITICAL" if score > 0.90 else "HIGH" if score > 0.70 else "CLEAN",
+            "level": "CRITICAL" if score > 0.90 else "HIGH" if score > 0.70 or brand_hits else "CLEAN",
             "analysis": analysis if analysis else ["Model scored risk based on embedded sub-features"],
             "model_used": model_kind,
             "enrichment_status": enrichment_status,

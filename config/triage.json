@@ -5,16 +5,17 @@
     "always_include_suspicious_tld": true
   },
   "triage": {
-    "pass_threshold": 0.35,
+    "pass_threshold": 0.198,
     "weights": {
-      "suspicious_tld": 0.3,
-      "high_entropy": 0.25,
-      "brand_match": 0.4,
-      "excessive_hyphens": 0.1,
-      "excessive_digits": 0.1,
-      "long_domain": 0.1,
-      "punycode": 0.2,
-      "free_subdomain_provider": 0.25
+      "suspicious_tld": 0.0431,
+      "high_entropy": 0.1076,
+      "brand_match": 0.3044,
+      "sensitive_word": 0.2835,
+      "excessive_hyphens": 0.0473,
+      "excessive_digits": 0.027,
+      "long_domain": 0.0,
+      "punycode": 0.0,
+      "free_subdomain_provider": 0.1872
     },
     "entropy_threshold": 3.8,
     "max_hyphens": 3,
@@ -69,7 +70,24 @@
     "support",
     "billing",
     "invoice",
-    "password"
+    "password",
+    "fedex",
+    "ups",
+    "dhl",
+    "usps",
+    "chase",
+    "wellsfargo",
+    "hsbc",
+    "bankofamerica",
+    "santander",
+    "metamask",
+    "ledger",
+    "outlook",
+    "office",
+    "onedrive",
+    "teams",
+    "crypto",
+    "blockchain"
   ],
   "free_subdomain_providers": [
     "duckdns.org",
@@ -95,7 +113,9 @@
       "amazon.com",
       "media-amazon.com",
       "ssl-images-amazon.com",
-      "amazontrust.com"
+      "amazontrust.com",
+      "amazon.dev",
+      "aws.dev"
     ],
     "google": [
       "google.com",
@@ -117,7 +137,10 @@
       "office365.com",
       "live.com",
       "msn.com",
-      "microsoft-int.com"
+      "microsoft-int.com",
+      "microsoft-falcon.net",
+      "ppe-microsoft-falcon.net",
+      "microsoft"
     ],
     "apple": [
       "apple.com",
@@ -132,7 +155,8 @@
     ],
     "instagram": [
       "instagram.com",
-      "cdninstagram.com"
+      "cdninstagram.com",
+      "fbcdn.net"
     ],
     "whatsapp": [
       "whatsapp.com",
@@ -160,6 +184,54 @@
       "deloitte.co.uk",
       "deloitte.ca",
       "deloitte.de"
+    ],
+    "fedex": [
+      "fedex.com"
+    ],
+    "ups": [
+      "ups.com"
+    ],
+    "dhl": [
+      "dhl.com"
+    ],
+    "usps": [
+      "usps.com"
+    ],
+    "chase": [
+      "chase.com"
+    ],
+    "wellsfargo": [
+      "wellsfargo.com"
+    ],
+    "hsbc": [
+      "hsbc.com",
+      "hsbc.co.uk"
+    ],
+    "bankofamerica": [
+      "bankofamerica.com"
+    ],
+    "santander": [
+      "santander.com"
+    ],
+    "metamask": [
+      "metamask.io"
+    ],
+    "ledger": [
+      "ledger.com"
+    ],
+    "outlook": [
+      "outlook.com"
+    ],
+    "office": [
+      "office.com",
+      "office365.com"
+    ],
+    "onedrive": [
+      "onedrive.com",
+      "onedrive.live.com"
+    ],
+    "teams": [
+      "teams.microsoft.com"
     ]
   },
   "infra_suffixes": [
@@ -168,5 +240,65 @@
     "akamaihd.net",
     "fastly.net",
     "cloudflare.net"
-  ]
+  ],
+  "weights_provenance": {
+    "fitted_utc": "2026-09-24T22:01:25+00:00",
+    "script": "ml/core/fit_triage_weights.py",
+    "fit_day": "2026-09-22",
+    "eval_day": "2026-09-23",
+    "n_positives": 8012,
+    "daily_budget": 7200,
+    "logistic_coefficients": {
+      "suspicious_tld": 0.593,
+      "high_entropy": 1.4797,
+      "brand_match": 4.1875,
+      "sensitive_word": 3.9,
+      "excessive_hyphens": 0.6507,
+      "excessive_digits": 0.3717,
+      "long_domain": -2.54,
+      "punycode": -1.4014,
+      "free_subdomain_provider": 2.575
+    },
+    "eval": [
+      {
+        "config": "before (hand weights, sample-then-score)",
+        "reaches_kafka": 0.0873,
+        "budget_recall": 0.0032,
+        "est_forwarded_per_day": 512325
+      },
+      {
+        "config": "after (fitted weights, score-then-sample)",
+        "reaches_kafka": 0.2095,
+        "budget_recall": 0.0329,
+        "est_forwarded_per_day": 102315
+      }
+    ],
+    "budget_curve": [
+      {
+        "daily_budget": 7200,
+        "before": 0.0032,
+        "after": 0.0329
+      },
+      {
+        "daily_budget": 36000,
+        "before": 0.0061,
+        "after": 0.1562
+      },
+      {
+        "daily_budget": 72000,
+        "before": 0.0431,
+        "after": 0.1947
+      },
+      {
+        "daily_budget": 144000,
+        "before": 0.0438,
+        "after": 0.2095
+      },
+      {
+        "daily_budget": 288000,
+        "before": 0.0464,
+        "after": 0.2095
+      }
+    ]
+  }
 }
