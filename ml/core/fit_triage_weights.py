@@ -36,6 +36,11 @@ Method
 - Evaluation is out-of-sample twice over: background from a different day, and
   positives from the half not used for fitting (split by a hash of the domain).
 
+Data retention: the spool days this reads are pruned after 7 days by
+ops/launchd/prune_spool.sh (SPOOL_KEEP_DAYS), so --fit-day / --eval-day must be
+recent. A past fit (see weights_provenance in config/triage.json) cannot be re-run
+on its original days once they age out; re-fit on fresh traffic instead.
+
 Known ceiling (measured 2026-09-24, 30 label partitions)
 -------------------------------------------------------
 ~45% of OpenPhish/URLHaus domains fire NO triage rule, and no reweighting can

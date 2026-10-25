@@ -45,7 +45,10 @@ rotate_one() {
   local f="$1"
   [[ -f "${f}" ]] || return 0
   local size
-  size="$(stat -f %z "${f}" 2>/dev/null || echo 0)"
+  # `wc -c < file`, not `stat -f %z`: BSD stat (macOS) and GNU stat (Linux CI)
+  # disagree on -f, and a silent 0 here would mean "never rotate".
+  size="$(wc -c < "${f}" 2>/dev/null | tr -d ' ')"
+  size="${size:-0}"
   if (( size <= MAX_BYTES )); then
     return 0
   fi
@@ -78,3 +81,10 @@ for f in "${LOG_DIR}"/forwarder.out.log \
          "${LOG_DIR}"/watchdog.err.log; do
   rotate_one "${f}"
 done
+
+# Also trim the forwarder's low-priority spool (see prune_spool.sh). Skipped
+# when LOG_ROTATE_DIR is overridden (i.e. under test) unless SPOOL_DIR is too,
+# so a test of log rotation can never delete real spool data by default.
+if [[ -z "${LOG_ROTATE_DIR:-}" || -n "${SPOOL_DIR:-}" ]]; then
+  bash "${SCRIPT_DIR}/prune_spool.sh"
+fi
