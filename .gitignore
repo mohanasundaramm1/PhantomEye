@@ -43,3 +43,7 @@ ops/launchd/logs/
 # runtime logs above.
 product/logs/
 AUDIT.md
+
+# local artifacts, not source
+backup_bronze_silver_*.tgz
+pre_migration_airflow.log
