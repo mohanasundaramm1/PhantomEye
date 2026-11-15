@@ -69,8 +69,8 @@ def _session() -> requests.Session:
 
 
 def _lookup(session: requests.Session, ips: List[str]) -> Dict[str, Dict[str, Any]]:
-    """Batch-resolve IPs to geo fields. Mirrors dns_ip_geo_dag._ip_geo_batch so
-    both writers produce identically-shaped rows in the same cache."""
+    """Batch-resolve IPs to geo fields (ip-api batch endpoint) for the shared
+    geo cache."""
     out: Dict[str, Dict[str, Any]] = {}
     for i in range(0, len(ips), BATCH_SIZE):
         chunk = ips[i:i + BATCH_SIZE]

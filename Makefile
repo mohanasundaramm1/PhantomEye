@@ -2,10 +2,9 @@ VENV_ACT = . .venv/bin/activate
 
 # api/ and web/ are real directories in this repo; without .PHONY, `make api`
 # and `make web` would be (incorrectly) considered "up to date" and no-op.
-.PHONY: up down up-all down-all topic-reset produce stream stream-fast \
-        stream-fresh stream-ct forward-ct api web check-freshness test \
+.PHONY: up down up-all down-all stream-ct forward-ct api web check-freshness test \
         supervise-install supervise-uninstall supervise-status \
-        seed-brands ingest-observations assemble-campaigns
+        seed-brands seed-analysts ingest-observations assemble-campaigns
 
 up:
 	docker compose up -d
@@ -44,24 +43,6 @@ down-all:
 	docker compose -f airflow/docker-compose.airflow.yml down
 	@echo "==> stopping root stack"
 	docker compose down
-
-topic-reset:
-	- docker compose exec kafka kafka-topics --delete --topic domain-events --bootstrap-server kafka:9092
-	docker compose exec kafka kafka-topics --create --topic domain-events --bootstrap-server kafka:9092 --replication-factor 1 --partitions 1
-	docker compose exec kafka kafka-topics --list --bootstrap-server kafka:9092
-
-produce:
-	$(VENV_ACT) && python simulator/producer.py
-
-stream:
-	$(VENV_ACT) && python pipelines/spark_stream.py
-
-stream-fast:
-	$(VENV_ACT) && SPARK_TRIGGER_SECS=2 python pipelines/spark_stream.py
-
-stream-fresh:
-	rm -rf bronze dlq chk
-	$(VENV_ACT) && SPARK_CHECKPOINT_DIR=./chk/dev python pipelines/spark_stream.py
 
 # Real CT lane: forwarder.py (certstream ws -> Kafka topic ct-events) must
 # already be running separately -- this only consumes ct-events -> parquet.
