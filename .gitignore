@@ -47,3 +47,6 @@ AUDIT.md
 # local artifacts, not source
 backup_bronze_silver_*.tgz
 pre_migration_airflow.log
+
+# local-only review notes (not for the public repo)
+docs/private/

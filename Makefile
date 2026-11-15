@@ -4,7 +4,7 @@ VENV_ACT = . .venv/bin/activate
 # and `make web` would be (incorrectly) considered "up to date" and no-op.
 .PHONY: up down up-all down-all stream-ct forward-ct api web check-freshness test \
         supervise-install supervise-uninstall supervise-status \
-        seed-brands seed-analysts ingest-observations assemble-campaigns
+        seed-brands seed-analysts ingest-observations assemble-campaigns test-db
 
 up:
 	docker compose up -d
@@ -115,3 +115,13 @@ supervise-status:
 # the bare `pytest` console script anchors sys.path[0] to .venv/bin instead.
 test:
 	$(VENV_ACT) && python -m pytest -q
+
+# One-time (idempotent): create the isolated test database inside the app-db
+# container and migrate it. tests/conftest.py points every test run at it and
+# refuses any database whose name doesn't end in "_test".
+TEST_DATABASE_URL ?= postgresql+psycopg2://app:app@localhost:5433/campaigns_test
+test-db:
+	docker compose exec -T app-db psql -U app -d campaigns -tAc \
+	  "SELECT 1 FROM pg_database WHERE datname='campaigns_test'" | grep -q 1 \
+	  || docker compose exec -T app-db createdb -U app campaigns_test
+	$(VENV_ACT) && APP_DATABASE_URL=$(TEST_DATABASE_URL) alembic upgrade head
