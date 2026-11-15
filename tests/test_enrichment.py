@@ -763,3 +763,40 @@ def test_enrich_item_passes_configured_timeout_through_to_whois_fetch(tmp_path):
         dns_fetch=lambda d: ["1.2.3.4"], whois_fetch=whois_fetch,
     )
     assert received["timeout"] == 7.5  # matches cfg, not whois_fetch's own unrelated default
+
+
+# ---------------- shared-file cache wiring (regression) ----------------
+
+def test_production_cache_wiring_keeps_dns_writes_when_all_caches_flush(tmp_path):
+    """build_caches() points "dns" and "geo" at the SAME dns_geo_cache.parquet.
+    "geo" is never upserted, and the worker flushes every cache in
+    whois -> dns -> geo order. Before the dirty flag, geo's flush rewrote its
+    load-time snapshot last and silently discarded every new DNS row (no DNS
+    row persisted from 2026-09-23 until this fix)."""
+    from ct.enrich.enrich_worker import build_caches
+
+    cfg = make_cfg(tmp_path)
+    lookups = tmp_path / "lookups"
+    lookups.mkdir()
+    pd.DataFrame([{"puny_domain": "old.com", "ip": "1.1.1.1",
+                   "fetched_at": pd.Timestamp("2026-01-01", tz="UTC")}]
+                 ).to_parquet(lookups / "dns_geo_cache.parquet", index=False)
+
+    caches = build_caches(cfg)
+    assert caches["dns"].path == caches["geo"].path  # the production wiring under test
+
+    caches["dns"].upsert([{"puny_domain": "new.com", "ip": "2.2.2.2"}])
+    for c in caches.values():  # same order as run_worker / run_hot_cycle
+        c.flush()
+
+    on_disk = set(pd.read_parquet(lookups / "dns_geo_cache.parquet")["puny_domain"])
+    assert on_disk == {"old.com", "new.com"}
+
+
+def test_flush_writes_only_when_dirty(tmp_path):
+    path = tmp_path / "c.parquet"
+    c = ParquetTTLCache("t", str(path), "k", 3600)
+    assert c.flush() is False and not path.exists()   # clean: no write
+    c.upsert([{"k": "a"}])
+    assert c.flush() is True and path.exists()        # dirty: writes
+    assert c.flush() is False                          # clean again after write
