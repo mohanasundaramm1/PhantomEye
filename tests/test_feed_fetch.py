@@ -90,3 +90,23 @@ def test_urlhaus_key_is_placed_in_the_url_path_and_reported_as_a_secret():
 def test_urlhaus_explicit_url_overrides_and_supports_a_key_placeholder():
     url, secrets = urlhaus_feed_url({"URLHAUS_FEED_URL": "https://mirror.example/{key}/all.csv", "URLHAUS_AUTH_KEY": "k"})
     assert url == "https://mirror.example/k/all.csv" and secrets == ("k",)
+
+
+# ---- host extraction (found with the real URLhaus feed: ftp:// URLs became the host "ftp") ----
+from feed_fetch import host_from_url  # noqa: E402
+
+
+@pytest.mark.parametrize("url,host", [
+    ("ftp://45.90.163.37/jklarm5", "45.90.163.37"),            # was "ftp"
+    ("http://115.48.146.158:46145/i", "115.48.146.158"),
+    ("https://Example.COM/x?y=1", "example.com"),
+    ("example.com/path", "example.com"),                       # no scheme at all
+    ("ftp://user:pw@host.example:21/f", "host.example"),
+    ("sftp://files.example/x", "files.example"),
+])
+def test_host_from_url_handles_any_scheme(url, host):
+    assert host_from_url(url) == host
+
+
+def test_host_from_url_returns_none_for_junk():
+    assert host_from_url("") is None

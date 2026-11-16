@@ -12,7 +12,7 @@ from airflow import DAG
 from alerts import notify_failure
 from airflow.operators.python import PythonOperator, get_current_context
 from airflow.exceptions import AirflowSkipException, AirflowFailException
-from feed_fetch import PermanentFeedError, TransientFeedError, fetch_feed, urlhaus_feed_url
+from feed_fetch import PermanentFeedError, TransientFeedError, fetch_feed, host_from_url, urlhaus_feed_url
 
 log = logging.getLogger(__name__)
 
@@ -46,11 +46,8 @@ def _to_utc_timestamp(ts_str: str):
     t = pd.Timestamp(ts_str)
     return t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
 
-def _host(u: str):
-    u = str(u).strip()
-    if not re.match(r"^https?://", u):
-        u = "http://" + u
-    return urlparse(u).hostname
+# Any URL scheme (feeds list ftp:// URLs too); see feed_fetch.host_from_url.
+_host = host_from_url
 
 def fetch_and_write_urlhaus(ds: str | None = None, ts: str | None = None, **context):
     # Align with orchestrator’s logical date/time
@@ -130,7 +127,7 @@ def fetch_and_write_urlhaus(ds: str | None = None, ts: str | None = None, **cont
     gdf = ge.from_pandas(df)
     assert gdf.expect_column_to_exist("domain").success
     assert gdf.expect_column_values_to_not_be_null("domain").success
-    assert gdf.expect_column_values_to_match_regex("url", r"^https?://").success
+    assert gdf.expect_column_values_to_match_regex("url", r"^(https?|ftp)://").success
 
     # Idempotent + atomic write
     if os.path.exists(outdir):

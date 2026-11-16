@@ -12,7 +12,9 @@ contain the URL goes through redact() first.
 """
 from __future__ import annotations
 
+import re
 import time
+from urllib.parse import urlparse
 
 PERMANENT_STATUSES = frozenset({401, 403, 404, 410})
 
@@ -74,3 +76,16 @@ def urlhaus_feed_url(environ) -> tuple[str, tuple]:
     if explicit:
         return explicit.replace("{key}", key), (key,)
     return f"https://urlhaus-api.abuse.ch/v2/files/exports/{key}/recent.csv", (key,)
+
+
+_SCHEME = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
+
+
+def host_from_url(u) -> str | None:
+    """Hostname of a feed URL, for any scheme. The ingest DAGs used to prepend
+    "http://" unless the URL started with http(s)://, so "ftp://1.2.3.4/x" became
+    "http://ftp://1.2.3.4/x" whose hostname is "ftp": a bogus domain in the labels."""
+    u = str(u).strip()
+    if not _SCHEME.match(u):
+        u = "http://" + u
+    return urlparse(u).hostname
