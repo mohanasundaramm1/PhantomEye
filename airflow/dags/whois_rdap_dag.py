@@ -10,6 +10,7 @@ import pandas as pd
 import tldextract
 
 from airflow import DAG
+from alerts import notify_failure
 from airflow.operators.python import PythonOperator, get_current_context
 from airflow.exceptions import AirflowSkipException
 
@@ -207,6 +208,7 @@ def whois_rdap_task(ds: str | None = None, ts: str | None = None, **context):
 
 
 default_args = {
+    "on_failure_callback": notify_failure,
     "owner": "you",
     "retries": 2,
     "retry_delay": timedelta(minutes=5),

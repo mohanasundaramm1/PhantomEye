@@ -7,6 +7,7 @@ import pandas as pd
 import tldextract
 
 from airflow import DAG
+from alerts import notify_failure
 from airflow.operators.python import PythonOperator
 from airflow.exceptions import AirflowSkipException
 
@@ -126,6 +127,7 @@ def dns_ip_geo_task(ds: str, ts: str, **context):
 
 
 default_args = {
+    "on_failure_callback": notify_failure,
     "owner": "you",
     "retries": 2,
     "retry_delay": timedelta(minutes=5),

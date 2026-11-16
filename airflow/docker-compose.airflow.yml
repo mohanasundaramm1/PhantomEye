@@ -103,6 +103,10 @@ services:
       # See the webserver block above for why this points at host.docker.internal
       # rather than localhost: app-db lives in a different compose project.
       APP_DATABASE_URL: "postgresql+psycopg2://app:app@host.docker.internal:5433/campaigns"
+      # Tasks run inside the scheduler (LocalExecutor). Set these in the repo-root .env
+      # (see .env.example); `make up-all` passes that file to this compose project.
+      URLHAUS_AUTH_KEY: ${URLHAUS_AUTH_KEY:-}
+      NTFY_TOPIC: ${NTFY_TOPIC:-}
     volumes:
       - ./dags:/opt/airflow/dags
       - ./logs:/opt/airflow/logs

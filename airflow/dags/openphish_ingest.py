@@ -9,8 +9,10 @@ import requests
 import great_expectations as ge
 
 from airflow import DAG
+from alerts import notify_failure
 from airflow.operators.python import PythonOperator, get_current_context
-from airflow.exceptions import AirflowSkipException
+from airflow.exceptions import AirflowSkipException, AirflowFailException
+from feed_fetch import PermanentFeedError, TransientFeedError, fetch_feed
 
 log = logging.getLogger(__name__)
 
@@ -70,21 +72,15 @@ def fetch_and_write_openphish(ds: str | None = None, ts: str | None = None, **co
             )
         raise AirflowSkipException("[openphish_ingest] OpenPhish has no historical feed; skipping backfill.")
 
-    # Resilient fetch
+    # Resilient fetch: a permanent HTTP error fails at once (no retries); transient ones are retried.
     url = "https://openphish.com/feed.txt"
-    sess = requests.Session()
-    last_exc = None
-    for attempt in range(3):
-        try:
-            r = sess.get(url, timeout=(5, 30), headers={"User-Agent": "threat-intel-lab/0.1"})
-            if r.ok and len(r.text) > 200:  # basic content sanity
-                break
-            last_exc = RuntimeError(f"Bad response (status={r.status_code}, len={len(r.text)})")
-        except Exception as e:
-            last_exc = e
-        time.sleep(2)
-    else:
-        raise last_exc if last_exc else RuntimeError("OpenPhish fetch failed")
+    try:
+        r = fetch_feed(requests.Session(), url, min_len=200, timeout=(5, 30),
+                       headers={"User-Agent": "threat-intel-lab/0.1"})
+    except PermanentFeedError as e:
+        raise AirflowFailException(f"[openphish_ingest] {e}") from None
+    except TransientFeedError as e:
+        raise RuntimeError(f"[openphish_ingest] {e}") from None
 
     # Normalize: one URL per line (ignore comments/blank lines)
     lines = [ln.strip() for ln in r.text.splitlines() if ln.strip() and not ln.startswith("#")]
@@ -121,7 +117,8 @@ def fetch_and_write_openphish(ds: str | None = None, ts: str | None = None, **co
     os.replace(tmp, final_path)
     log.info("[openphish_ingest] %s: wrote %d rows -> %s", ds, n, final_path)
 
-default_args = {"owner": "you", "retries": 2}
+default_args = {
+    "on_failure_callback": notify_failure,"owner": "you", "retries": 2}
 
 with DAG(
     dag_id="openphish_ingest",

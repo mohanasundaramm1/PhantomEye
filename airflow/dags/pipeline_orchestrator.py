@@ -2,13 +2,20 @@
 from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.empty import EmptyOperator
+from airflow.operators.python import PythonOperator
+from airflow.exceptions import AirflowFailException
+from airflow.utils.trigger_rule import TriggerRule
+from alerts import notify_failure
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.utils.task_group import TaskGroup
 from airflow.utils.state import State  # <-- add this
 
 default_args = {
-    "retries": 2,
-    "retry_delay": timedelta(minutes=5),
+    # The orchestrator's trigger tasks must NOT retry: every retry re-triggers the child DAG, which has its own
+    # retries, and the multiplication (orchestrator x child x HTTP tries) sent ~27 requests a day to a dead
+    # endpoint. The child DAGs own their retries; permanent errors skip them (AirflowFailException).
+    "retries": 0,
+    "on_failure_callback": notify_failure,
 }
 
 # Toggle this to True if you want WHOIS -> DNS sequentially for lower resource spikes
@@ -94,6 +101,7 @@ with DAG(
         poke_interval=60,
         allowed_states=[State.SUCCESS],
         failed_states=[State.FAILED],
+        trigger_rule=TriggerRule.ALL_DONE,     # run with whichever sources produced data (labels_union decides)
     )
 
     # ----- Lookups (depend on union) -----
@@ -140,7 +148,31 @@ with DAG(
 
     end = EmptyOperator(task_id="end")
 
-    # Graph
-    start >> bronze >> silver >> union >> lookups
+    # A run in which a source failed but the pipeline carried on must still be RED: the leaf task
+    # `end` succeeds when the lookups and MISP did, and a DAG run's state follows its leaf tasks.
+    def _assert_no_failed_tasks(**ctx):
+        me = ctx["task_instance"].task_id
+        bad = sorted(ti.task_id for ti in ctx["dag_run"].get_task_instances()
+                     if ti.task_id != me and str(ti.state) in ("failed", "upstream_failed"))
+        if bad:
+            raise AirflowFailException(f"pipeline ran in DEGRADED mode; failed/blocked tasks: {bad}")
+
+    run_health = PythonOperator(
+        task_id="assert_no_failed_tasks",
+        python_callable=_assert_no_failed_tasks,
+        trigger_rule=TriggerRule.ALL_DONE,     # run even when something upstream failed
+    )
+
+    # Graph: one independent chain per source, so a dead feed cannot block the other sources.
+    #   openphish_bronze -> openphish_silver --\
+    #                                           >-- labels_union (waits for BOTH to finish, any outcome) -> lookups
+    #   urlhaus_bronze   -> urlhaus_silver   --/
+    start >> [openphish_bronze, urlhaus_bronze]
+    openphish_bronze >> openphish_silver
+    urlhaus_bronze >> urlhaus_silver
+    [openphish_silver, urlhaus_silver] >> union
+    union >> lookups
     start >> misp
     [lookups, misp] >> end
+    end >> run_health
+    [openphish_bronze, urlhaus_bronze, openphish_silver, urlhaus_silver, union] >> run_health

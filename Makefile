@@ -4,7 +4,7 @@ VENV_ACT = . .venv/bin/activate
 # and `make web` would be (incorrectly) considered "up to date" and no-op.
 .PHONY: up down up-all down-all stream-ct forward-ct api web check-freshness test \
         supervise-install supervise-uninstall supervise-status \
-        seed-brands seed-analysts ingest-observations assemble-campaigns test-db
+        seed-brands seed-analysts ingest-observations assemble-campaigns test-db alerts
 
 up:
 	docker compose up -d
@@ -31,7 +31,7 @@ up-all:
 	docker compose up -d
 	@echo "==> [1/2] done. Kafdrop: http://localhost:9000  CertStream: ws://127.0.0.1:4000  app-db: localhost:5433"
 	@echo "==> [2/2] airflow stack: postgres, webserver, scheduler, triggerer"
-	AIRFLOW_UID=$${AIRFLOW_UID:-$$(id -u)} docker compose -f airflow/docker-compose.airflow.yml up -d
+	AIRFLOW_UID=$${AIRFLOW_UID:-$$(id -u)} docker compose $(if $(wildcard .env),--env-file .env) -f airflow/docker-compose.airflow.yml up -d
 	@echo "==> [2/2] done. Airflow UI: http://localhost:8080 (default admin/admin, unless changed)"
 	@echo "==> up-all complete. Remaining processes are foreground dev commands -- see README.md Quick Start:"
 	@echo "      make stream-ct   (Spark: CT Kafka -> ct/data/raw)"
@@ -120,6 +120,10 @@ test:
 # container and migrate it. tests/conftest.py points every test run at it and
 # refuses any database whose name doesn't end in "_test".
 TEST_DATABASE_URL ?= postgresql+psycopg2://app:app@localhost:5433/campaigns_test
+# Recent Airflow task failures (written by airflow/dags/alerts.py).
+alerts:
+	@tail -n 20 ct/data/alerts/alerts.jsonl 2>/dev/null || echo "no alerts recorded"
+
 test-db:
 	docker compose exec -T app-db psql -U app -d campaigns -tAc \
 	  "SELECT 1 FROM pg_database WHERE datname='campaigns_test'" | grep -q 1 \

@@ -1,12 +1,15 @@
 # airflow/dags/labels_union_dag.py
 from __future__ import annotations
-import os, tempfile, logging
+import os, json, tempfile, logging
 from datetime import datetime
 
 import pandas as pd
 
 from airflow import DAG
+from alerts import notify_failure
 from airflow.operators.python import PythonOperator, get_current_context
+from airflow.exceptions import AirflowFailException
+from label_union_logic import NoSourceData, combine_sources
 
 log = logging.getLogger(__name__)
 
@@ -74,28 +77,14 @@ def build_union(ds: str | None = None, ts: str | None = None, **context):
     uh = _read_if_exists(uh_p)
     op = _read_if_exists(op_p)
 
-    dfs: list[pd.DataFrame] = []
-    if uh is not None and len(uh):
-        uh = uh.assign(seen_in_urlhaus=True, seen_in_openphish=False)
-        dfs.append(uh)
-    if op is not None and len(op):
-        op = op.assign(seen_in_urlhaus=False, seen_in_openphish=True)
-        dfs.append(op)
-
-    if dfs:
-        union = pd.concat(dfs, ignore_index=True)
-    else:
-        # Empty-but-valid dataset prevents downstream errors
-        union = pd.DataFrame({
-            "domain": pd.Series(dtype="string"),
-            "url": pd.Series(dtype="string"),
-            "first_seen": pd.Series(dtype="datetime64[ns, UTC]"),
-            "label": pd.Series(dtype="string"),
-            "source": pd.Series(dtype="string"),
-            "seen_in_urlhaus": pd.Series(dtype="bool"),
-            "seen_in_openphish": pd.Series(dtype="bool"),
-        })
-        log.warning("[labels_union] %s: no silver inputs found; writing empty union.", ds)
+    # One dead feed must not block the others, and "no data at all" must be a failure,
+    # not a green task that writes an empty partition (R-03 / R-11).
+    try:
+        union, lineage = combine_sources({"urlhaus": uh, "openphish": op})
+    except NoSourceData as e:
+        raise AirflowFailException(f"[labels_union] {ds}: {e}") from None
+    if lineage["sources_missing"]:
+        log.warning("[labels_union] %s: PARTIAL union, missing sources: %s", ds, lineage["sources_missing"])
 
     # Normalize & hygiene
     union["domain"] = union["domain"].astype("string")
@@ -117,9 +106,12 @@ def build_union(ds: str | None = None, ts: str | None = None, **context):
     outdir = f"{UNION_OUT}/ingest_date={ds}"
     out_path = f"{outdir}/labels_union.parquet"
     _atomic_to_parquet(union, out_path)
-    log.info("[labels_union] %s: wrote %d rows -> %s", ds, len(union), out_path)
+    with open(f"{outdir}/_lineage.json", "w") as f:        # which sources made this partition
+        json.dump({"ds": ds, **lineage}, f)
+    log.info("[labels_union] %s: wrote %d rows -> %s (sources: %s)", ds, len(union), out_path, lineage["sources_included"])
 
-default_args = {"owner": "you", "retries": 1}
+default_args = {
+    "on_failure_callback": notify_failure,"owner": "you", "retries": 1}
 
 with DAG(
     dag_id="labels_union",

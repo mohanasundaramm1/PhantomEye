@@ -6,6 +6,7 @@ from datetime import datetime
 import pandas as pd
 
 from airflow import DAG
+from alerts import notify_failure
 from airflow.operators.python import PythonOperator, get_current_context
 from airflow.exceptions import AirflowSkipException
 
@@ -100,7 +101,8 @@ def urlhaus_to_silver(ds: str | None = None, ts: str | None = None, **context):
 
     log.info("[urlhaus_silver] %s: wrote %d rows -> %s", ds, len(out), final_path)
 
-default_args = {"owner": "you", "retries": 0}
+default_args = {
+    "on_failure_callback": notify_failure,"owner": "you", "retries": 0}
 
 with DAG(
     dag_id="urlhaus_silver",

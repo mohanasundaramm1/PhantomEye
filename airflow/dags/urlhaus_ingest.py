@@ -9,8 +9,10 @@ import requests
 import great_expectations as ge
 
 from airflow import DAG
+from alerts import notify_failure
 from airflow.operators.python import PythonOperator, get_current_context
-from airflow.exceptions import AirflowSkipException
+from airflow.exceptions import AirflowSkipException, AirflowFailException
+from feed_fetch import PermanentFeedError, TransientFeedError, fetch_feed, urlhaus_feed_url
 
 log = logging.getLogger(__name__)
 
@@ -64,21 +66,17 @@ def fetch_and_write_urlhaus(ds: str | None = None, ts: str | None = None, **cont
             raise AirflowSkipException(f"Historical partition exists for {ds}; skipping rewrite.")
         raise AirflowSkipException("URLhaus has no historical feed; skipping backfill.")
 
-    # Resilient fetch
-    url = "https://urlhaus.abuse.ch/downloads/csv_online/"
-    sess = requests.Session()
-    last_exc = None
-    for attempt in range(3):
-        try:
-            r = sess.get(url, timeout=(5, 45), headers={"User-Agent": "threat-intel-lab/0.1"})
-            if r.ok and len(r.text) > 1000:
-                break
-            last_exc = RuntimeError(f"Bad response (status={r.status_code}, len={len(r.text)})")
-        except Exception as e:
-            last_exc = e
-        time.sleep(2)
-    else:
-        raise last_exc if last_exc else RuntimeError("URLhaus fetch failed")
+    # Resilient fetch. The old public csv_online URL has returned 410 Gone since 2026-10-25;
+    # abuse.ch now needs a free Auth-Key (URLHAUS_AUTH_KEY). A permanent error fails the task
+    # at once (no Airflow retries); only transient problems are retried inside fetch_feed.
+    try:
+        url, secrets = urlhaus_feed_url(os.environ)
+        r = fetch_feed(requests.Session(), url, min_len=1000, timeout=(5, 45),
+                       headers={"User-Agent": "threat-intel-lab/0.1"}, secrets=secrets)
+    except PermanentFeedError as e:
+        raise AirflowFailException(f"[urlhaus_ingest] {e}") from None
+    except TransientFeedError as e:
+        raise RuntimeError(f"[urlhaus_ingest] {e}") from None
 
     # Optional freshness guard (header is commented; parse from text)
     m = re.search(r"Last updated:\s*([0-9\-: ]+)\s*\(UTC\)", r.text)
@@ -144,7 +142,8 @@ def fetch_and_write_urlhaus(ds: str | None = None, ts: str | None = None, **cont
     os.replace(tmp, final_path)
     log.info("[urlhaus_ingest] %s: wrote %d rows -> %s", ds, n, final_path)
 
-default_args = {"owner": "you", "retries": 2}
+default_args = {
+    "on_failure_callback": notify_failure,"owner": "you", "retries": 2}
 
 with DAG(
     dag_id="urlhaus_ingest",
