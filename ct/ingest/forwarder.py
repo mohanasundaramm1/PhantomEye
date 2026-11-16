@@ -12,6 +12,15 @@
 #   CT_TRIAGE_CONFIG          (override path to config/triage.json)
 #   CT_LOW_PRIORITY_DIR       (override low-priority spool directory)
 #   CT_METRICS_LOG_EVERY_SEC  (default "30" seconds between counter log lines)
+#   CT_OUTBOX_DIR             (default ct/data/outbox; durable copy of events Kafka could not take)
+#   CT_OUTBOX_MAX_AGE_DAYS    (default "7")
+#   CT_OUTBOX_REPLAY_EVERY_SEC (default "5" seconds between outbox replay attempts)
+#   CT_PRODUCER_RETRY_SEC     (default "5" seconds between Kafka reconnect attempts)
+#
+# Delivery: events are sent to Kafka with an idempotent, acks=all producer. If Kafka
+# is unreachable (at startup or later) or a send fails, the event is appended to the
+# local outbox instead of being dropped -- CertStream has no replay, so this is the
+# only copy -- and replayed oldest-first once Kafka is back. SIGTERM flushes and exits.
 #
 # Intake flow per domain (triage.route_domain; see config/triage.json):
 #   score >= pass_threshold            -> forward to Kafka with score+reasons
@@ -23,18 +32,21 @@ import os
 import json
 import time
 import re
+import signal
+import threading
 import logging
 from datetime import datetime, timezone
 
 from websocket import WebSocketApp
 from kafka import KafkaProducer
-from kafka.errors import KafkaTimeoutError, KafkaError
+from kafka.errors import KafkaTimeoutError, KafkaError, NoBrokersAvailable
 
 try:
-    from ct.ingest import backoff, triage
+    from ct.ingest import backoff, triage, outbox
 except ImportError:  # running as a plain script from ct/ingest/
     import backoff
     import triage
+    import outbox
 
 # ---------- config ----------
 
@@ -53,6 +65,11 @@ os.makedirs(LOW_PRIORITY_DIR, exist_ok=True)
 
 METRICS_LOG_EVERY_SEC = float(os.getenv("CT_METRICS_LOG_EVERY_SEC", "30"))
 
+OUTBOX_DIR = os.getenv("CT_OUTBOX_DIR", os.path.join(DATA_DIR, "outbox"))
+OUTBOX_MAX_AGE_DAYS = float(os.getenv("CT_OUTBOX_MAX_AGE_DAYS", "7"))
+OUTBOX_REPLAY_EVERY_SEC = float(os.getenv("CT_OUTBOX_REPLAY_EVERY_SEC", "5"))
+PRODUCER_RETRY_SEC = float(os.getenv("CT_PRODUCER_RETRY_SEC", "5"))
+
 TRIAGE_CFG = triage.load_config()
 
 logging.basicConfig(
@@ -70,17 +87,139 @@ log.info(
     FLUSH_EVERY,
 )
 
-# ---------- Kafka producer ----------
+# ---------- Kafka producer (created lazily; never at import) ----------
+#
+# Creating KafkaProducer at import time meant a down broker crashed the process
+# (NoBrokersAvailable) before any retry logic existed, so launchd respawned it every
+# 10 s while CertStream kept emitting certificates nobody recorded.
 
-producer = KafkaProducer(
-    bootstrap_servers=BOOTSTRAP,
-    value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-    key_serializer=lambda v: v.encode("utf-8"),
-    linger_ms=50,
-    acks="all",
-    retries=5,
-    request_timeout_ms=30000,
-)
+_outbox = outbox.Outbox(OUTBOX_DIR)
+_producer = None
+_producer_next_try = 0.0
+_producer_lock = threading.Lock()
+_stop = threading.Event()
+
+
+def _get_producer():
+    """The shared producer, connecting if needed. May BLOCK for a couple of seconds
+    when the broker is down, so only startup and the background tick call it, never
+    the websocket callback. Failed attempts are retried every PRODUCER_RETRY_SEC."""
+    global _producer, _producer_next_try
+    with _producer_lock:
+        if _producer is not None:
+            return _producer
+        now = time.monotonic()
+        if now < _producer_next_try:
+            return None
+        try:
+            _producer = KafkaProducer(
+                bootstrap_servers=BOOTSTRAP,
+                value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+                key_serializer=lambda v: v.encode("utf-8"),
+                linger_ms=50,
+                acks="all",
+                enable_idempotence=True,    # retries can no longer duplicate or reorder within a partition
+                retries=5,
+                request_timeout_ms=30000,
+                max_block_ms=2000,          # bound how long one send() can stall
+            )
+            log.info("connected to Kafka at %s", BOOTSTRAP)
+        except (NoBrokersAvailable, KafkaError) as e:
+            _producer_next_try = now + PRODUCER_RETRY_SEC
+            log.warning("Kafka unavailable at %s (%r); buffering to the outbox, retry in %.0fs",
+                        BOOTSTRAP, e, PRODUCER_RETRY_SEC)
+            return None
+        return _producer
+
+
+def _mark_producer_broken(p):
+    """Drop a producer that just failed so later events go straight to the outbox
+    (no more blocking send() calls) until the background tick reconnects."""
+    global _producer, _producer_next_try
+    with _producer_lock:
+        if _producer is p:
+            _producer = None
+            _producer_next_try = time.monotonic() + PRODUCER_RETRY_SEC
+    try:
+        p.close(timeout=0)      # buffered records fail fast and reach the outbox via their errbacks
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _to_outbox(event: dict, reason=None):
+    _outbox.append(event)
+    _counters["outbox_appended"] += 1
+    if reason is not None:
+        log.warning("delivery failed (%r); event %s kept in the outbox", reason, event.get("id"))
+
+
+def _deliver(key: str, event: dict):
+    """Send one event to Kafka without ever blocking on a connect; anything that can't
+    be delivered is persisted to the outbox (CertStream cannot replay it)."""
+    p = _producer
+    if p is None:
+        _to_outbox(event)
+        return False
+    try:
+        fut = p.send(TOPIC, key=key, value=event)
+    except KafkaError as e:                    # includes KafkaTimeoutError (metadata/buffer stall)
+        _to_outbox(event, e)
+        _mark_producer_broken(p)
+        return False
+    if fut is not None and hasattr(fut, "add_errback"):
+        def _failed(exc, ev=event, prod=p):    # delivery failed AFTER retries were exhausted
+            _to_outbox(ev, exc)
+            _mark_producer_broken(prod)
+        fut.add_errback(_failed)
+    return True
+
+
+def replay_outbox(force: bool = False):
+    """Reconnect if needed, then replay buffered events oldest-first."""
+    p = _get_producer()
+    if p is None or not _outbox.has_pending():
+        return None
+    failures = []
+
+    def _send(ev):
+        fut = p.send(TOPIC, key=ev["domain"], value=ev)
+        if fut is not None and hasattr(fut, "add_errback"):
+            fut.add_errback(lambda exc: failures.append(exc))
+
+    def _flush():
+        try:
+            p.flush(timeout=FLUSH_TIMEOUT_SEC * 3)
+        except KafkaError:
+            return False
+        return not failures
+
+    result = _outbox.replay(_send, _flush)
+    if result["replayed"]:
+        _counters["outbox_replayed"] += result["replayed"]
+        log.info("outbox replay: %d event(s) delivered, %d file(s) kept", result["replayed"], result["failed_files"])
+    if result["failed_files"]:
+        _mark_producer_broken(p)
+    return result
+
+
+def _maintenance_tick():
+    """One pass of background upkeep: reconnect to Kafka and drain the outbox."""
+    try:
+        replay_outbox()
+    except Exception:  # noqa: BLE001  upkeep must never take the forwarder down
+        log.exception("outbox maintenance failed")
+
+
+def _maintenance_loop():
+    while not _stop.is_set():
+        _maintenance_tick()
+        _stop.wait(OUTBOX_REPLAY_EVERY_SEC)
+
+
+# One synchronous attempt at startup so a healthy start sends immediately. It can
+# only log a warning on failure; it can no longer crash the process.
+_get_producer()
+
 
 # how many messages we’ve queued since last flush
 _sent_since_flush = 0
@@ -92,6 +231,8 @@ _counters = {
     "sampled_out": 0,     # dropped by deterministic sampling
     "triage_passed": 0,   # score >= threshold, forwarded to Kafka
     "triage_deferred": 0, # score <  threshold, spooled to low-priority
+    "outbox_appended": 0, # could not be delivered to Kafka now; kept on disk
+    "outbox_replayed": 0, # delivered from the outbox after Kafka returned
 }
 _last_metrics_log = time.monotonic()
 
@@ -101,11 +242,14 @@ def _maybe_log_metrics():
     now = time.monotonic()
     if now - _last_metrics_log >= METRICS_LOG_EVERY_SEC:
         log.info(
-            "intake counters: ingested=%d sampled_out=%d triage_passed=%d triage_deferred=%d",
+            "intake counters: ingested=%d sampled_out=%d triage_passed=%d triage_deferred=%d "
+            "outbox_appended=%d outbox_replayed=%d",
             _counters["ingested"],
             _counters["sampled_out"],
             _counters["triage_passed"],
             _counters["triage_deferred"],
+            _counters["outbox_appended"],
+            _counters["outbox_replayed"],
         )
         _last_metrics_log = now
 
@@ -148,10 +292,11 @@ def evt(domain: str, offset: int = 0):
 def _maybe_flush():
     """Flush producer occasionally; don't scream on soft timeouts."""
     global _sent_since_flush
-    if _sent_since_flush <= 0:
+    p = _producer
+    if _sent_since_flush <= 0 or p is None:
         return
     try:
-        producer.flush(timeout=FLUSH_TIMEOUT_SEC)
+        p.flush(timeout=FLUSH_TIMEOUT_SEC)
         _sent_since_flush = 0
     except KafkaTimeoutError as e:
         # This usually means broker is slow or unreachable; producer will keep retrying.
@@ -194,8 +339,8 @@ def on_message(_ws, msg):  # str or bytes (see skip_utf8_validation in the main 
 
             _counters["triage_passed"] += 1
 
-            # enqueue event to Kafka (async)
-            producer.send(TOPIC, key=d, value=event)
+            # enqueue event to Kafka (async); undeliverable events go to the outbox
+            _deliver(d, event)
             batch_sent += 1
             _sent_since_flush += 1
 
@@ -227,9 +372,23 @@ def on_close(*_):
     log.warning("[ct] ws closed")
 
 
+def _on_sigterm(_signum, _frame):
+    """launchd stops the job with SIGTERM. Python's default is to die at once, which
+    skips the `finally:` below and drops whatever the producer still buffers. Raising
+    SystemExit unwinds through that finally (flush + close) instead."""
+    log.info("SIGTERM received, shutting down (flush + close)")
+    raise SystemExit(0)
+
+
 # ---------- main loop ----------
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    _outbox.prune(OUTBOX_MAX_AGE_DAYS)
+    if _outbox.has_pending():
+        log.warning("outbox has %d event(s) from a previous run; will replay when Kafka is reachable",
+                    _outbox.pending_count())
+    threading.Thread(target=_maintenance_loop, name="outbox-maintenance", daemon=True).start()
     try:
         delay = 0.0
         while True:
@@ -267,8 +426,10 @@ if __name__ == "__main__":
                 log.warning("[ct] connection lasted %.1fs; reconnecting in %.0fs", ran_for, delay)
                 time.sleep(delay)
     finally:
+        _stop.set()
         try:
             _maybe_flush()
         finally:
-            producer.close()
-            log.info("Kafka producer closed")
+            if _producer is not None:
+                _producer.close(timeout=5)
+            log.info("Kafka producer closed (outbox pending: %d)", _outbox.pending_count())
