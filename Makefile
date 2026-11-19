@@ -54,11 +54,13 @@ stream-ct:
 forward-ct:
 	$(VENV_ACT) && python ct/ingest/forwarder.py
 
+# Both listen on loopback only: the API has no authentication yet, so it must not
+# be reachable from other machines on the network.
 api:
-	$(VENV_ACT) && uvicorn api.main:app --host 0.0.0.0 --port 8000
+	$(VENV_ACT) && uvicorn api.main:app --host 127.0.0.1 --port 8000
 
 web:
-	cd web && npm run dev -- -p 3000
+	cd web && npm run dev -- -H 127.0.0.1 -p 3000
 
 # Operationalizes the audit's staleness check (see scripts/check_ct_freshness.py):
 # warns/fails if ct/data/raw hasn't been touched recently, or if the last few

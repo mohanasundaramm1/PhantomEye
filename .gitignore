@@ -53,3 +53,7 @@ docs/private/
 
 # forwarder outbox (durable copy of events Kafka could not take)
 ct/data/outbox/
+
+# one-off audit outputs and personal tool config
+audits/
+.claude/
