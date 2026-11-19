@@ -48,6 +48,12 @@ class ParquetTTLCache:
         self.expired = 0
         self._df = self._load()
         self._index = self._build_index()
+        # True once upsert() has changed the in-memory frame. flush() only
+        # writes when dirty: two cache objects can share one file (the "dns"
+        # and "geo" views over dns_geo_cache.parquet), and an unconditional
+        # flush from the never-written view used to overwrite the other's new
+        # rows with its stale load-time snapshot.
+        self._dirty = False
 
     def _load(self) -> pd.DataFrame:
         if os.path.exists(self.path):
@@ -116,9 +122,17 @@ class ParquetTTLCache:
         # Positions shift on every concat, so the index is rebuilt rather than
         # patched -- correctness over cleverness; upserts are far rarer than gets.
         self._index = self._build_index()
+        self._dirty = True
 
-    def flush(self):
+    def flush(self) -> bool:
+        """Write the frame to disk if this object changed it; returns whether it
+        wrote. A clean cache never rewrites the file, so a read-only view can't
+        clobber writes made through another object on the same path."""
+        if not self._dirty:
+            return False
         atomic_to_parquet(self._df, self.path)
+        self._dirty = False
+        return True
 
     @property
     def hit_rate(self) -> float:

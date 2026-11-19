@@ -11,6 +11,7 @@ from urllib3.util.retry import Retry
 from urllib.parse import urljoin
 
 from airflow import DAG
+from alerts import notify_failure
 from airflow.operators.python import PythonOperator, get_current_context
 from airflow.exceptions import AirflowSkipException
 
@@ -238,6 +239,7 @@ def ingest_misp_osint(ds: str | None = None, ts: str | None = None, **context):
 # ---------------- DAG ----------------
 
 default_args = {
+    "on_failure_callback": notify_failure,
     "owner": "you",
     "retries": 2,
     "retry_delay": timedelta(minutes=5),

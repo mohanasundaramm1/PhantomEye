@@ -4,12 +4,11 @@
 # - Writes data under:   ct/data/raw/ds=YYYY-MM-DD/...
 # - Uses checkpoint dir: ct/data/chk/stream_ct (for dropDuplicates + watermark)
 #
-# For local development we *default* to resetting the checkpoint on every start
-# to avoid corrupted state after crashes / laptop sleep:
-#   CT_RESET_CHK_ON_START=1  (default)
-#
-# If you ever want to preserve state across restarts, run with:
-#   CT_RESET_CHK_ON_START=0
+# The checkpoint is KEPT across restarts by default. It holds the Kafka offsets
+# already written, so keeping it is what lets a restart resume exactly where
+# the last committed batch ended instead of skipping everything produced while
+# the job was down. Resetting it (CT_RESET_CHK_ON_START=1) is a deliberate,
+# data-losing recovery action, not a dev convenience.
 #
 # Environment knobs:
 #   KAFKA_BOOTSTRAP_SERVERS   (default "localhost:29092")
@@ -18,7 +17,12 @@
 #   CT_CHK_DIR                (override checkpoint directory)
 #   CT_DLQ_DIR                (override DLQ directory)
 #   CT_MAX_OFFSETS_PER_TRIGGER (default "5000")
-#   CT_RESET_CHK_ON_START     (default "1"  -> reset checkpoints at start)
+#   CT_RESET_CHK_ON_START     (default "0"; "1" wipes checkpoint + sink manifest)
+#   CT_STARTING_OFFSETS       (default "latest"; only read when the checkpoint
+#                              is empty -- e.g. '{"ct-events":{"0":24858356}}'
+#                              to resume a fresh checkpoint at a known offset)
+#   CT_DRIVER_MEMORY          (default "2g")
+#   CT_DEBUG_CONSOLE          (default "0"; "1" also prints batches to stdout)
 
 import os
 import shutil
@@ -66,10 +70,14 @@ OUT_DIR = os.getenv("CT_RAW_DIR", RAW_DIR_DEFAULT)
 CHK_DIR = os.getenv("CT_CHK_DIR", CHK_DIR_DEFAULT)
 DLQ_DIR = os.getenv("CT_DLQ_DIR", DLQ_DIR_DEFAULT)
 
-# IMPORTANT: default to *resetting* checkpoint on start for local dev
-RESET_CHK = os.getenv("CT_RESET_CHK_ON_START", "1") == "1"
+RESET_CHK = os.getenv("CT_RESET_CHK_ON_START", "0") == "1"
 
 MAX_OFFSETS_PER_TRIGGER = os.getenv("CT_MAX_OFFSETS_PER_TRIGGER", "5000")
+# Spark ignores startingOffsets whenever the checkpoint already has offsets;
+# it only applies to the very first batch of a brand-new checkpoint.
+STARTING_OFFSETS = os.getenv("CT_STARTING_OFFSETS", "latest")
+DRIVER_MEMORY = os.getenv("CT_DRIVER_MEMORY", "2g")
+DEBUG_CONSOLE = os.getenv("CT_DEBUG_CONSOLE", "0") == "1"
 
 print("[stream_ct] -------- config --------")
 print(f"[stream_ct] BOOTSTRAP={BOOTSTRAP}")
@@ -79,6 +87,9 @@ print(f"[stream_ct] CHK CHK_DIR={CHK_DIR}")
 print(f"[stream_ct] DLQ DLQ_DIR={DLQ_DIR}")
 print(f"[stream_ct] CT_RESET_CHK_ON_START={int(RESET_CHK)}")
 print(f"[stream_ct] CT_MAX_OFFSETS_PER_TRIGGER={MAX_OFFSETS_PER_TRIGGER}")
+print(f"[stream_ct] CT_STARTING_OFFSETS={STARTING_OFFSETS} (fresh checkpoint only)")
+print(f"[stream_ct] CT_DRIVER_MEMORY={DRIVER_MEMORY}")
+print(f"[stream_ct] CT_DEBUG_CONSOLE={int(DEBUG_CONSOLE)}")
 print("[stream_ct] ------------------------")
 
 # Optional: reset corrupted checkpoint safely on start
@@ -125,6 +136,9 @@ schema = StructType(
 
 spark = (
     SparkSession.builder.appName("CT->Raw")
+    # Must be set before the JVM starts (i.e. here, in a fresh process). The
+    # 1g default was the ceiling the unbounded dedup state kept hitting.
+    .config("spark.driver.memory", DRIVER_MEMORY)
     .config("spark.sql.shuffle.partitions", "4")
     .config("spark.sql.session.timeZone", "UTC")
     .config("spark.sql.streaming.stateStore.maintenanceInterval", "60s")
@@ -145,8 +159,8 @@ raw = (
     spark.readStream.format("kafka")
     .option("kafka.bootstrap.servers", BOOTSTRAP)
     .option("subscribe", TOPIC)
-    # Start from latest offsets when job starts
-    .option("startingOffsets", "latest")
+    # Only used for a brand-new checkpoint (see CT_STARTING_OFFSETS above).
+    .option("startingOffsets", STARTING_OFFSETS)
     # Don't fail if some offsets are missing (e.g. Kafka log retention)
     .option("failOnDataLoss", "false")
     # Group id only for this consumer (careful not to reuse from other jobs)
@@ -179,8 +193,13 @@ good = (
         expr("ROUND(unix_timestamp(ingest_ts) - unix_timestamp(event_ts), 3)"),
     )
     .withWatermark("event_ts", "10 minutes")
-    # NOTE: this is what requires checkpoint / state store
-    .dropDuplicates(["id"])
+    # Dedup by id, but only remember ids for the watermark window. Plain
+    # dropDuplicates(["id"]) can only evict state when the event-time column is
+    # part of the key, so it kept every id ever seen in heap state until the
+    # driver OOM-looped (Nov 2026). WithinWatermark keeps the same "drop repeats
+    # of an id" semantics while letting state expire 10 min behind the newest
+    # event_ts. Changing this operator requires a fresh checkpoint.
+    .dropDuplicatesWithinWatermark(["id"])
     .withColumn("ds", to_date(col("event_ts")))
 )
 
@@ -193,15 +212,18 @@ bad = (
     )
 )
 
-# Console sink (debug)
-(
-    good.writeStream.format("console")
-    .outputMode("append")
-    .option("truncate", "false")
-    .trigger(processingTime="5 seconds")
-    .queryName("ct_console")
-    .start()
-)
+# Console sink (debug only). Every started query re-reads Kafka and keeps its
+# own copy of the dedup state, so this doubled memory and filled the launchd
+# stdout log; opt in with CT_DEBUG_CONSOLE=1.
+if DEBUG_CONSOLE:
+    (
+        good.writeStream.format("console")
+        .outputMode("append")
+        .option("truncate", "false")
+        .trigger(processingTime="5 seconds")
+        .queryName("ct_console")
+        .start()
+    )
 
 # Main bronze parquet sink
 (

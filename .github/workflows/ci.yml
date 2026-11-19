@@ -28,16 +28,16 @@ jobs:
         env:
           POSTGRES_USER: app
           POSTGRES_PASSWORD: app
-          POSTGRES_DB: campaigns
+          POSTGRES_DB: campaigns_test
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U app -d campaigns"
+          --health-cmd "pg_isready -U app -d campaigns_test"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
     env:
-      APP_DATABASE_URL: postgresql+psycopg2://app:app@localhost:5432/campaigns
+      APP_DATABASE_URL: postgresql+psycopg2://app:app@localhost:5432/campaigns_test
     steps:
       - uses: actions/checkout@v4
 
@@ -135,3 +135,14 @@ jobs:
                   echo '--- DAG import errors found above ---'; \
                   exit 1; \
                 fi"
+
+      # Parsing is not enough: pin the properties whose absence caused a real incident
+      # (a dead URLhaus feed blocked every other source for 3 weeks with no alert).
+      - name: Check DAG structure (per-source chains, trigger rules, failure alerts)
+        run: |
+          docker run --rm --entrypoint python \
+            -v "${{ github.workspace }}/airflow/dags:/opt/airflow/dags:ro" \
+            -v "${{ github.workspace }}/scripts/check_dag_structure.py:/check.py:ro" \
+            -e AIRFLOW__CORE__LOAD_EXAMPLES=false \
+            -e AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=sqlite:////tmp/airflow.db \
+            phantomeye-airflow-ci /check.py

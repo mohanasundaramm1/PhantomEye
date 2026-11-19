@@ -1,12 +1,14 @@
 from datetime import datetime, timedelta
 
 from airflow import DAG
+from alerts import notify_failure
 from airflow.operators.bash import BashOperator
 
 # Adjust this path if your repo lives somewhere else in the Airflow environment
 REPO_ROOT = "/opt/airflow"
 
 default_args = {
+    "on_failure_callback": notify_failure,
     "owner": "ct-pipeline",
     "depends_on_past": False,
     "retries": 1,

@@ -15,12 +15,14 @@ neither can block scoring or clustering since they live in their own DAG.
 from datetime import datetime, timedelta
 
 from airflow import DAG
+from alerts import notify_failure
 from airflow.operators.bash import BashOperator
 
 REPO_ROOT = "/opt/airflow"
 ENV = f"cd {REPO_ROOT} && export PYTHONPATH=$PYTHONPATH:{REPO_ROOT} && "
 
 default_args = {
+    "on_failure_callback": notify_failure,
     "owner": "ct-pipeline",
     "depends_on_past": False,
     "retries": 1,

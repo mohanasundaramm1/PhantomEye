@@ -43,3 +43,17 @@ ops/launchd/logs/
 # runtime logs above.
 product/logs/
 AUDIT.md
+
+# local artifacts, not source
+backup_bronze_silver_*.tgz
+pre_migration_airflow.log
+
+# local-only review notes (not for the public repo)
+docs/private/
+
+# forwarder outbox (durable copy of events Kafka could not take)
+ct/data/outbox/
+
+# one-off audit outputs and personal tool config
+audits/
+.claude/

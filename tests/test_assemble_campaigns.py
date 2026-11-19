@@ -231,7 +231,7 @@ def test_burst_forms_one_cluster_and_second_batch_merges():
             add_obs(s, f"{BRAND}-secure-c-d.tk")
             s.commit()
 
-            assemble(min_risk=0.5)
+            assemble(min_risk=0.5, brand_names=[BRAND])
             clusters = s.execute(
                 select(CampaignCluster).where(CampaignCluster.target_brand == BRAND)
             ).scalars().all()
@@ -241,7 +241,7 @@ def test_burst_forms_one_cluster_and_second_batch_merges():
             # second batch: another host, same brand/day/family -> MERGE
             add_obs(s, f"{BRAND}-verify-e-f.tk")
             s.commit()
-            assemble(min_risk=0.5)
+            assemble(min_risk=0.5, brand_names=[BRAND])
             s.expire_all()
             clusters = s.execute(
                 select(CampaignCluster).where(CampaignCluster.target_brand == BRAND)
@@ -283,7 +283,7 @@ def test_suppressed_observation_never_forms_a_new_cluster():
             s.add(CtObservation(raw_host=host, registered_domain=host, event_ts=day, risk_score=0.9))
             s.commit()
 
-            result = assemble(min_risk=0.5)
+            result = assemble(min_risk=0.5, brand_names=[BRAND])
             assert result["suppressed_candidates"] >= 1
             clusters = s.execute(
                 select(CampaignCluster).where(CampaignCluster.target_brand == BRAND)
@@ -318,7 +318,7 @@ def test_existing_cluster_transitions_to_suppressed_when_rule_added_later():
             s.add(CtObservation(raw_host=host, registered_domain=host, event_ts=day, risk_score=0.9))
             s.commit()
 
-            assemble(min_risk=0.5)  # forms the cluster, no suppression rule yet
+            assemble(min_risk=0.5, brand_names=[BRAND])  # forms the cluster, no suppression rule yet
             cluster = s.execute(
                 select(CampaignCluster).where(CampaignCluster.target_brand == BRAND)
             ).scalar_one()
@@ -327,7 +327,7 @@ def test_existing_cluster_transitions_to_suppressed_when_rule_added_later():
             # NOW add a suppression rule matching the (only) member, and re-run
             s.add(SuppressionRule(rule_type="domain", match_value=host, created_by="test", active=True))
             s.commit()
-            assemble(min_risk=0.5)
+            assemble(min_risk=0.5, brand_names=[BRAND])
 
             s.expire_all()
             cluster = s.execute(
@@ -344,4 +344,47 @@ def test_existing_cluster_transitions_to_suppressed_when_rule_added_later():
             s.execute(delete(CtObservation).where(CtObservation.raw_host == host))
             s.execute(delete(SuppressionRule).where(SuppressionRule.match_value == host))
             s.execute(delete(WatchlistBrand).where(WatchlistBrand.brand_name == BRAND))
+            s.commit()
+
+
+@pytest.mark.skipif(not ping(), reason="app-db not reachable (make test-db)")
+def test_assemble_scoped_to_brand_leaves_other_brands_untouched():
+    """Regression guard for the test-isolation bug: an assemble() call scoped
+    to one brand must not create or touch clusters for any other brand, even
+    when that brand has qualifying observations in the same database."""
+    from sqlalchemy import delete, select
+
+    from product.assemble_campaigns import assemble
+    from product.db import SessionLocal
+    from product.models import CampaignCluster, ClusterMember, CtObservation, WatchlistBrand
+
+    IN_SCOPE, OUT_OF_SCOPE = "zzscopein", "zzscopeout"
+    day = dt.datetime(2026, 7, 5, 9, 0, 0, tzinfo=dt.timezone.utc)
+    hosts = [f"{IN_SCOPE}-login-a-b.tk", f"{OUT_OF_SCOPE}-login-a-b.tk"]
+
+    with SessionLocal() as s:
+        try:
+            for b in (IN_SCOPE, OUT_OF_SCOPE):
+                s.add(WatchlistBrand(brand_name=b, priority=999, active=True))
+            for h in hosts:
+                s.add(CtObservation(raw_host=h, registered_domain=h, event_ts=day, risk_score=0.9))
+            s.commit()
+
+            assemble(min_risk=0.5, brand_names=[IN_SCOPE])
+
+            brands_with_clusters = set(s.execute(
+                select(CampaignCluster.target_brand)
+                .where(CampaignCluster.target_brand.in_([IN_SCOPE, OUT_OF_SCOPE]))
+            ).scalars().all())
+            assert brands_with_clusters == {IN_SCOPE}
+        finally:
+            ids = s.execute(
+                select(CampaignCluster.id)
+                .where(CampaignCluster.target_brand.in_([IN_SCOPE, OUT_OF_SCOPE]))
+            ).scalars().all()
+            if ids:
+                s.execute(delete(ClusterMember).where(ClusterMember.cluster_id.in_(ids)))
+                s.execute(delete(CampaignCluster).where(CampaignCluster.id.in_(ids)))
+            s.execute(delete(CtObservation).where(CtObservation.raw_host.in_(hosts)))
+            s.execute(delete(WatchlistBrand).where(WatchlistBrand.brand_name.in_([IN_SCOPE, OUT_OF_SCOPE])))
             s.commit()

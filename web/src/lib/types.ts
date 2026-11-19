@@ -127,7 +127,7 @@ export interface ModelStatus {
 export interface OperationsMetrics {
   available: boolean;
   reason?: string;
-  analyst_confirmation?: { rate: number | null; n_dispositions: number; n_confirmed: number };
+  analyst_confirmation?: { rate: number | null; n_dispositions: number; n_confirmed: number; confidence_note?: string };
   median_time_to_first_review?: { median_hours: number | null; n: number };
   suppression?: { rate: number | null; n_total: number; n_suppressed: number };
   campaigns_created?: { per_day: number | null; window_days: number; n_in_window: number };

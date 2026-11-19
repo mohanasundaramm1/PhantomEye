@@ -227,17 +227,23 @@ def compute_membership_score(o: CtObservation, existing_members: list[CtObservat
     return round(0.30 + 0.25 * burst + 0.20 * lexical + 0.15 * asn + 0.10 * registrar, 4)
 
 
-def reevaluate_suppressed_clusters(session, rules) -> int:
+def reevaluate_suppressed_clusters(session, rules, brand_names: list[str] | None = None) -> int:
     """Existing clusters whose members have ALL come to match an active
     suppression rule get pushed to stage="suppressed" via the stage engine.
     Separate from the candidate-selection exclusion in assemble(): once a
     cluster's members stop being freshly regrouped (nothing new to add),
     candidate-time exclusion alone would never touch that cluster again, even
     though a rule added later should still suppress it. Returns the number of
-    clusters transitioned."""
+    clusters transitioned.
+
+    brand_names: if given, only clusters targeting these brands are
+    re-evaluated (see assemble())."""
     if not rules:
         return 0
-    cluster_ids = session.execute(select(CampaignCluster.id)).scalars().all()
+    q = select(CampaignCluster.id)
+    if brand_names is not None:
+        q = q.where(CampaignCluster.target_brand.in_([b.lower() for b in brand_names]))
+    cluster_ids = session.execute(q).scalars().all()
     transitioned = 0
     for cid in cluster_ids:
         members = session.execute(
@@ -256,9 +262,19 @@ def reevaluate_suppressed_clusters(session, rules) -> int:
     return transitioned
 
 
-def assemble(min_risk: float = 0.5) -> dict:
+def assemble(min_risk: float = 0.5, brand_names: list[str] | None = None) -> dict:
+    """Group candidate observations into campaign clusters.
+
+    brand_names: if given, only these watchlist brands are considered, so only
+    clusters targeting them are created, merged, re-staged or suppressed.
+    None (the default, used by the DAG and CLI) means every active brand.
+    Tests must always pass their own brand(s): an unscoped call touches every
+    real cluster in whatever database it is connected to."""
     with SessionLocal() as s:
         brands = load_brands(s)
+        if brand_names is not None:
+            wanted = {b.lower() for b in brand_names}
+            brands = [b for b in brands if b[0] in wanted]
         if not brands:
             return {"ok": False, "reason": "no active watchlist brands; run `make seed-brands`"}
 
@@ -356,7 +372,7 @@ def assemble(min_risk: float = 0.5) -> dict:
             # stage via real evidence (MISP hit), never backward.
             apply_stage_transition(s, cluster.id)
 
-        suppressed = reevaluate_suppressed_clusters(s, suppression_rules)
+        suppressed = reevaluate_suppressed_clusters(s, suppression_rules, brand_names)
 
         s.commit()  # no-op for cluster rows (each already committed via the
                     # stage-transition call above); harmless / keeps the

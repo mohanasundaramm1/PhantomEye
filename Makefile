@@ -2,10 +2,9 @@ VENV_ACT = . .venv/bin/activate
 
 # api/ and web/ are real directories in this repo; without .PHONY, `make api`
 # and `make web` would be (incorrectly) considered "up to date" and no-op.
-.PHONY: up down up-all down-all topic-reset produce stream stream-fast \
-        stream-fresh stream-ct forward-ct api web check-freshness test \
+.PHONY: up down up-all down-all stream-ct forward-ct api web check-freshness test \
         supervise-install supervise-uninstall supervise-status \
-        seed-brands ingest-observations assemble-campaigns
+        seed-brands seed-analysts ingest-observations assemble-campaigns test-db alerts
 
 up:
 	docker compose up -d
@@ -32,7 +31,7 @@ up-all:
 	docker compose up -d
 	@echo "==> [1/2] done. Kafdrop: http://localhost:9000  CertStream: ws://127.0.0.1:4000  app-db: localhost:5433"
 	@echo "==> [2/2] airflow stack: postgres, webserver, scheduler, triggerer"
-	AIRFLOW_UID=$${AIRFLOW_UID:-$$(id -u)} docker compose -f airflow/docker-compose.airflow.yml up -d
+	AIRFLOW_UID=$${AIRFLOW_UID:-$$(id -u)} docker compose $(if $(wildcard .env),--env-file .env) -f airflow/docker-compose.airflow.yml up -d
 	@echo "==> [2/2] done. Airflow UI: http://localhost:8080 (default admin/admin, unless changed)"
 	@echo "==> up-all complete. Remaining processes are foreground dev commands -- see README.md Quick Start:"
 	@echo "      make stream-ct   (Spark: CT Kafka -> ct/data/raw)"
@@ -45,24 +44,6 @@ down-all:
 	@echo "==> stopping root stack"
 	docker compose down
 
-topic-reset:
-	- docker compose exec kafka kafka-topics --delete --topic domain-events --bootstrap-server kafka:9092
-	docker compose exec kafka kafka-topics --create --topic domain-events --bootstrap-server kafka:9092 --replication-factor 1 --partitions 1
-	docker compose exec kafka kafka-topics --list --bootstrap-server kafka:9092
-
-produce:
-	$(VENV_ACT) && python simulator/producer.py
-
-stream:
-	$(VENV_ACT) && python pipelines/spark_stream.py
-
-stream-fast:
-	$(VENV_ACT) && SPARK_TRIGGER_SECS=2 python pipelines/spark_stream.py
-
-stream-fresh:
-	rm -rf bronze dlq chk
-	$(VENV_ACT) && SPARK_CHECKPOINT_DIR=./chk/dev python pipelines/spark_stream.py
-
 # Real CT lane: forwarder.py (certstream ws -> Kafka topic ct-events) must
 # already be running separately -- this only consumes ct-events -> parquet.
 stream-ct:
@@ -73,11 +54,13 @@ stream-ct:
 forward-ct:
 	$(VENV_ACT) && python ct/ingest/forwarder.py
 
+# Both listen on loopback only: the API has no authentication yet, so it must not
+# be reachable from other machines on the network.
 api:
-	$(VENV_ACT) && uvicorn api.main:app --host 0.0.0.0 --port 8000
+	$(VENV_ACT) && uvicorn api.main:app --host 127.0.0.1 --port 8000
 
 web:
-	cd web && npm run dev -- -p 3000
+	cd web && npm run dev -- -H 127.0.0.1 -p 3000
 
 # Operationalizes the audit's staleness check (see scripts/check_ct_freshness.py):
 # warns/fails if ct/data/raw hasn't been touched recently, or if the last few
@@ -117,7 +100,7 @@ supervise-uninstall:
 # Show each agent's state/pid and the watchdog's last recorded result.
 supervise-status:
 	@UID_NUM=$$(id -u); \
-	for label in com.phantomeye.forwarder com.phantomeye.stream-ct com.phantomeye.freshness-watchdog; do \
+	for label in com.phantomeye.forwarder com.phantomeye.stream-ct com.phantomeye.freshness-watchdog com.phantomeye.log-rotate; do \
 	  if launchctl print gui/$$UID_NUM/$$label >/dev/null 2>&1; then \
 	    state=$$(launchctl print gui/$$UID_NUM/$$label 2>/dev/null | awk -F'= ' '/state = /{print $$2; exit}'); \
 	    pid=$$(launchctl print gui/$$UID_NUM/$$label 2>/dev/null | awk -F'= ' '/pid = /{print $$2; exit}'); \
@@ -134,3 +117,17 @@ supervise-status:
 # the bare `pytest` console script anchors sys.path[0] to .venv/bin instead.
 test:
 	$(VENV_ACT) && python -m pytest -q
+
+# One-time (idempotent): create the isolated test database inside the app-db
+# container and migrate it. tests/conftest.py points every test run at it and
+# refuses any database whose name doesn't end in "_test".
+TEST_DATABASE_URL ?= postgresql+psycopg2://app:app@localhost:5433/campaigns_test
+# Recent Airflow task failures (written by airflow/dags/alerts.py).
+alerts:
+	@tail -n 20 ct/data/alerts/alerts.jsonl 2>/dev/null || echo "no alerts recorded"
+
+test-db:
+	docker compose exec -T app-db psql -U app -d campaigns -tAc \
+	  "SELECT 1 FROM pg_database WHERE datname='campaigns_test'" | grep -q 1 \
+	  || docker compose exec -T app-db createdb -U app campaigns_test
+	$(VENV_ACT) && APP_DATABASE_URL=$(TEST_DATABASE_URL) alembic upgrade head

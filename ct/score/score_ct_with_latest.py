@@ -326,9 +326,8 @@ def load_recent_misp_domains(days_back: int = 30) -> set:
             print(f"[warn] failed to read MISP silver {p}: {e}")
             continue
 
-        # Try multiple possible domain columns. "indicator" is what both
-        # misp_ingest.py (authenticated restSearch) and misp_osint_ingest.py
-        # (CIRCL public feed) actually write -- it was missing from this list
+        # Try multiple possible domain columns. "indicator" is what
+        # misp_osint_ingest.py (CIRCL public feed) actually writes -- it was missing from this list
         # entirely, so ti_misp_hit has been 0 on every scored row since this
         # loader was built, regardless of how much data landed in silver.
         # Checked "indicator" last only for backward compat with any other
